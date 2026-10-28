@@ -2,11 +2,10 @@
 
 
 
-
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset=<img width="3400" height="1013" alt="XPOSim_logo_dark" src="https://github.com/user-attachments/assets/41b705ef-8517-48c9-80dd-10bffce855b0" />>
-  <source media="(prefers-color-scheme: light)" srcset=<img width="3400" height="1013" alt="XPOSim_logo_light" src="https://github.com/user-attachments/assets/e5d3943c-3e5e-4029-b22e-4f0dd36fe3c7" />>
-  <img width="3400" height="1013" alt="XPOSim_logo" src=<img width="3400" height="1013" alt="XPOSim_logo_light" src="https://github.com/user-attachments/assets/e5d3943c-3e5e-4029-b22e-4f0dd36fe3c7" />>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/2e5871f4-7dce-4fb5-afea-e0f77d400280">
+  <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/4990525d-43d6-4419-b972-7389c84afb40">
+  <img width="3400" height="1013" alt="XPOSim_logo" src="https://github.com/user-attachments/assets/4990525d-43d6-4419-b972-7389c84afb40">
 </picture>
 
 
