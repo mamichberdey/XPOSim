@@ -5,10 +5,8 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/2e5871f4-7dce-4fb5-afea-e0f77d400280">
   <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/4990525d-43d6-4419-b972-7389c84afb40">
-  <img width="3400" height="1013" alt="XPOSim_logo" src="https://github.com/user-attachments/assets/4990525d-43d6-4419-b972-7389c84afb40">
+  <img width="600" alt="XPOSim_logo" src="https://github.com/user-attachments/assets/4990525d-43d6-4419-b972-7389c84afb40">
 </picture>
-
-
 
 
 **GPU-accelerated paraxial wave-optics simulations for X-ray optical systems.**
