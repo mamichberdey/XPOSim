@@ -9,8 +9,8 @@ The module deliberately keeps the public model small:
 * :class:`PointSource` creates a field and therefore is the only object that
   does not consume an input field;
 * NumPy and CuPy are supported without changing the array type of a field;
-* CRL defects are represented as thickness modifiers instead of separate
-  CRL subclasses.
+* CRL surface errors are specified as sampled height deviations and interpolated
+  onto the calculation grid.
 
 The file is intentionally self-contained. The material database is expected
 in ``xray_material_data/`` next to this module.
@@ -26,6 +26,7 @@ from typing import Any, Callable, Iterable, Sequence
 import warnings
 
 import numpy as np
+from scipy.interpolate import RegularGridInterpolator
 
 try:  # CuPy is optional; it is the preferred backend when available.
     import cupy as cp
@@ -35,7 +36,7 @@ except ImportError:  # pragma: no cover - depends on the local machine.
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"
 
 
 __all__ = [
@@ -47,6 +48,9 @@ __all__ = [
     "Grid2D",
     "ThicknessDefect",
     "FunctionThicknessDefect",
+    "InterpolatedThicknessDefect",
+    "SurfaceError",
+    "ArrayObject",
     "OpticalObject",
     "OpticalElement",
     "PointSource",
@@ -171,7 +175,7 @@ def wavelength_energy(
 class _MaterialDatabase:
     """Internal parser/cache for the tabulated material data."""
 
-    ELEMENT_RE = re.compile(r"^[A-Z][a-z]?$" )
+    ELEMENT_RE = re.compile(r"^[A-Z][a-z]?$")
 
     def __init__(self, data_dir: str | Path | None = None) -> None:
         if data_dir is not None:
@@ -687,17 +691,27 @@ class OpticalObject(ABC):
         """Initialize a grid-bound optical object and resolve its photon energy."""
 
         self.grid = grid
-        self.wavelength_m, self.energy_kev = wavelength_energy(
-            wavelength_m=wavelength_m, energy_kev=energy_kev
-        )
-        self.k = 2 * np.pi / self.wavelength_m
-        self.angular_frequency = 2 * np.pi * self.c / self.wavelength_m
+        if wavelength_m is None and energy_kev is None:
+            self.wavelength_m = None
+            self.energy_kev = None
+            self.k = None
+            self.angular_frequency = None
+        else:
+            self.wavelength_m, self.energy_kev = wavelength_energy(
+                wavelength_m=wavelength_m, energy_kev=energy_kev
+            )
+            self.k = 2 * np.pi / self.wavelength_m
+            self.angular_frequency = 2 * np.pi * self.c / self.wavelength_m
 
     def propagate(self, field: Any, z: float) -> Any:
         """Fresnel-propagate ``field`` on this object's grid by ``z`` metres."""
 
         if z < 0:
             raise ValueError("Propagation distance z must be >= 0.")
+        if self.k is None:
+            raise ValueError(
+                "Propagation requires wavelength_m or energy_kev at construction time."
+            )
         return self.grid.propagate(field, z, self.k)
 
     @abstractmethod
@@ -718,6 +732,8 @@ class OpticalObject(ABC):
     def divergence(self, z: float = 0.0) -> float | tuple[float, float] | None:
         """Estimate the far-field angular FWHM of the object's field."""
 
+        if self.k is None:
+            raise ValueError("Divergence calculation requires wavelength_m or energy_kev.")
         return divergence(self.E(z=z), self.grid, self.k)
 
 
@@ -726,27 +742,42 @@ class OpticalElement(OpticalObject):
 
     def __init__(
         self,
-        input_field: Any,
-        grid: BaseGrid,
+        input_field: Any | None = None,
+        grid: BaseGrid | None = None,
         *,
         wavelength_m: float | None = None,
         energy_kev: float | None = None,
     ) -> None:
-        """Store and validate the field immediately before the optical element."""
+        """Store an optional incident field and validate it when provided."""
 
+        if grid is None:
+            raise TypeError("grid is required.")
         super().__init__(
             grid,
             wavelength_m=wavelength_m,
             energy_kev=energy_kev,
         )
-        self.grid._validate_field_backend(input_field)
+        if input_field is not None:
+            self.grid._validate_field_backend(input_field)
         self.input_field = input_field
+
+    def _require_input_field(self) -> Any:
+        """Return the incident field or raise a clear error in geometry-only mode."""
+        if self.input_field is None:
+            raise ValueError(
+                f"{type(self).__name__} field calculation requires input_field; "
+                "geometry-only operations remain available without it."
+            )
+        return self.input_field
 
     def E(self, z: float = 0.0) -> Any:
         """Return the element's transformed field and optionally propagate it by ``z``."""
 
         if z < 0:
             raise ValueError("Propagation distance z must be >= 0.")
+        self._require_input_field()
+        if self.k is None and z > 0:
+            raise ValueError("Propagation requires wavelength_m or energy_kev.")
         field_after_element = self._field_after_element()
         if z == 0:
             return field_after_element
@@ -807,6 +838,8 @@ class PointSource(OpticalObject):
 
         if z <= 0:
             raise ValueError("PointSource.E requires z > 0 because the point source is singular at z=0.")
+        if self.k is None:
+            raise ValueError("PointSource.E requires wavelength_m or energy_kev.")
 
         if self.grid.dimension == 1:
             return self.grid.xp.exp(
@@ -832,16 +865,22 @@ class Hole(OpticalElement):
 
     def __init__(
         self,
-        input_field: Any,
-        grid: BaseGrid,
-        center_offset: float | tuple[float, float],
-        radius: float,
+        input_field: Any | None = None,
+        grid: BaseGrid | None = None,
+        center_offset: float | tuple[float, float] | None = None,
+        radius: float | None = None,
         *,
         wavelength_m: float | None = None,
         energy_kev: float | None = None,
     ) -> None:
         """Initialize a symmetric two-hole aperture."""
 
+        if grid is None:
+            raise TypeError("grid is required.")
+        if center_offset is None:
+            raise TypeError("center_offset is required.")
+        if radius is None:
+            raise TypeError("radius is required.")
         super().__init__(
             input_field,
             grid,
@@ -921,24 +960,258 @@ class ThicknessDefect(ABC):
     """
 
     @abstractmethod
-    def apply(self, thickness: Any, grid: BaseGrid, lens_index: int) -> Any:
-        """Return a modified CRL thickness map for one lens."""
+    def apply(self, thickness: Any, grid: BaseGrid, element_index: int) -> Any:
+        """Return a modified CRL thickness map for one element."""
 
 
 class FunctionThicknessDefect(ThicknessDefect):
     """Adapt a user-supplied Python function to the thickness-defect interface."""
 
     def __init__(self, function: Callable[[Any, BaseGrid, int], Any]) -> None:
-        """Store ``function(thickness, grid, lens_index)`` as the defect model."""
+        """Store ``function(thickness, grid, element_index)`` as the defect model."""
 
         self.function = function
 
-    def apply(self, thickness: Any, grid: BaseGrid, lens_index: int) -> Any:
+    def apply(self, thickness: Any, grid: BaseGrid, element_index: int) -> Any:
         """Apply the wrapped function and validate its returned shape/backend."""
 
-        result = self.function(thickness, grid, lens_index)
+        result = self.function(thickness, grid, element_index)
         grid._validate_field_backend(result)
         return result
+
+
+class InterpolatedThicknessDefect(ThicknessDefect):
+    """Adds a custom thickness defect defined on its own coordinate grid,
+    interpolated onto the CRL calculation grid.
+    """
+
+    def __init__(self, defect_array: Any, coords: Any, fill_value: float = 0.0) -> None:
+        """Initialize the interpolated thickness defect.
+
+        Parameters
+        ----------
+        defect_array:
+            NumPy array containing the defect values (heights/thickness modifications).
+            Shape must be (nx,) for 1D or (ny, nx) for 2D.
+        coords:
+            For 1D: a 1D array of x-coordinates ``x_def``.
+            For 2D: a tuple of 1D arrays ``(x_def, y_def)`` defining the axes.
+        fill_value:
+            Value used outside the defect coordinate bounds (default is 0.0,
+            meaning pure ideal thickness).
+        """
+        self.defect_array = _to_numpy(defect_array)
+        self.fill_value = float(fill_value)
+
+        if isinstance(coords, (tuple, list)):
+            self.coords = tuple(_to_numpy(c) for c in coords)
+        else:
+            self.coords = _to_numpy(coords)
+
+    def apply(self, thickness: Any, grid: BaseGrid, element_index: int) -> Any:
+        """Interpolate the defect onto the CRL grid and add it to the thickness."""
+        xp = grid.xp
+
+        if grid.dimension == 1:
+            x_def = self.coords
+            if not isinstance(x_def, np.ndarray) or x_def.ndim != 1:
+                raise ValueError("1D defect coordinates must be a 1D array.")
+
+            grid_x = _to_numpy(grid.x)
+
+            if grid_x.min() < x_def.min() or grid_x.max() > x_def.max():
+                warnings.warn(
+                    "The defect coordinates do not fully cover the CRL grid range. "
+                    "Regions outside the defect bounds will use fill_value.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+            interpolated = np.interp(
+                grid_x, x_def, self.defect_array, 
+                left=self.fill_value, right=self.fill_value
+            )
+
+        else:
+            if not (isinstance(self.coords, tuple) and len(self.coords) == 2):
+                raise ValueError("2D defect coordinates must be a tuple (x_def, y_def) of 1D arrays.")
+            
+            x_def, y_def = self.coords
+            if x_def.ndim != 1 or y_def.ndim != 1:
+                raise ValueError("2D defect coordinate axes must be 1D arrays.")
+
+            grid_x_axis = _to_numpy(grid.x_axis)
+            grid_y_axis = _to_numpy(grid.y_axis)
+
+            if (grid_x_axis.min() < x_def.min() or grid_x_axis.max() > x_def.max() or
+                grid_y_axis.min() < y_def.min() or grid_y_axis.max() > y_def.max()):
+                warnings.warn(
+                    "The defect coordinates do not fully cover the CRL grid range. "
+                    "Regions outside the defect bounds will use fill_value.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+            interp_func = RegularGridInterpolator(
+                (y_def, x_def),
+                self.defect_array,
+                method="linear",
+                bounds_error=False,
+                fill_value=self.fill_value
+            )
+
+            grid_x = _to_numpy(grid.x)
+            grid_y = _to_numpy(grid.y)
+            points = np.stack((grid_y.flat, grid_x.flat), axis=-1)
+            interpolated = interp_func(points).reshape(grid.shape)
+
+        interpolated_backend = xp.asarray(interpolated, dtype=thickness.dtype)
+        return thickness + interpolated_backend
+
+
+class SurfaceError:
+    """Surface-height error sampled on an independent regular 1D/2D grid.
+
+    Input is ``[error, x]`` or ``[error, x, y]``. For 2D data, ``x`` and
+    ``y`` may be 1D axes or 2D ``meshgrid`` coordinate arrays. Values outside
+    the supplied coordinate range are zero.
+    """
+
+    def __init__(self, data: Sequence[Any]) -> None:
+        if not isinstance(data, (list, tuple)) or len(data) not in (2, 3):
+            raise ValueError("surface_error must be [error, x] or [error, x, y].")
+        self.error = _to_numpy(data[0]).astype(float, copy=False)
+        self.x = _to_numpy(data[1]).astype(float, copy=False)
+        self.y = _to_numpy(data[2]).astype(float, copy=False) if len(data) == 3 else None
+        if self.error.ndim not in (1, 2):
+            raise ValueError("surface_error values must be a 1D or 2D array.")
+        if self.error.ndim == 1:
+            if self.y is not None or self.x.ndim != 1 or self.error.size != self.x.size:
+                raise ValueError("1D surface_error must be [error_1d, x_1d].")
+            if self.x.size < 2 or np.any(np.diff(self.x) <= 0):
+                raise ValueError("surface_error x coordinates must be strictly increasing.")
+            self.x_axis, self.y_axis = self.x, None
+        else:
+            if self.y is None:
+                raise ValueError("2D surface_error must be [error_2d, x, y].")
+            self.x_axis = self._axis_from_coordinates(self.x, "x")
+            self.y_axis = self._axis_from_coordinates(self.y, "y")
+            if self.error.shape != (self.y_axis.size, self.x_axis.size):
+                raise ValueError("2D surface_error must have shape (len(y), len(x)).")
+            if (self.x_axis.size < 2 or self.y_axis.size < 2 or
+                np.any(np.diff(self.x_axis) <= 0) or np.any(np.diff(self.y_axis) <= 0)):
+                raise ValueError("surface_error coordinate axes must be strictly increasing.")
+
+    @staticmethod
+    def _axis_from_coordinates(coords: np.ndarray, name: str) -> np.ndarray:
+        if coords.ndim == 1:
+            return coords
+        if coords.ndim != 2:
+            raise ValueError(f"surface_error {name} coordinates must be 1D or 2D meshgrid arrays.")
+        axis = coords[0, :] if name == "x" else coords[:, 0]
+        expected = np.broadcast_to(axis[None, :] if name == "x" else axis[:, None], coords.shape)
+        if not np.allclose(coords, expected, rtol=1e-10, atol=1e-14):
+            raise ValueError(f"surface_error {name} coordinates must form a regular meshgrid.")
+        return np.asarray(axis, dtype=float)
+
+    def on_grid(self, grid: BaseGrid) -> Any:
+        """Linearly interpolate the surface error onto a calculation grid."""
+        if grid.dimension == 1:
+            if self.error.ndim != 1:
+                raise ValueError("A 2D surface_error cannot be used with Grid1D.")
+            values = np.interp(_to_numpy(grid.x), self.x_axis, self.error, left=0.0, right=0.0)
+            return grid.xp.asarray(values)
+        if self.error.ndim != 2 or self.y_axis is None:
+            raise ValueError("A 1D surface_error cannot be used with Grid2D.")
+        interpolator = RegularGridInterpolator(
+            (self.y_axis, self.x_axis), self.error, method="linear",
+            bounds_error=False, fill_value=0.0,
+        )
+        points = np.stack((_to_numpy(grid.y).ravel(), _to_numpy(grid.x).ravel()), axis=-1)
+        return grid.xp.asarray(interpolator(points).reshape(grid.shape))
+
+
+class ArrayObject(OpticalElement):
+    """Homogeneous-material optical object defined by a sampled thickness map.
+
+    Supply ``[thickness_1d, x]`` for 1D or ``[thickness_2d, x, y]`` for 2D.
+    For 2D, coordinates may be 1D axes or 2D regular ``meshgrid`` arrays.
+    Zero thickness means no material; negative thickness is invalid. Outside
+    the supplied map the object is absent. The map is linearly interpolated
+    onto the calculation grid.
+    """
+
+    def __init__(
+        self,
+        input_field: Any | None = None,
+        grid: BaseGrid | None = None,
+        thickness: Sequence[Any] | None = None,
+        material: Material | None = None,
+        *,
+        wavelength_m: float | None = None,
+        energy_kev: float | None = None,
+    ) -> None:
+        if grid is None:
+            raise TypeError("grid is required.")
+        if thickness is None:
+            raise TypeError("thickness is required as [values, x] or [values, x, y].")
+        if material is None:
+            raise TypeError("material is required.")
+        super().__init__(input_field, grid, wavelength_m=wavelength_m, energy_kev=energy_kev)
+        self.material = material
+        self._thickness_data = SurfaceError(thickness)
+        if np.any(self._thickness_data.error < 0):
+            raise ValueError("ArrayObject thickness cannot be negative.")
+        self._warn_if_clipped()
+        if self.energy_kev is None:
+            if material._delta is not None and material._beta is not None:
+                self.delta, self.beta = material.optical_constants(1.0)
+            else:
+                self.delta = self.beta = None
+        else:
+            self.delta, self.beta = material.optical_constants(self.energy_kev)
+        if self.delta is not None:
+            _validate_positive("material delta", self.delta)
+        if self.beta is not None and self.beta < 0:
+            raise ValueError("material beta must be >= 0.")
+
+    def _warn_if_clipped(self) -> None:
+        """Warn only when the supplied object extends beyond the calculation grid."""
+        d = self._thickness_data
+        axes = [("x", d.x_axis, _to_numpy(self.grid.x))]
+        if self.grid.dimension == 2 and d.y_axis is not None:
+            axes.append(("y", d.y_axis, _to_numpy(self.grid.y_axis)))
+        for name, coords, calc_coords in axes:
+            lo, hi = float(np.min(calc_coords)), float(np.max(calc_coords))
+            tol = 1e-12 * max(1.0, abs(lo), abs(hi))
+            if coords[0] < lo - tol or coords[-1] > hi + tol:
+                warnings.warn(
+                    f"ArrayObject extends beyond the calculation grid along {name}; "
+                    "the outside part is clipped.", UserWarning, stacklevel=3,
+                )
+
+    def thickness_map(self) -> Any:
+        """Return the object's thickness interpolated onto the calculation grid."""
+        values = self._thickness_data.on_grid(self.grid)
+        values_np = _to_numpy(values)
+        if np.any(values_np < 0):
+            raise ValueError("Interpolated ArrayObject thickness cannot be negative.")
+        return values
+
+    def transmission(self) -> Any:
+        """Return the complex transmission function of the object."""
+        if self.k is None:
+            raise ValueError("Transmission calculation requires wavelength_m or energy_kev.")
+        if self.delta is None or self.beta is None:
+            raise ValueError("Optical constants require energy_kev or explicit material delta/beta.")
+        thickness = self.thickness_map()
+        return self.grid.xp.exp(-1j * self.k * (self.delta - 1j * self.beta) * thickness)
+
+    def _field_after_element(self) -> Any:
+        """Apply material transmission where thickness is positive; block no material outside."""
+        thickness = self.thickness_map()
+        mask = (thickness > 0).astype(self.input_field.dtype)
+        return self.input_field * self.transmission() * mask
 
 
 # ---------------------------------------------------------------------------
@@ -947,16 +1220,16 @@ class FunctionThicknessDefect(ThicknessDefect):
 
 
 class CRL(OpticalElement):
-    """Compound refractive lens for 1D and 2D paraxial wave-optics schemes.
+    """Compound refractive element for 1D and 2D paraxial wave-optics schemes.
 
     A CRL is built from two opposing parabolic surfaces and a central bridge.
-    The complete material thickness of one lens is
+    The complete material thickness of one element is
 
     ``T(x) = 2 * sag(x) + d``
 
     inside the optical aperture, where ``d`` is the distance between the two
-    parabolic surfaces. A sequence of ``n_lenses`` such elements is simulated
-    numerically with Fresnel propagation between adjacent lens centres.
+    parabolic surfaces. A sequence of ``n_elements`` such elements is simulated
+    numerically with Fresnel propagation between adjacent element centres.
 
     The same class is used for both genuinely one-dimensional schemes and for
     one-axis-focusing CRLs embedded in a two-dimensional scheme. In 1D the
@@ -965,13 +1238,13 @@ class CRL(OpticalElement):
     is supplied, the CRL is cylindrically focusing: the local ``x`` coordinate
     is the focusing direction and the local ``y`` coordinate defines the finite
     transverse width. The orientation of that local frame is controlled by
-    ``rotation=(rx, ry, rz)``; the current paraxial transverse model implements
-    the in-plane angle ``rz`` and deliberately rejects non-zero ``rx``/``ry``.
+    ``rotation`` (in-plane angle in radians).
 
     Parameters
     ----------
     input_field:
-        Complex field incident on the first CRL element.
+        Optional complex field incident on the first CRL element. Omit it to
+        construct geometry and evaluate thickness maps without calculating a field.
     grid:
         :class:`Grid1D` or :class:`Grid2D` used by the field.
     radius:
@@ -980,8 +1253,8 @@ class CRL(OpticalElement):
         Full optical aperture (diameter), metres.
     bridge_thickness:
         Distance ``d`` between the two opposing parabolic surfaces, metres.
-    n_lenses:
-        Number of CRL elements.
+    n_elements:
+        Number of CRL elements in the stack.
     material:
         :class:`Material` describing the refractive medium.
     transverse_length:
@@ -989,45 +1262,41 @@ class CRL(OpticalElement):
         2D. If omitted on a 2D grid the CRL is rotationally symmetric. Ignored
         on a 1D grid.
     rotation:
-        Three angles ``(rx, ry, rz)`` in radians. ``rz`` rotates a cylindrical
-        2D CRL within the transverse plane. Non-zero ``rx``/``ry`` are reserved
-        for a future tilted-element model and currently raise an error.
-    thickness_defect:
-        One :class:`ThicknessDefect`, a callable, or one defect per lens. A
-        defect receives the complete ideal thickness map and may replace or
-        modify it.
-    reuse_lens_geometry:
-        Reuse one calculated thickness/transmission map for every lens when
-        the lens geometry is identical. Per-lens defect sequences automatically
+        In-plane rotation angle in radians for a cylindrical 2D CRL.
+    surface_error:
+        Optional ``[error, x]`` 1D profile or ``[error, x, y]`` 2D map.
+        The error is added to one parabolic surface, so its contribution to
+        total thickness is doubled. Linear interpolation maps it to the CRL grid.
+    reuse_element_geometry:
+        Reuse one calculated thickness/transmission map for every element when
+        the element geometry is identical. Per-element defect sequences automatically
         disable this optimization.
     wavelength_m, energy_kev:
-        Exactly one optical-energy representation. If omitted, the energy and
-        wavelength are inherited from the first optical field only indirectly
-        by explicitly supplying one of them to the CRL.
+        Optional photon wavelength or energy. Required for propagation and
+        transmission calculations; not required for geometry-only use.
     """
 
     def __init__(
         self,
-        input_field: Any,
-        grid: BaseGrid,
+        input_field: Any | None = None,
+        grid: BaseGrid | None = None,
         *,
         radius: float,
         aperture: float,
         bridge_thickness: float,
-        n_lenses: int,
+        n_elements: int,
         material: Material,
         transverse_length: float | None = None,
-        rotation: tuple[float, float, float] = (0.0, 0.0, 0.0),
-        thickness_defect: ThicknessDefect
-        | Callable[[Any, BaseGrid, int], Any]
-        | Sequence[ThicknessDefect | Callable[[Any, BaseGrid, int], Any]]
-        | None = None,
-        reuse_lens_geometry: bool = True,
+        rotation: float = 0.0,
+        surface_error: Sequence[Any] | None = None,
+        reuse_element_geometry: bool = True,
         wavelength_m: float | None = None,
         energy_kev: float | None = None,
     ) -> None:
-        """Initialize a CRL, its optical constants, geometry and defect model."""
+        """Initialize a CRL, its optional optical field and geometry."""
 
+        if grid is None:
+            raise TypeError("grid is required.")
         super().__init__(
             input_field,
             grid,
@@ -1037,141 +1306,149 @@ class CRL(OpticalElement):
         _validate_positive("radius", radius)
         _validate_positive("aperture", aperture)
         _validate_positive("bridge_thickness", bridge_thickness)
-        if n_lenses < 1:
-            raise ValueError("n_lenses must be >= 1.")
-        if len(rotation) != 3:
-            raise ValueError("rotation must be (rx, ry, rz).")
+        if n_elements < 1:
+            raise ValueError("n_elements must be >= 1.")
 
         self.radius = float(radius)
         self.aperture = float(aperture)
         self.bridge_thickness = float(bridge_thickness)
-        self.n_lenses = int(n_lenses)
+        self.n_elements = int(n_elements)
         self.material = material
         self.transverse_length = None if transverse_length is None else float(transverse_length)
-        self.rotation = tuple(float(v) for v in rotation)
-        self.reuse_lens_geometry = bool(reuse_lens_geometry)
+        self.rotation = float(rotation)
+        self.reuse_element_geometry = bool(reuse_element_geometry)
+        self._surface_error = None if surface_error is None else SurfaceError(surface_error)
 
         if self.transverse_length is not None:
             _validate_positive("transverse_length", self.transverse_length)
         if self.grid.dimension == 1 and self.transverse_length is not None:
             raise ValueError("transverse_length is only meaningful for a 2D one-axis CRL.")
-        if abs(self.rotation[0]) > 1e-15 or abs(self.rotation[1]) > 1e-15:
-            raise NotImplementedError(
-                "Non-zero rx/ry rotations are not implemented in the transverse paraxial model; "
-                "use rz for in-plane CRL rotation."
-            )
 
-        self.delta, self.beta = material.optical_constants(self.energy_kev)
-        _validate_positive("material delta", self.delta)
-        if self.beta < 0:
+        if self._surface_error is not None:
+            self._warn_surface_error_extent()
+
+        if self.energy_kev is None:
+            if material._delta is not None and material._beta is not None:
+                self.delta, self.beta = material.optical_constants(1.0)
+            else:
+                self.delta = self.beta = None
+        else:
+            self.delta, self.beta = material.optical_constants(self.energy_kev)
+        if self.delta is not None:
+            _validate_positive("material delta", self.delta)
+        if self.beta is not None and self.beta < 0:
             raise ValueError("material beta must be >= 0.")
 
-        # The complete edge thickness of one CRL element determines the pitch
-        # used by the paraxial stack model.
-        self.edge_thickness = self.bridge_thickness + self.aperture**2 / (4 * self.radius)
+        self.element_length = self.bridge_thickness + self.aperture**2 / (4 * self.radius)
         self._thickness_cache: dict[int, Any] = {}
         self._transmission_cache: dict[int, Any] = {}
 
-        self._normalize_defect(thickness_defect)
-
-        # The maximum valid integer lens count is checked immediately so a
-        # physically questionable CRL cannot be created silently.
-        if self.n_lenses > self.max_lens_count():
+        if self.delta is not None and self.n_elements > self.max_element_count():
             warnings.warn(
-                f"CRL contains {self.n_lenses} elements, while the maximum valid "
-                f"paraxial external-focus count is {self.max_lens_count()}. "
+                f"CRL contains {self.n_elements} elements, while the maximum valid "
+                f"paraxial external-focus count is {self.max_element_count()}. "
                 "The formal focus lies inside the CRL, so external focal-plane "
                 "analysis is not physically meaningful.",
                 RuntimeWarning,
                 stacklevel=2,
             )
 
-    def _normalize_defect(self, defect: Any) -> None:
-        """Normalize a single defect or a per-lens defect sequence."""
-
-        self._single_defect: ThicknessDefect | None = None
-        self._per_lens_defects: list[ThicknessDefect] | None = None
-
-        if defect is None:
-            return
-
-        if isinstance(defect, Sequence) and not isinstance(defect, (str, bytes)):
-            if len(defect) != self.n_lenses:
-                raise ValueError("A per-lens defect sequence must have n_lenses elements.")
-            self._per_lens_defects = [self._coerce_defect(item) for item in defect]
-            self.reuse_lens_geometry = False
-            return
-
-        self._single_defect = self._coerce_defect(defect)
-
-    @staticmethod
-    def _coerce_defect(defect: Any) -> ThicknessDefect:
-        """Convert a defect object or callable into a ``ThicknessDefect``."""
-
-        if isinstance(defect, ThicknessDefect):
-            return defect
-        if callable(defect):
-            return FunctionThicknessDefect(defect)
-        raise TypeError(
-            "thickness_defect must be a ThicknessDefect, callable, or sequence of them."
-        )
+    @property
+    def element_period(self) -> float:
+        """Axial period occupied by one CRL element, in metres."""
+        return self.element_length
 
     @property
-    def lens_pitch(self) -> float:
-        """Return the centre-to-centre distance between neighbouring CRL elements."""
+    def length(self) -> float:
+        """Total axial length of the CRL stack, in metres."""
+        return self.element_period * self.n_elements
 
-        return self.edge_thickness
+    def _require_optical_constants(self) -> tuple[float, float, float]:
+        """Return (k, delta, beta), or explain which optical input is missing."""
+        if self.k is None:
+            raise ValueError(
+                "This calculation requires wavelength_m or energy_kev; "
+                "geometry-only CRLs do not define a photon wavelength."
+            )
+        if self.delta is None or self.beta is None:
+            raise ValueError(
+                "Optical constants require energy_kev, unless Material was created "
+                "with explicit delta and beta."
+            )
+        return self.k, self.delta, self.beta
 
     @property
     def characteristic_length(self) -> float:
         """Return the characteristic CRL length ``sqrt(p R / (2 delta))`` in metres."""
 
-        return float(np.sqrt(self.lens_pitch * self.radius / (2 * self.delta)))
+        if self.delta is None:
+            raise ValueError("characteristic_length requires energy_kev or explicit material delta/beta.")
+        return float(np.sqrt(self.element_period * self.radius / (2 * self.delta)))
 
     @property
-    def characteristic_lens_count(self) -> float:
-        """Return the characteristic lens count ``characteristic_length / lens_pitch``."""
+    def characteristic_element_count(self) -> float:
+        """Return the characteristic element count ``characteristic_length / element_period``."""
 
-        return self.characteristic_length / self.lens_pitch
+        return self.characteristic_length / self.element_period
 
-    def critical_lens_count(self) -> float:
-        """Return the real-valued critical lens count ``pi/2 * Lc / p``.
+    def critical_element_count(self) -> float:
+        """Return the real-valued critical element count ``pi/2 * Lc / p``.
 
         At this value the formal paraxial focus reaches the exit reference
         plane. Beyond it the formal focus is inside the CRL and external focal
         plane analysis is not physically meaningful.
         """
 
-        return float(np.pi / 2 * self.characteristic_lens_count)
+        return float(np.pi / 2 * self.characteristic_element_count)
 
-    def max_lens_count(self) -> int:
-        """Return the largest valid integer lens count with an external focus."""
+    def max_element_count(self) -> int:
+        """Return the largest valid integer element count with an external focus."""
 
-        critical = self.critical_lens_count()
-        # The focus must remain strictly before the critical point.
+        critical = self.critical_element_count()
         return max(0, int(np.ceil(critical) - 1))
 
     def _local_coordinates(self) -> tuple[Any, Any | None]:
-        """Return coordinates in the CRL's local transverse frame after ``rz`` rotation."""
+        """Return coordinates in the CRL's local transverse frame after in-plane rotation."""
 
         if self.grid.dimension == 1:
             return self.grid.x, None
 
-        theta = self.rotation[2]
+        theta = self.rotation
         c, s = np.cos(theta), np.sin(theta)
         x_local = c * self.grid.x + s * self.grid.y
         y_local = -s * self.grid.x + c * self.grid.y
         return x_local, y_local
 
-    def _ideal_thickness(self) -> Any:
-        """Build one defect-free CRL thickness map.
+    def _warn_surface_error_extent(self) -> None:
+        """Warn when the supplied defect coordinate extent differs from the CRL aperture."""
+        assert self._surface_error is not None
+        error = self._surface_error
+        half_x = self.aperture / 2
+        self._warn_extent_axis("x", error.x, -half_x, half_x)
+        if error.error.ndim == 2 and error.y is not None:
+            half_y = (self.transverse_length / 2
+                      if self.transverse_length is not None else self.aperture / 2)
+            self._warn_extent_axis("y", error.y, -half_y, half_y)
 
-        For a rotationally symmetric 2D CRL the sag depends on ``x_local²+y_local²``.
-        If ``transverse_length`` is supplied, the CRL is cylindrically focusing:
-        sag depends only on ``x_local`` and the finite ``y_local`` width limits the
-        lens outside its useful aperture. On a 1D grid the single coordinate is
-        always the focusing coordinate.
-        """
+    @staticmethod
+    def _warn_extent_axis(axis: str, coords: np.ndarray, lower: float, upper: float) -> None:
+        tol = 1e-12 * max(1.0, abs(lower), abs(upper))
+        supplied_lower, supplied_upper = float(coords[0]), float(coords[-1])
+        if supplied_lower < lower - tol or supplied_upper > upper + tol:
+            warnings.warn(
+                f"surface_error is wider than the CRL geometry along {axis}; "
+                "values outside the aperture will be ignored.",
+                UserWarning, stacklevel=3,
+            )
+        elif supplied_lower > lower + tol or supplied_upper < upper - tol:
+            warnings.warn(
+                f"surface_error is narrower than the CRL geometry along {axis}; "
+                "the error is zero outside its coordinate range.",
+                UserWarning, stacklevel=3,
+            )
+
+    def _ideal_thickness(self) -> Any:
+        """Build one defect-free CRL thickness map."""
 
         xp = self.grid.xp
         x_local, y_local = self._local_coordinates()
@@ -1186,9 +1463,22 @@ class CRL(OpticalElement):
             radial_sag = (x_local**2 + y_local**2) / (2 * self.radius)
             sag = xp.minimum(radial_sag, h_max)
 
+        if self._surface_error is not None:
+            error_map = self._surface_error.on_grid(self.grid).astype(sag.dtype, copy=False)
+            # A surface defect is defined only inside the CRL aperture. Coordinates
+            # are interpreted in the CRL's local frame, including after rotation.
+            if self.grid.dimension == 1:
+                aperture_mask = abs(x_local) <= self.aperture / 2
+            elif self.transverse_length is not None:
+                aperture_mask = ((abs(x_local) <= self.aperture / 2) &
+                                 (abs(y_local) <= self.transverse_length / 2))
+            else:
+                aperture_mask = (x_local**2 + y_local**2) <= (self.aperture / 2)**2
+            error_map = xp.where(aperture_mask, error_map, 0.0)
+            sag = sag + error_map
         return 2 * sag + self.bridge_thickness
 
-    def thickness(self, lens_index: int = 0) -> Any:
+    def element_thickness(self, element_index: int = 0) -> Any:
         """Return the complete material thickness map of one CRL element.
 
         The returned thickness includes both opposing parabolic surfaces and
@@ -1196,48 +1486,47 @@ class CRL(OpticalElement):
         geometry is constructed.
         """
 
-        if not 0 <= lens_index < self.n_lenses:
-            raise IndexError("lens_index is outside the CRL range.")
-        if self.reuse_lens_geometry and self._thickness_cache:
+        if not 0 <= element_index < self.n_elements:
+            raise IndexError("element_index is outside the CRL range.")
+        if self.reuse_element_geometry and self._thickness_cache:
             return next(iter(self._thickness_cache.values()))
-        if lens_index in self._thickness_cache:
-            return self._thickness_cache[lens_index]
+        if element_index in self._thickness_cache:
+            return self._thickness_cache[element_index]
 
         thickness = self._ideal_thickness()
-        defect = None
-        if self._per_lens_defects is not None:
-            defect = self._per_lens_defects[lens_index]
-        elif self._single_defect is not None:
-            defect = self._single_defect
-        if defect is not None:
-            thickness = defect.apply(thickness, self.grid, lens_index)
 
         self.grid._validate_field_backend(thickness)
         if not np.issubdtype(thickness.dtype, np.number):
             raise TypeError("CRL thickness defect returned a non-numeric array.")
-        if np.any(_to_numpy(thickness) < 0):
-            raise ValueError("CRL thickness must not contain negative values.")
+        thickness_values = _to_numpy(thickness)
+        if np.any(thickness_values <= 0):
+            min_thickness = float(np.min(thickness_values))
+            raise ValueError(
+                "surface_error removes too much material: the resulting CRL "
+                f"thickness must stay positive (minimum thickness is {min_thickness:g} m)."
+            )
 
-        if self.reuse_lens_geometry:
+        if self.reuse_element_geometry:
             self._thickness_cache[0] = thickness
-        self._thickness_cache[lens_index] = thickness
+        self._thickness_cache[element_index] = thickness
         return thickness
 
-    def transmission(self, lens_index: int = 0) -> Any:
+    def transmission(self, element_index: int = 0) -> Any:
         """Return the complex transmission function of one CRL element."""
 
-        if self.reuse_lens_geometry and self._transmission_cache:
+        if self.reuse_element_geometry and self._transmission_cache:
             return next(iter(self._transmission_cache.values()))
-        if lens_index in self._transmission_cache:
-            return self._transmission_cache[lens_index]
+        if element_index in self._transmission_cache:
+            return self._transmission_cache[element_index]
 
-        thickness = self.thickness(lens_index)
+        thickness = self.element_thickness(element_index)
+        k, delta, beta = self._require_optical_constants()
         transmission = self.grid.xp.exp(
-            -1j * self.k * (self.delta - 1j * self.beta) * thickness
+            -1j * k * (delta - 1j * beta) * thickness
         )
-        if self.reuse_lens_geometry:
+        if self.reuse_element_geometry:
             self._transmission_cache[0] = transmission
-        self._transmission_cache[lens_index] = transmission
+        self._transmission_cache[element_index] = transmission
         return transmission
 
     def clear_cache(self) -> None:
@@ -1249,50 +1538,50 @@ class CRL(OpticalElement):
     def _field_after_element(self) -> Any:
         """Propagate through the complete CRL stack and return its exit-plane field."""
 
-        field = self.propagate(self.input_field, self.lens_pitch / 2)
-        for lens_index in range(self.n_lenses):
-            field = field * self.transmission(lens_index)
-            if lens_index < self.n_lenses - 1:
-                field = self.propagate(field, self.lens_pitch)
-        return self.propagate(field, self.lens_pitch / 2)
+        field = self.propagate(self._require_input_field(), self.element_period / 2)
+        for element_index in range(self.n_elements):
+            field = field * self.transmission(element_index)
+            if element_index < self.n_elements - 1:
+                field = self.propagate(field, self.element_period)
+        return self.propagate(field, self.element_period / 2)
 
-    def theoretical_focus(self, *, n_lenses: int | None = None) -> float:
+    def theoretical_focus(self, *, n_elements: int | None = None) -> float:
         """Return the formal paraxial focal distance from the CRL exit reference plane."""
 
-        count = self.n_lenses if n_lenses is None else int(n_lenses)
+        count = self.n_elements if n_elements is None else int(n_elements)
         if count < 1:
-            raise ValueError("n_lenses must be >= 1.")
-        critical = self.critical_lens_count()
+            raise ValueError("n_elements must be >= 1.")
+        critical = self.critical_element_count()
         if count >= critical:
             warnings.warn(
-                "The requested lens count is at or beyond the critical count; "
+                "The requested element count is at or beyond the critical count; "
                 "the formal focus is not an external physical focus.",
                 RuntimeWarning,
                 stacklevel=2,
             )
-        u = count / self.characteristic_lens_count
+        u = count / self.characteristic_element_count
         return float(self.characteristic_length / np.tan(u))
 
     def effective_focus(
         self,
         source_distance: float,
         *,
-        n_lenses: int | None = None,
+        n_elements: int | None = None,
     ) -> float:
         """Return the finite-object image distance from the CRL exit reference plane."""
 
         _validate_positive("source_distance", source_distance)
-        count = self.n_lenses if n_lenses is None else int(n_lenses)
+        count = self.n_elements if n_elements is None else int(n_elements)
         if count < 1:
-            raise ValueError("n_lenses must be >= 1.")
-        if count > self.max_lens_count():
+            raise ValueError("n_elements must be >= 1.")
+        if count > self.max_element_count():
             raise ValueError(
-                "The requested lens count exceeds max_lens_count(); "
+                "The requested element count exceeds max_element_count(); "
                 "the formal focus lies inside the CRL."
             )
 
         lc = self.characteristic_length
-        u = count / self.characteristic_lens_count
+        u = count / self.characteristic_element_count
         focal_length = lc / np.sin(u)
         back_principal_distance = focal_length * (1 - np.cos(u))
         object_distance = source_distance + back_principal_distance
@@ -1307,44 +1596,44 @@ class CRL(OpticalElement):
         source_distance: float,
         image_distance: float,
         *,
-        n_lenses: int | None = None,
+        n_elements: int | None = None,
     ) -> float:
         """Return the signed analytical CRL transverse magnification."""
 
         _validate_positive("source_distance", source_distance)
         _validate_positive("image_distance", image_distance)
-        count = self.n_lenses if n_lenses is None else int(n_lenses)
+        count = self.n_elements if n_elements is None else int(n_elements)
         if count < 1:
-            raise ValueError("n_lenses must be >= 1.")
+            raise ValueError("n_elements must be >= 1.")
         lc = self.characteristic_length
-        lens_length = count * self.lens_pitch
-        u = lens_length / lc
+        stack_length = count * self.element_period
+        u = stack_length / lc
         sine = np.sin(u)
         cosine = np.cos(u)
-        numerator = image_distance * (lens_length * cosine + lc * sine) + lens_length * lc * sine
-        denominator = source_distance * (lens_length + lc * sine * cosine)
+        numerator = image_distance * (stack_length * cosine + lc * sine) + stack_length * lc * sine
+        denominator = source_distance * (stack_length + lc * sine * cosine)
         return float(numerator / denominator)
 
-    def image_scale(self, source_distance: float, *, n_lenses: int | None = None) -> float:
+    def image_scale(self, source_distance: float, *, n_elements: int | None = None) -> float:
         """Return the analytical image/source distance ratio for a finite object."""
 
         _validate_positive("source_distance", source_distance)
-        count = self.n_lenses if n_lenses is None else int(n_lenses)
-        if count > self.max_lens_count():
-            raise ValueError("The requested lens count exceeds max_lens_count().")
+        count = self.n_elements if n_elements is None else int(n_elements)
+        if count > self.max_element_count():
+            raise ValueError("The requested element count exceeds max_element_count().")
         lc = self.characteristic_length
-        u = count / self.characteristic_lens_count
+        u = count / self.characteristic_element_count
         focal_length = lc / np.sin(u)
         back_principal_distance = focal_length * (1 - np.cos(u))
         object_distance = source_distance + back_principal_distance
         image_distance = focal_length * object_distance / (object_distance - focal_length)
         return float(image_distance / object_distance)
 
-    def is_focus_outside_crl(self, *, n_lenses: int | None = None) -> bool:
-        """Return whether the specified integer lens count gives an external focus."""
+    def is_focus_outside_crl(self, *, n_elements: int | None = None) -> bool:
+        """Return whether the specified integer element count gives an external focus."""
 
-        count = self.n_lenses if n_lenses is None else int(n_lenses)
-        return count <= self.max_lens_count()
+        count = self.n_elements if n_elements is None else int(n_elements)
+        return count <= self.max_element_count()
 
     def focus_scan(
         self,
@@ -1361,27 +1650,27 @@ class CRL(OpticalElement):
         stack is retained. ``roi`` is specified in physical transverse coordinates.
         """
 
-        if not self.is_focus_outside_crl():
-            warnings.warn(
-                "CRL focus_scan skipped because the theoretical focus lies inside the CRL.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return FocusScanResult.invalid(np.asarray(z_values, dtype=float))
-
         z_array = np.asarray(z_values, dtype=float)
         if z_array.ndim != 1 or len(z_array) == 0:
             raise ValueError("z_values must be a non-empty 1D sequence.")
         if np.any(z_array < 0):
             raise ValueError("z_values must contain non-negative distances.")
 
-        field0 = self.E(z=0)
-        fields: list[np.ndarray] = []
+        if not self.is_focus_outside_crl():
+            warnings.warn(
+                "CRL focus_scan skipped because the theoretical focus lies inside the CRL.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return FocusScanResult.invalid()
+
+        E0 = self.E(z=0)
+        E_stack = []
         metrics: list[BeamMetrics] = []
         for z in z_array:
-            field = self.propagate(field0, float(z))
+            E = self.propagate(E0, float(z))
             measured = beam_metrics(
-                field,
+                E,
                 self.grid,
                 roi=roi,
                 calculate_divergence=calculate_divergence,
@@ -1389,7 +1678,7 @@ class CRL(OpticalElement):
             )
             metrics.append(measured)
             if return_fields:
-                fields.append(_to_numpy(_crop_field(field, self.grid, roi)))
+                E_stack.append(_crop_field(E, self.grid, roi))
 
         max_intensities = np.asarray([m.max_intensity for m in metrics], dtype=float)
         peak_index = (
@@ -1397,11 +1686,16 @@ class CRL(OpticalElement):
             if len(max_intensities) == 0 or np.all(np.isnan(max_intensities))
             else int(np.nanargmax(max_intensities))
         )
+        E_array = self.grid.xp.stack(E_stack, axis=0) if return_fields else None
+        x_roi, y_roi = _roi_coordinates(self.grid, roi)
+        peak_z = None if peak_index is None else float(z_array[peak_index])
         return FocusScanResult(
-            z=z_array,
             metrics=metrics,
             peak_index=peak_index,
-            fields=fields if return_fields else None,
+            peak_z=peak_z,
+            E=E_array,
+            x_roi=x_roi,
+            y_roi=y_roi,
         )
 
 
@@ -1422,27 +1716,29 @@ class BeamMetrics:
 
 @dataclass
 class FocusScanResult:
-    """Result of a multi-distance focus scan."""
+    """Result of a multi-distance focus scan.
 
-    z: np.ndarray
+    ``E`` has shape ``(nz, nx_roi)`` for 1D grids and
+    ``(nz, ny_roi, nx_roi)`` for 2D grids. Its array backend matches the grid.
+    ``x_roi`` and, for 2D grids, ``y_roi`` contain the transverse coordinates
+    corresponding to the cropped field. Coordinates are returned even when
+    ``return_fields=False`` (in which case ``E`` is ``None``).
+    """
+
     metrics: list[BeamMetrics]
     peak_index: int | None
-    fields: list[np.ndarray] | None = None
+    peak_z: float | None = None
+    E: Any = None
+    x_roi: Any = None
+    y_roi: Any = None
     valid: bool = True
 
     @classmethod
-    def invalid(cls, z: np.ndarray) -> "FocusScanResult":
+    def invalid(cls) -> "FocusScanResult":
         """Create an invalid result when a focus scan is physically inapplicable."""
 
-        return cls(z=z, metrics=[], peak_index=None, fields=None, valid=False)
+        return cls(metrics=[], peak_index=None, peak_z=None, valid=False)
 
-    @property
-    def peak_z(self) -> float | None:
-        """Return the scanned z position with maximum measured intensity."""
-
-        if self.peak_index is None:
-            return None
-        return float(self.z[self.peak_index])
 
     @property
     def fwhm_at_peak(self) -> float | tuple[float, float] | None:
@@ -1518,6 +1814,40 @@ def full_width_half_max(
     )
     width = right_cross - left_cross
     return float(width) if width >= 0 else None
+
+
+def _roi_coordinates(grid: BaseGrid, roi: Any) -> tuple[Any, Any | None]:
+    """Return backend-preserving transverse coordinate axes after ROI cropping."""
+
+    if grid.dimension == 1:
+        x = grid.x
+        if roi is None:
+            return x, None
+        if not (isinstance(roi, Sequence) and len(roi) == 2):
+            raise ValueError("1D roi must be (xmin, xmax).")
+        xmin, xmax = map(float, roi)
+        mask = (x >= xmin) & (x <= xmax)
+        indices = _to_numpy(np.where(_to_numpy(mask))[0])
+        if len(indices) == 0:
+            raise ValueError("1D ROI does not overlap the grid.")
+        return x[int(indices[0]) : int(indices[-1]) + 1], None
+
+    x_axis, y_axis = grid.x_axis, grid.y_axis
+    if roi is None:
+        return x_axis, y_axis
+    if not (isinstance(roi, Sequence) and len(roi) == 2):
+        raise ValueError("2D roi must be ((xmin, xmax), (ymin, ymax)).")
+    (xmin, xmax), (ymin, ymax) = roi
+    xmask = (x_axis >= float(xmin)) & (x_axis <= float(xmax))
+    ymask = (y_axis >= float(ymin)) & (y_axis <= float(ymax))
+    xi = _to_numpy(np.where(_to_numpy(xmask))[0])
+    yi = _to_numpy(np.where(_to_numpy(ymask))[0])
+    if len(xi) == 0 or len(yi) == 0:
+        raise ValueError("2D ROI does not overlap the grid.")
+    return (
+        x_axis[int(xi[0]) : int(xi[-1]) + 1],
+        y_axis[int(yi[0]) : int(yi[-1]) + 1],
+    )
 
 
 def _crop_field(field: Any, grid: BaseGrid, roi: Any) -> Any:
@@ -1642,6 +1972,7 @@ def divergence(
     fy = values[valid_y, max_i]
     return full_width_half_max(fx, theta_x), full_width_half_max(fy, theta_y)
 
+
 def gaussian_filter_1d(field: Any, coordinate: Any, sigma: float) -> Any:
     """Gaussian-filter a 1D array using the library's continuous FFT convention."""
 
@@ -1672,15 +2003,3 @@ def gaussian_filter_2d(field: Any, x: Any, y: Any, sigma_x: float, sigma_y: floa
         -(x_grid / sigma_x) ** 2 / 2 - (y_grid / sigma_y) ** 2 / 2
     ) / (2 * np.pi * sigma_x * sigma_y)
     return _ifft2d(_fft2d(field, dx, dy) * _fft2d(kernel, dx, dy), dx, dy).real
-
-
-
-# ---------------------------------------------------------------------------
-# End-of-file note
-# ---------------------------------------------------------------------------
-
-# The old SiemensStar, CRL1Dm/CRL1Deq/CRL1Dcurv/CRL2Dm experimental classes,
-# global grid state, commented-out implementations, and `focus_params_calc`
-# are intentionally not carried into this module. Their place in the new
-# architecture is either a generic thickness defect or the standalone analysis
-# layer above.
