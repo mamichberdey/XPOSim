@@ -1,7 +1,6 @@
 # XPOSim (X-ray Paraxial Optical Simulation)
 
-<img width="1617" height="490" alt="image" src="https://github.com/user-attachments/assets/22b63f7e-99ec-451b-b792-64ae34714dba" />
-
+<img width="6800" height="2026" alt="XPOSim_logo" src="https://github.com/user-attachments/assets/e1805d6d-d1f4-4f76-9a8b-6ef3415b69b3" />
 
 
 
