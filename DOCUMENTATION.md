@@ -1,6 +1,6 @@
 # XPOSim documentation
 
-User guide and API reference for **[XPOSim](https://github.com/mamichberdey/XPOSim). Installation is described in [README.md](README.md).
+User guide and API reference for [XPOSim](https://github.com/mamichberdey/XPOSim). Installation is described in [README.md](README.md).
 
 This document describes the single-file implementation in the project repository, checked against commit `a68d920239bf4e5cc0ed5dcd4e3ff68315da44b7`. Examples and reference entries distinguish implemented behavior from intended general optical conventions. All code uses `import XPOSim as xpos`.
 
