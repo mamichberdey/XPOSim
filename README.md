@@ -1,5 +1,9 @@
 # XPOSim
 
+<img width="1648" height="350" alt="image" src="https://github.com/user-attachments/assets/71af40bf-4237-4733-a15e-06110e4b2c1e" />
+
+
+
 **GPU-accelerated paraxial wave-optics simulations for X-ray optical systems.**
 
 XPOSim is a Python library for calculating the propagation and focusing of X-ray radiation in optical systems with one or two transverse dimensions. It models complex wavefields, diffraction, refraction, and absorption, with particular support for compound refractive lenses (CRLs), including lenses with surface errors.
@@ -76,20 +80,16 @@ For another CPU architecture, choose the corresponding installer from the [Minic
 Download the repository with Git:
 
 ```bash
-git clone https://github.com/USERNAME/REPOSITORY.git
+git clone https://github.com/mamichberdey/XPOSim
 ```
-
-Replace `USERNAME/REPOSITORY` with the actual repository address. Git must be installed. The repository URL is a placeholder until the project address is provided.
 
 ### 4. Enter the project directory
 
 Change to the directory created by Git:
 
 ```bash
-cd REPOSITORY
+cd XPOSim
 ```
-
-Replace `REPOSITORY` with the downloaded directory name. Run the following commands from the repository root, where `environment.yml` and `XPOSim.py` are located.
 
 ### 5. Create the environment
 
@@ -277,10 +277,8 @@ Unless a parameter states otherwise, spatial quantities are in metres, angles ar
 Download the repository with Git:
 
 ```bash
-git clone https://github.com/USERNAME/REPOSITORY.git
+git clone https://github.com/mamichberdey/XPOSim
 ```
-
-Replace `USERNAME/REPOSITORY` with the actual repository address. Git must be installed. The repository URL is a placeholder until the project address is provided.
 
 ### 4. Enter the project directory
 
@@ -289,8 +287,6 @@ Change to the directory created by Git:
 ```bash
 cd REPOSITORY
 ```
-
-Replace `REPOSITORY` with the downloaded directory name. Run the following commands from the repository root, where `environment.yml` and `XPOSim.py` are located.
 
 ### 5. Create the environment
 
@@ -328,8 +324,8 @@ Place these database files next to the module:
 
 The tables must be supplied separately if absent from the repository. They are not installed by Conda. Calculating material properties from a chemical formula and density requires them; supplying both `delta` and `beta` directly to `Material` bypasses the database.
 
-''' +s[b:].replace('### 5. Verify the environment','### 8. Verify the environment',1)
-s=s.replace('conda activate xposim','conda activate cu_env')
+''' +s[b:].('### 5. Verify the environment','### 8. Verify the environment',1)
+s=s.('conda activate xposim','conda activate cu_env')
 a=s.index('## Code structure and usage workflow')
 s=s[:a]+'''## Writing an optical simulation: the main logic
 
@@ -538,7 +534,7 @@ print("Parallel-beam focus from the CRL exit (m):", crl_ideal.theoretical_focus(
 print("Finite-distance source image estimate (m):", crl_ideal.effective_focus(Z0))
 ```
 
-These estimates describe the ideal paraxial CRL model and do not replace inspecting the simulated field.
+These estimates describe the ideal paraxial CRL model and do not  inspecting the simulated field.
 
 ## Approximate an extended incoherent source
 
