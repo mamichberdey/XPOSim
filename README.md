@@ -1,59 +1,87 @@
-# XPOSim (X-ray Paraxial Optical Simulation)
+# XPOSim
 
-**GPU-accelerated paraxial wave optics for X-ray optical systems.**
+**X-ray Paraxial Optical Simulation — wave optics with GPU acceleration.**
 
-XPOSim calculates complex wavefields and intensity distributions in optical systems with one or two transverse dimensions. It supports compound refractive lenses (CRLs), apertures, sampled material objects, and lens surface errors. Applications include studying focusing, evaluating optical imperfections, and generating simulated data for X-ray optical diagnostics.
+XPOSim is a Python library for simulating X-ray propagation and focusing in one or two transverse dimensions. It calculates complex wavefields and intensity distributions for compound refractive lenses (CRLs), apertures, and objects described by material-thickness maps, including lens surface errors.
 
-In the paraxial approximation, free-space propagation is a convolution with the Fresnel propagator. The convolution theorem allows this operation to be evaluated efficiently using FFTs. CuPy accelerates the main array calculations on NVIDIA GPUs; NumPy is also supported for CPU calculations.
+The library is intended for studying focal distributions, evaluating optical imperfections, and generating synthetic data for X-ray optical diagnostics.
 
-Project repository: [mamichberdey/XPOSim](https://github.com/mamichberdey/XPOSim).
+### Why XPOSim?
 
-See the [user guide and API reference](DOCUMENTATION.md) for a complete worked example, optical-scheme construction, and parameter descriptions.
+- **Efficient propagation:** the paraxial approximation reduces free-space propagation to a convolution, evaluated using FFTs through the convolution theorem.
+- **GPU acceleration:** CuPy runs the main array operations on NVIDIA GPUs. This is the **recommended setup**, especially for large 2D grids and repeated calculations.
+- **Optional CPU backend:** NumPy and SciPy are sufficient for the library itself; CUDA and CuPy are optional. CPU calculations are useful for small examples and checks, but large simulations will generally be slower.
+
+[Repository](https://github.com/mamichberdey/XPOSim) · [Full documentation and examples](DOCUMENTATION.md)
+
+## Getting started
+
+1. [Download the project](#1-download-the-project).
+2. Choose [GPU installation — recommended](#2-install-with-gpu-support-recommended) or [CPU installation — optional](#alternative-cpu-only-installation).
+3. Follow the [complete example](DOCUMENTATION.md#2-complete-example-point-source-crl-and-detector).
+
+The [physical model](#physical-model) below introduces the equations used by the library. Detailed usage and the API reference are in `DOCUMENTATION.md`.
 
 ## Installation
 
-The following steps target **Linux x86_64 or WSL 2 on x86_64**. Install [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install) first. Git is optional and is needed only if you choose to clone the repository. GPU calculations require a compatible NVIDIA GPU and driver. Under WSL 2, use the Windows NVIDIA driver; see [NVIDIA's WSL guide](https://docs.nvidia.com/cuda/wsl-user-guide/).
+The commands below are for Linux or the Linux terminal in WSL 2. Install [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install) first.
 
-**1. Obtain the project files using either option below.** You only need to choose one.
+### 1. Download the project
 
-- **Download a ZIP archive:** [download the main branch](https://github.com/mamichberdey/XPOSim/archive/refs/heads/main.zip) and extract it. Alternatively, select **Code → Download ZIP** on the [repository page](https://github.com/mamichberdey/XPOSim). Git is not required.
-- **Clone with Git:** install [Git](https://git-scm.com/downloads), then run:
+Choose one option:
+
+- **ZIP archive:** [download and extract the project](https://github.com/mamichberdey/XPOSim/archive/refs/heads/main.zip). Git is not required.
+- **Git clone:** if [Git](https://git-scm.com/downloads) is installed, download the repository with:
 
 ```bash
 git clone https://github.com/mamichberdey/XPOSim.git
 ```
 
-Both options provide the project files needed to run XPOSim. Cloning also retains Git version history and supports fetching later updates; the ZIP archive is a snapshot without that history.
-
-**2. Enter the project directory.** For a Git clone, run this command from the folder where you downloaded the project:
+Enter the project folder. For a Git clone:
 
 ```bash
 cd XPOSim
 ```
 
-For a ZIP download, use the extracted directory name, normally `XPOSim-main`, instead of `XPOSim`. If it is elsewhere, supply its full path. Continue from the project root containing `environment.yml` and `XPOSim.py`.
+For a ZIP archive, use the extracted folder name, normally `XPOSim-main`, instead. The current directory should contain `XPOSim.py` and `environment.yml`.
 
-**3. Create the environment** using the supplied dependency file.
+### 2. Install with GPU support (recommended)
+
+This option requires an NVIDIA GPU and a compatible driver. The supplied environment targets **Linux x86_64 / WSL 2 x86_64** and specifies **CUDA 13.4**. Under WSL 2, GPU access is provided by the Windows NVIDIA driver; see [NVIDIA's setup guide](https://docs.nvidia.com/cuda/wsl-user-guide/).
+
+Create the environment from the supplied dependency file:
 
 ```bash
 conda env create -f environment.yml
 ```
 
-The supplied file specifies CUDA 13.4 and requires compatible hardware and a driver. CUDA dependencies are installed inside the environment; the NVIDIA driver is installed separately.
-
-**4. Activate the environment.** Repeat this step in each new terminal session before running the project.
+Activate it before running the project:
 
 ```bash
 conda activate cu_env
 ```
 
-Run scripts from the repository root, where `XPOSim.py` is located. For formula-based materials, the following data files must be present next to the module:
+The environment includes CuPy and CUDA runtime dependencies. The NVIDIA driver must be installed separately. Select `backend="cupy"` when creating a calculation grid. Repeat the activation command when opening a new terminal session.
 
-- `xray_material_data/AtomicConstants.dat`
-- `xray_material_data/CrossSec-Compton_McMaster.dat`
-- `xray_material_data/f1f2_Windt.dat`
+### Alternative: CPU-only installation
 
-These material tables are included in the repository and in its ZIP archive; Conda does not install them. Materials specified directly by `delta` and `beta` do not require these tables.
+Use this option if a compatible GPU is unavailable or you only need small calculations. **CUDA, an NVIDIA driver, and CuPy are not required.** Create a separate environment with Python and the two required library dependencies:
+
+```bash
+conda create -n xposim_cpu --override-channels -c conda-forge python=3.11 numpy scipy
+```
+
+Activate the CPU environment:
+
+```bash
+conda activate xposim_cpu
+```
+
+Select `backend="numpy"` when creating grids and use NumPy arrays in your code. The supplied GPU `environment.yml` is not needed for this option. Plotting examples additionally require Matplotlib; see the [CPU usage guide](DOCUMENTATION.md#7-one-dimensional-and-cpu-calculations) for backend conventions.
+
+### Project files and material data
+
+Run scripts from the project root so that `XPOSim.py` can be imported. Keep the included `xray_material_data/` directory next to the module: its tables are used to calculate optical constants from chemical formulas and density. Materials specified directly by `delta` and `beta` do not need these tables. This applies to both CPU and GPU calculations.
 
 ## Physical model
 
