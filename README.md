@@ -1,11 +1,5 @@
 # XPOSim (X-ray Paraxial Optical Simulation)
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/2e5871f4-7dce-4fb5-afea-e0f77d400280">
-  <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/4990525d-43d6-4419-b972-7389c84afb40">
-  <img width="600" alt="XPOSim_logo" src="https://github.com/user-attachments/assets/4990525d-43d6-4419-b972-7389c84afb40">
-</picture>
-
 **GPU-accelerated paraxial wave optics for X-ray optical systems.**
 
 XPOSim calculates complex wavefields and intensity distributions in optical systems with one or two transverse dimensions. It supports compound refractive lenses (CRLs), apertures, sampled material objects, and lens surface errors. Applications include studying focusing, evaluating optical imperfections, and generating simulated data for X-ray optical diagnostics.
