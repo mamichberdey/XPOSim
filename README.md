@@ -2,6 +2,10 @@
 
 **X-ray Paraxial Optical Simulation — wave optics with GPU acceleration.**
 
+[![Open CRL Focus in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/c0064f57d16a607b3b971533eaff3410cbf1f6db/notebooks/CRL_Focus_Colab.ipynb)
+
+**Calculate a CRL focus without setting up a local environment.** The [Colab notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/c0064f57d16a607b3b971533eaff3410cbf1f6db/notebooks/CRL_Focus_Colab.ipynb) provides parameter forms, automatic CPU/GPU selection, focus scans, plots, and downloadable results. It pins a checked XPOSim revision and downloads the material tables automatically. Start with the supplied CPU example; GPU access depends on Colab availability. See the [Russian Colab guide](COLAB_GUIDE_RU.md) for setup, numerical checks, and publishing your own notebooks.
+
 [Download ZIP](https://github.com/mamichberdey/XPOSim/archive/refs/heads/main.zip) · [Installation](#2-installation) · [Tutorial](DOCUMENTATION.md#2-complete-example-point-source-crl-and-detector) · [API reference](DOCUMENTATION.md#8-api-reference) · [Repository](https://github.com/mamichberdey/XPOSim)
 
 **Contents**
