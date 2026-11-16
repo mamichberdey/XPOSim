@@ -22,7 +22,7 @@ in ``xray_material_data/`` next to this module.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from numbers import Integral
 from pathlib import Path
 import re
@@ -36,11 +36,11 @@ try:  # CuPy is optional; it is the preferred backend when available.
     import cupy as cp
 
     CUPY_AVAILABLE = True
-except ImportError:  # pragma: no cover - depends on the local machine.
+except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be unusable.
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 __all__ = [
@@ -69,6 +69,10 @@ __all__ = [
     "divergence",
     "gaussian_filter_1d",
     "gaussian_filter_2d",
+    "select_backend",
+    "CRLFocusConfig",
+    "CRLFocusResult",
+    "estimate_crl_focus",
 ]
 
 
@@ -2088,3 +2092,291 @@ def gaussian_filter_2d(field: Any, x: Any, y: Any, sigma_x: float, sigma_y: floa
         -(x_grid / sigma_x) ** 2 / 2 - (y_grid / sigma_y) ** 2 / 2
     ) / (2 * np.pi * sigma_x * sigma_y)
     return _ifft2d(_fft2d(field, dx, dy) * _fft2d(kernel, dx, dy), dx, dy).real
+
+
+# ---------------------------------------------------------------------------
+# Ready-to-run CRL focus workflow (SI parameters; host-side exportable results)
+# ---------------------------------------------------------------------------
+
+
+def select_backend(preferred: str = "auto") -> str:
+    """Select a working backend, probing a small GPU FFT rather than import alone.
+
+    auto falls back to NumPy. An explicit cupy request raises a diagnostic error
+    when CUDA cannot execute. This does not install dependencies or change drivers.
+    """
+    if preferred not in {"auto", "numpy", "cupy"}:
+        raise ValueError("backend must be auto, numpy or cupy.")
+    if preferred == "numpy":
+        return "numpy"
+    failure = "CuPy is not installed or its CUDA libraries could not be imported."
+    if CUPY_AVAILABLE:
+        try:
+            if cp.cuda.runtime.getDeviceCount() < 1:
+                raise RuntimeError("No CUDA device is visible.")
+            probe = cp.fft.fft(cp.asarray([0.0, 1.0]))
+            probe.get()  # Synchronize: asynchronous CUDA errors must be caught here.
+            return "cupy"
+        except Exception as exc:
+            failure = f"CUDA probe failed: {exc}"
+    if preferred == "cupy":
+        raise RuntimeError(failure + " Use backend='auto' or 'numpy' for CPU execution.")
+    return "numpy"
+
+
+@dataclass(frozen=True)
+class CRLFocusConfig:
+    """Parameters for an ideal, centered CRL with an entrance aperture.
+
+    All lengths are metres, energy is keV, density is g/cm^3. A cylindrical lens
+    uses the 1D model; an axisymmetric lens uses the 2D circular-pupil model.
+    A finite point source has unit amplitude at the entrance plane. None selects
+    a plane wave. The incident field is clipped to the nominal lens aperture.
+    Accuracy controls sampling, not the physical model. Automatic grids are
+    heuristic and capped for memory; diagnostics do not establish convergence.
+    """
+
+    energy_kev: float = 12.0
+    material_formula: str = "Be"
+    density_g_cm3: float = 1.848
+    radius_m: float = 50e-6
+    aperture_m: float = 100e-6
+    bridge_thickness_m: float = 30e-6
+    n_elements: int = 10
+    source_distance_m: float | None = 15.0
+    geometry: str = "cylindrical"
+    accuracy: str = "preview"
+    backend: str = "auto"
+    scan_range_m: tuple[float, float] | None = None
+    scan_points: int = 41
+    refine_points: int = 21
+    grid_points: int | None = None
+    window_factor: float = 2.0
+    batch_size: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("energy_kev", "density_g_cm3", "radius_m", "aperture_m", "bridge_thickness_m"):
+            _validate_positive(name, getattr(self, name))
+            object.__setattr__(self, name, float(getattr(self, name)))
+        _validate_count("n_elements", self.n_elements)
+        _validate_count("scan_points", self.scan_points, 5)
+        _validate_count("refine_points", self.refine_points, 0)
+        if self.refine_points in (1, 2):
+            raise ValueError("refine_points must be zero or >= 3.")
+        if self.source_distance_m is not None:
+            _validate_positive("source_distance_m", self.source_distance_m)
+            object.__setattr__(self, "source_distance_m", float(self.source_distance_m))
+        if self.geometry not in {"cylindrical", "axisymmetric"}:
+            raise ValueError("geometry must be cylindrical or axisymmetric.")
+        if self.accuracy not in {"preview", "refined"}:
+            raise ValueError("accuracy must be preview or refined.")
+        if self.backend not in {"auto", "numpy", "cupy"}:
+            raise ValueError("backend must be auto, numpy or cupy.")
+        _validate_positive("window_factor", self.window_factor)
+        if self.window_factor <= 1:
+            raise ValueError("window_factor must be > 1 to contain the entrance aperture.")
+        if self.grid_points is not None:
+            _validate_count("grid_points", self.grid_points, 16)
+        if self.batch_size is not None:
+            _validate_count("batch_size", self.batch_size)
+        for name in ("n_elements", "scan_points", "refine_points", "grid_points", "batch_size"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, int(getattr(self, name)))
+        object.__setattr__(self, "window_factor", float(self.window_factor))
+        if self.scan_range_m is not None:
+            bounds = _validated_distances(self.scan_range_m, nonnegative=True)
+            if bounds.size != 2 or bounds[1] <= bounds[0]:
+                raise ValueError("scan_range_m must contain increasing start and stop distances.")
+            object.__setattr__(self, "scan_range_m", tuple(map(float, bounds)))
+        # Parse the composition before allocating any fields.
+        Material(self.material_formula, self.density_g_cm3).composition()
+
+
+@dataclass
+class CRLFocusResult:
+    """A focus scan and best-plane image as NumPy arrays, independent of CUDA.
+
+    Distances are measured from the CRL exit. The best plane maximizes sampled
+    peak intensity; this need not minimize FWHM. Intensities use relative units.
+    Transmission is exit/input power on the finite grid, after the entrance pupil.
+    longitudinal_intensity contains central x profiles, not stored 2D planes.
+    """
+
+    configuration: CRLFocusConfig
+    backend: str
+    analytical_focus_m: float
+    z_m: np.ndarray
+    peak_intensity: np.ndarray
+    fwhm_m: np.ndarray
+    peak_index: int
+    x_m: np.ndarray
+    y_m: np.ndarray | None
+    best_intensity: np.ndarray
+    longitudinal_intensity: np.ndarray
+    transmission: float
+    delta: float
+    beta: float
+    grid_step_m: float
+    diagnostics: tuple[str, ...]
+
+    @property
+    def peak_z_m(self) -> float:
+        return float(self.z_m[self.peak_index])
+
+    @property
+    def fwhm_at_peak_m(self) -> float | tuple[float | None, float | None] | None:
+        widths = np.atleast_1d(self.fwhm_m[self.peak_index])
+        values = tuple(_optional_float(v) for v in widths)
+        return values[0] if self.configuration.geometry == "cylindrical" else values
+
+    def summary(self) -> dict[str, Any]:
+        """JSON-compatible metadata; arrays are saved separately by the caller."""
+        return {
+            "schema_version": 1, "xposim_version": __version__,
+            "configuration": asdict(self.configuration), "backend": self.backend,
+            "analytical_focus_m": self.analytical_focus_m,
+            "peak_z_m": self.peak_z_m, "fwhm_at_peak_m": self.fwhm_at_peak_m,
+            "peak_intensity": float(self.peak_intensity[self.peak_index]),
+            "transmission_after_entrance_aperture": self.transmission,
+            "delta": self.delta, "beta": self.beta,
+            "grid_points": int(self.x_m.size), "grid_step_m": self.grid_step_m,
+            "window_m": float(self.x_m.size * self.grid_step_m),
+            "sampled_planes": int(self.z_m.size), "diagnostics": list(self.diagnostics),
+            "focus_criterion": "maximum sampled peak intensity",
+            "distance_reference": "CRL exit plane", "intensity_units": "relative",
+            "convergence_checked": False,
+        }
+
+
+def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
+    """Run a centered ideal-CRL calculation, coarse scan and local refinement.
+
+    Only one exit field and its spectrum are calculated. Detector propagation
+    uses bounded batches. The result retains a single best-plane image and
+    central line profiles, without a full stack of 2D images. An automatic scan
+    covers 0.5 to 1.5 times the analytical real-image distance; a boundary peak
+    is reported as unresolved. Supply scan_range_m to inspect another interval.
+    """
+    if not isinstance(configuration, CRLFocusConfig):
+        raise TypeError("Pass a CRLFocusConfig instance.")
+    cfg = configuration
+    backend = select_backend(cfg.backend)
+    material = Material(cfg.material_formula, cfg.density_g_cm3)
+    parameters = dict(radius=cfg.radius_m, aperture=cfg.aperture_m,
+                      bridge_thickness=cfg.bridge_thickness_m,
+                      n_elements=cfg.n_elements, material=material, energy_kev=cfg.energy_kev)
+    # A two-point grid is used only for analytical geometry, never propagated.
+    reference = CRL(grid=Grid1D(cfg.aperture_m, 2, backend="numpy"), **parameters)
+    if not reference.is_focus_outside_crl():
+        raise ValueError("The element count puts the formal focus inside the CRL; reduce n_elements.")
+    analytical = (reference.theoretical_focus() if cfg.source_distance_m is None else
+                  reference.effective_focus(cfg.source_distance_m))
+    if not np.isfinite(analytical) or analytical <= 0:
+        raise ValueError("This source/lens configuration has no finite real image after the CRL.")
+
+    messages: list[str] = []
+    window = cfg.window_factor * cfg.aperture_m
+    wavelength, _ = wavelength_energy(energy_kev=cfg.energy_kev)
+    # Slit and circular-pupil diffraction estimates provide a sampling heuristic.
+    factor = 0.886 if cfg.geometry == "cylindrical" else 1.028
+    expected_width = factor * wavelength * analytical / cfg.aperture_m
+    samples_per_width = 6 if cfg.accuracy == "preview" else 12
+    step_target = expected_width / samples_per_width
+    if cfg.source_distance_m is not None:
+        step_target = min(step_target, wavelength * cfg.source_distance_m / (2 * cfg.aperture_m))
+    required = max(512, 2**int(np.ceil(np.log2(window / step_target))))
+    if cfg.grid_points is None:
+        cap = (65536 if cfg.geometry == "cylindrical" else
+               (2048 if backend == "cupy" or cfg.accuracy == "refined" else 1024))
+        n = min(required, cap)
+        if n < required:
+            messages.append("grid_cap: Automatic grid hit its memory cap; refine sampling before trusting spot size.")
+    else:
+        n = cfg.grid_points
+    step = window / n
+    grid = (Grid1D(step, n, backend=backend) if cfg.geometry == "cylindrical" else
+            Grid2D(step, step, n, n, backend=backend))
+    xp = grid.xp
+    if cfg.source_distance_m is None:
+        incident = xp.ones(grid.shape, dtype=xp.complex128)
+    else:
+        position = 0.0 if grid.dimension == 1 else (0.0, 0.0)
+        incident = PointSource(grid=grid, position=position, energy_kev=cfg.energy_kev).E(cfg.source_distance_m)
+    pupil = (abs(grid.x) <= cfg.aperture_m / 2 if grid.dimension == 1 else
+             grid.x**2 + grid.y**2 <= (cfg.aperture_m / 2)**2)
+    incident *= pupil
+    input_power = _to_python_float(xp.sum(abs(incident)**2))
+    if input_power <= 0:
+        raise ValueError("The entrance aperture is not resolved by the grid; refine sampling or reduce the window.")
+    crl = CRL(input_field=incident, grid=grid, **parameters)
+    exit_field = crl.E()
+    spectrum = grid.fft(exit_field)
+    output_power = _to_python_float(xp.sum(abs(exit_field)**2))
+    transmission = output_power / input_power
+    bounds = cfg.scan_range_m or (0.5 * analytical, 1.5 * analytical)
+    z_values = np.linspace(*bounds, cfg.scan_points)
+    measurements: dict[float, tuple[BeamMetrics, np.ndarray]] = {}
+    slices = (slice(None),) * grid.dimension
+
+    def measure(positions: np.ndarray) -> None:
+        for planes, fields in grid._iter_spectrum(exit_field, spectrum, positions, crl.k, cfg.batch_size):
+            metrics = _beam_metrics_batch(fields, grid, slices)
+            profiles = fields if grid.dimension == 1 else fields[:, n // 2, :]
+            lines = _to_numpy(abs(profiles)**2)
+            for z, metric, line in zip(positions[planes], metrics, lines):
+                measurements[float(z)] = (metric, line.copy())
+            del fields
+
+    measure(z_values)
+    coarse_peaks = np.asarray([measurements[float(z)][0].max_intensity for z in z_values])
+    if not np.all(np.isfinite(coarse_peaks)):
+        raise ArithmeticError("The calculated intensity is non-finite; review numerical parameters.")
+    best_coarse = int(np.argmax(coarse_peaks))
+    if cfg.refine_points and 0 < best_coarse < len(z_values) - 1:
+        fine = np.linspace(z_values[best_coarse - 1], z_values[best_coarse + 1], cfg.refine_points)
+        fine = fine[~np.any(np.isclose(fine[:, None], z_values[None, :], rtol=1e-12, atol=0), axis=1)]
+        if fine.size:
+            measure(fine)
+    z_all = np.asarray(sorted(measurements))
+    metrics = [measurements[float(z)][0] for z in z_all]
+    peaks = np.asarray([m.max_intensity for m in metrics])
+    if not np.all(np.isfinite(peaks)):
+        raise ArithmeticError("The refined intensity is non-finite; review numerical parameters.")
+    best = int(np.argmax(peaks))
+    widths = np.asarray([np.nan if m.fwhm is None else m.fwhm for m in metrics], dtype=float)
+    best_field = grid._propagate_spectrum(spectrum, np.asarray([z_all[best]]), crl.k)[0]
+    if z_all[best] == 0:
+        best_field = exit_field
+    image = _to_numpy(abs(best_field)**2)
+    if best in (0, len(z_all) - 1):
+        messages.append("scan_boundary: Peak is at the scan boundary; widen the scan range.")
+    best_widths = np.atleast_1d(widths[best])
+    if np.any(~np.isfinite(best_widths)):
+        messages.append("fwhm_missing: Half-maximum crossings are outside the measured window.")
+    elif np.min(best_widths) / step < 6:
+        messages.append("sampling: Fewer than six samples across the focal FWHM; use a finer grid.")
+    max_phase_step = crl.k * crl.delta * cfg.n_elements * cfg.aperture_m / cfg.radius_m * step
+    if cfg.source_distance_m is not None:
+        max_phase_step += crl.k * cfg.aperture_m / (2 * cfg.source_distance_m) * step
+    if max_phase_step > np.pi / 2:
+        messages.append("phase_sampling: Lens/source phase changes too rapidly between samples; refine the grid.")
+    rim = max(1, n // 20)
+    if grid.dimension == 1:
+        edge_power = np.sum(image[:rim]) + np.sum(image[-rim:])
+    else:
+        edge_power = (np.sum(image[:rim]) + np.sum(image[-rim:]) +
+                      np.sum(image[rim:-rim, :rim]) + np.sum(image[rim:-rim, -rim:]))
+    total = float(np.sum(image))
+    if total > 0 and edge_power / total > 1e-3:
+        messages.append("window_boundary: Noticeable power reaches the best-plane window edge; enlarge the window.")
+    if transmission < 1e-12:
+        messages.append("low_transmission: The transmitted power is very small; review material and lens thickness.")
+    x_axis = grid.x if grid.dimension == 1 else grid.x_axis
+    return CRLFocusResult(
+        configuration=cfg, backend=backend, analytical_focus_m=float(analytical),
+        z_m=z_all, peak_intensity=peaks, fwhm_m=widths, peak_index=best,
+        x_m=_to_numpy(x_axis).copy(), y_m=None if grid.dimension == 1 else _to_numpy(grid.y_axis).copy(),
+        best_intensity=image, longitudinal_intensity=np.stack([measurements[float(z)][1] for z in z_all]),
+        transmission=float(transmission), delta=float(crl.delta), beta=float(crl.beta),
+        grid_step_m=step, diagnostics=tuple(messages),
+    )
