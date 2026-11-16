@@ -11,6 +11,9 @@ The module deliberately keeps the public model small:
 * NumPy and CuPy are supported without changing the array type of a field;
 * CRL surface errors are specified as sampled height deviations and interpolated
   onto the calculation grid.
+* cached configuration parameters are read-only; CRL.with_parameters constructs
+  a validated replacement without changing the original lens;
+* detector planes can be propagated in bounded batches with shared spectra.
 
 The file is intentionally self-contained. The material database is expected
 in ``xray_material_data/`` next to this module.
@@ -20,9 +23,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 import re
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 import warnings
 
 import numpy as np
@@ -36,7 +40,7 @@ except ImportError:  # pragma: no cover - depends on the local machine.
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 
 __all__ = [
@@ -123,11 +127,54 @@ def _to_numpy(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
+def _validate_finite(name: str, value: float) -> None:
+    """Reject non-finite scalar parameters before numerical calculation."""
+
+    if not np.isscalar(value) or not np.isfinite(value):
+        raise ValueError(f"{name} must be a finite scalar; got {value!r}.")
+
+
 def _validate_positive(name: str, value: float) -> None:
     """Raise ``ValueError`` when a numeric parameter is not strictly positive."""
 
+    _validate_finite(name, value)
     if value <= 0:
         raise ValueError(f"{name} must be > 0; got {value!r}.")
+
+
+def _validate_count(name: str, value: int, minimum: int = 1) -> None:
+    """Reject fractional counts and booleans rather than truncating them."""
+
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}; got {value!r}.")
+
+
+class _Configured:
+    """Protect parameters whose reassignment would invalidate derived state."""
+
+    _configuration_fields: frozenset[str] = frozenset()
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if (getattr(self, "_configuration_frozen", False)
+                and name in self._configuration_fields and name in self.__dict__):
+            raise AttributeError(
+                f"{type(self).__name__}.{name} is read-only. "
+                "Construct a new configuration"
+                + (" with with_parameters(...)." if hasattr(self, "with_parameters") else ".")
+            )
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in self._configuration_fields:
+            raise AttributeError(f"{type(self).__name__}.{name} is read-only.")
+        object.__delattr__(self, name)
+
+    def _freeze_configuration(self) -> None:
+        for name in self._configuration_fields:
+            value = self.__dict__.get(name)
+            if isinstance(value, np.ndarray):
+                value.flags.writeable = False
+        object.__setattr__(self, "_configuration_frozen", True)
 
 
 def wavelength_energy(
@@ -288,7 +335,7 @@ class _MaterialDatabase:
 _DEFAULT_MATERIAL_DATABASE = _MaterialDatabase()
 
 
-class Material:
+class Material(_Configured):
     """Describe a material used by an X-ray optical element.
 
     Parameters
@@ -307,6 +354,7 @@ class Material:
     """
 
     _FORMULA_RE = re.compile(r"([A-Z][a-z]?)([0-9]+(?:[.,][0-9]+)?)?")
+    _configuration_fields = frozenset({"formula", "density", "_database", "_delta", "_beta"})
 
     def __init__(
         self,
@@ -332,6 +380,12 @@ class Material:
 
         if self.density is not None:
             _validate_positive("density", self.density)
+        if self._delta is not None:
+            _validate_finite("delta", self._delta)
+            _validate_finite("beta", self._beta)
+            if self._beta < 0:
+                raise ValueError("beta must be >= 0.")
+        self._freeze_configuration()
 
     def composition(self) -> list[tuple[str, float]]:
         """Parse the chemical formula into ``(element, stoichiometry)`` pairs."""
@@ -347,6 +401,7 @@ class Material:
                 raise ValueError(f"Unsupported chemical formula syntax: {self.formula!r}.")
             element = match.group(1)
             count = 1.0 if match.group(2) is None else float(match.group(2))
+            _validate_positive("stoichiometry", count)
             result.append((element, count))
             position = match.end()
         if position != len(formula) or not result:
@@ -361,10 +416,10 @@ class Material:
         the tabulated range are rejected rather than extrapolated silently.
         """
 
+        _validate_positive("energy_kev", energy_kev)
         if self._delta is not None and self._beta is not None:
             return self._delta, self._beta
 
-        _validate_positive("energy_kev", energy_kev)
         assert self.density is not None
 
         composition = self.composition()
@@ -450,92 +505,195 @@ def _fourier_phase(n: int, sign: int, xp) -> tuple[Any, complex]:
     return phase, scalar
 
 
-def _fft1d(array: Any, dx: float) -> Any:
-    """Compute the centered continuous 1D Fourier transform."""
-
+def _fft1d(array: Any, dx: float, phase_data: Any = None) -> Any:
+    """Centered continuous FFT along the last axis, including field batches."""
     xp = _array_module(array)
-    n = array.shape[0]
-    phase, scalar = _fourier_phase(n, +1, xp)
-    return dx * scalar * phase * xp.fft.fft(array * phase)
+    phase, scalar = phase_data or _fourier_phase(array.shape[-1], +1, xp)
+    result = xp.fft.fft(array * phase, axis=-1)
+    result *= phase
+    result *= dx * scalar
+    return result
 
 
-def _ifft1d(array: Any, dx: float) -> Any:
-    """Compute the centered continuous 1D inverse Fourier transform."""
-
+def _ifft1d(array: Any, dx: float, phase_data: Any = None) -> Any:
+    """Centered continuous inverse FFT along the last axis."""
     xp = _array_module(array)
-    n = array.shape[0]
-    phase, scalar = _fourier_phase(n, -1, xp)
-    return scalar * phase * xp.fft.ifft(array * phase) / dx
+    phase, scalar = phase_data or _fourier_phase(array.shape[-1], -1, xp)
+    result = xp.fft.ifft(array * phase, axis=-1)
+    result *= phase
+    result *= scalar / dx
+    return result
+
+
+def _transform2d(array: Any, dx: float, dy: float, inverse: bool,
+                 phase_data: Any = None) -> Any:
+    """Transform the last two axes without allocating a full 2D phase map."""
+    xp = _array_module(array)
+    ny, nx = array.shape[-2:]
+    if phase_data is None:
+        px, sx = _fourier_phase(nx, -1 if inverse else +1, xp)
+        py, sy = _fourier_phase(ny, -1 if inverse else +1, xp)
+    else:
+        px, sx, py, sy = phase_data
+    work = array * px
+    work *= py[:, None]
+    transform = xp.fft.ifft2 if inverse else xp.fft.fft2
+    result = transform(work, axes=(-2, -1))
+    result *= px
+    result *= py[:, None]
+    result *= sx * sy / (dx * dy) if inverse else dx * dy * sx * sy
+    return result
 
 
 def _fft2d(array: Any, dx: float, dy: float) -> Any:
-    """Compute the centered continuous 2D Fourier transform."""
-
-    xp = _array_module(array)
-    ny, nx = array.shape
-    px, sx = _fourier_phase(nx, +1, xp)
-    py, sy = _fourier_phase(ny, +1, xp)
-    phase = py[:, None] * px[None, :]
-    return dx * dy * sx * sy * phase * xp.fft.fft2(array * phase)
+    return _transform2d(array, dx, dy, False)
 
 
 def _ifft2d(array: Any, dx: float, dy: float) -> Any:
-    """Compute the centered continuous 2D inverse Fourier transform."""
-
-    xp = _array_module(array)
-    ny, nx = array.shape
-    px, sx = _fourier_phase(nx, -1, xp)
-    py, sy = _fourier_phase(ny, -1, xp)
-    phase = py[:, None] * px[None, :]
-    return sx * sy * phase * xp.fft.ifft2(array * phase) / (dx * dy)
+    return _transform2d(array, dx, dy, True)
 
 
-class BaseGrid(ABC):
-    """Common numerical-grid interface shared by 1D and 2D calculations."""
+class BaseGrid(_Configured, ABC):
+    """Immutable numerical-grid parameters and shared CPU/GPU operations.
+
+    Use dataclasses.replace(grid, dx=...) to construct a different grid. Arrays
+    describing the coordinates must also be treated as read-only on the GPU.
+    """
 
     dimension: int
+    _configuration_fields = frozenset({
+        "dx", "dy", "nx", "ny", "backend", "shape", "dimension", "x", "y",
+        "qx", "qy", "x_axis", "y_axis", "qx_axis", "qy_axis", "dqx", "dqy",
+    })
+
+    @property
+    def xp(self):
+        return _backend_module(self.backend)
 
     def _validate_field_backend(self, field: Any) -> None:
-        """Verify that a field uses the backend and shape expected by the grid."""
-
         _array_module(field)
         if _backend_name(field) != self.backend:
-            raise TypeError(
-                f"Field backend is {_backend_name(field)!r}, but the grid uses {self.backend!r}."
-            )
+            raise TypeError(f"Field backend is {_backend_name(field)!r}, but the grid uses {self.backend!r}.")
         if tuple(field.shape) != self.shape:
             raise ValueError(f"Expected field shape {self.shape}, got {field.shape}.")
+        if not np.issubdtype(field.dtype, np.number):
+            raise TypeError("Field arrays must have a numeric dtype.")
 
-    @abstractmethod
-    def propagate(self, field: Any, z: float, k: float) -> Any:
-        """Fresnel-propagate a field by distance ``z``."""
+    def _transform_batch(self, fields: Any, inverse: bool = False) -> Any:
+        key = -1 if inverse else +1
+        if key not in self._phase_cache:
+            px, sx = _fourier_phase(self.nx, key, self.xp)
+            if self.dimension == 1:
+                self._phase_cache[key] = (px, sx)
+            else:
+                py, sy = _fourier_phase(self.ny, key, self.xp)
+                self._phase_cache[key] = (px, sx, py, sy)
+        phase = self._phase_cache[key]
+        if self.dimension == 1:
+            transform = _ifft1d if inverse else _fft1d
+            return transform(fields, self.dx, phase)
+        return _transform2d(fields, self.dx, self.dy, inverse, phase)
 
-    @abstractmethod
     def fft(self, field: Any) -> Any:
-        """Return the centered continuous Fourier transform of a field."""
+        """Return the centered continuous Fourier transform of one field."""
+        self._validate_field_backend(field)
+        return self._transform_batch(field)
 
-    @abstractmethod
     def ifft(self, field: Any) -> Any:
-        """Return the centered continuous inverse Fourier transform of a field."""
+        """Return the centered continuous inverse Fourier transform."""
+        self._validate_field_backend(field)
+        return self._transform_batch(field, inverse=True)
 
-    @abstractmethod
+    def _propagate_spectrum(self, spectrum: Any, z_values: np.ndarray, k: float) -> Any:
+        """Batched inverse FFTs, with separable Fresnel factors along x and y."""
+        xp = self.xp
+        z = xp.asarray(z_values)[:, None]
+        qx = self.qx if self.dimension == 1 else self.qx_axis
+        phase_x = xp.exp((-0.5j / k) * z * qx**2)
+        work = spectrum[None, ...] * (phase_x if self.dimension == 1 else phase_x[:, None, :])
+        if self.dimension == 2:
+            phase_y = xp.exp((-0.5j / k) * z * self.qy_axis**2)
+            work *= phase_y[:, :, None]
+        return self._transform_batch(work, inverse=True)
+
+    def propagate(self, field: Any, z: float, k: float) -> Any:
+        """Fresnel-propagate one field; signed distances are supported."""
+        self._validate_field_backend(field)
+        _validate_finite("z", z)
+        _validate_positive("k", k)
+        if z == 0:
+            return field.copy()
+        return self._propagate_spectrum(self.fft(field), np.asarray([z]), k)[0]
+
+    def _batch_size(self, n_planes: int, dtype: Any, batch_size: int | None) -> int:
+        if batch_size is not None:
+            _validate_count("batch_size", batch_size)
+            return min(n_planes, batch_size)
+        if self.backend == "numpy":
+            return 1  # GPU batching is optional; keep CPU working memory small.
+        free_bytes, _ = cp.cuda.runtime.memGetInfo()
+        field_bytes = int(np.prod(self.shape)) * np.dtype(dtype).itemsize
+        # Reserve space for FFT workspace, spectra, intensity and retained output.
+        return max(1, min(n_planes, 16, int(free_bytes * 0.25) // (6 * field_bytes)))
+
+    def iter_propagate(self, field: Any, z_values: Sequence[float], k: float, *,
+                       batch_size: int | None = None) -> Iterator[tuple[slice, Any]]:
+        """Yield (plane_slice, fields) batches with one shared forward FFT.
+
+        Each batch has shape (batch, *grid.shape). None selects a conservative
+        GPU batch from free memory, or one plane on CPU. The iterator retains
+        no detector stack. Explicit batch sizes override the memory heuristic.
+        """
+        self._validate_field_backend(field)
+        _validate_positive("k", k)
+        z_array = _validated_distances(z_values)
+        spectrum = self.fft(field)
+        yield from self._iter_spectrum(field, spectrum, z_array, k, batch_size)
+
+    def _iter_spectrum(self, field: Any, spectrum: Any, z_array: np.ndarray,
+                       k: float, batch_size: int | None) -> Iterator[tuple[slice, Any]]:
+        size = self._batch_size(len(z_array), spectrum.dtype, batch_size)
+        for start in range(0, len(z_array), size):
+            stop = min(start + size, len(z_array))
+            positions = z_array[start:stop]
+            fields = self._propagate_spectrum(spectrum, positions, k)
+            zero = np.flatnonzero(positions == 0)
+            if zero.size:
+                fields[self.xp.asarray(zero)] = field
+            yield slice(start, stop), fields
+
+    def propagate_many(self, field: Any, z_values: Sequence[float], k: float, *,
+                       batch_size: int | None = None) -> Any:
+        """Return a detector stack; use iter_propagate for bounded output memory."""
+        self._validate_field_backend(field)
+        z_array = _validated_distances(z_values)
+        # Allocate only after validation, and before the iterator sizes its batches.
+        _validate_positive("k", k)
+        if batch_size is not None:
+            _validate_count("batch_size", batch_size)
+        dtype = self.xp.result_type(field.dtype, self.xp.complex128)
+        result = self.xp.empty((len(z_array), *self.shape), dtype=dtype)
+        for planes, fields in self.iter_propagate(field, z_array, k, batch_size=batch_size):
+            result[planes] = fields
+        return result
+
     def convolve(self, field_a: Any, field_b: Any) -> Any:
-        """Convolve two fields using the grid's Fourier convention."""
+        """Convolve two fields using the continuous Fourier convention."""
+        return self.ifft(self.fft(field_a) * self.fft(field_b))
+
+
+def _validated_distances(z_values: Sequence[float], *, nonnegative: bool = False) -> np.ndarray:
+    z = np.array(_to_numpy(z_values), dtype=float, copy=True)
+    if z.ndim != 1 or z.size == 0 or not np.all(np.isfinite(z)):
+        raise ValueError("z_values must be a non-empty, finite 1D sequence.")
+    if nonnegative and np.any(z < 0):
+        raise ValueError("z_values must contain non-negative distances.")
+    return z
 
 
 @dataclass
 class Grid1D(BaseGrid):
-    """Uniform one-dimensional transverse grid.
-
-    Parameters
-    ----------
-    dx:
-        Spatial sampling step in metres.
-    nx:
-        Number of samples.
-    backend:
-        ``"cupy"`` or ``"numpy"``. CuPy is preferred for production runs.
-    """
+    """Uniform 1D grid: dx in metres, nx samples, NumPy or CuPy backend."""
 
     dx: float
     nx: int
@@ -543,65 +701,21 @@ class Grid1D(BaseGrid):
 
     def __post_init__(self) -> None:
         _validate_positive("dx", self.dx)
-        if self.nx < 2:
-            raise ValueError("nx must be >= 2.")
+        _validate_count("nx", self.nx, 2)
         self.backend = self.backend.lower()
-        xp = _backend_module(self.backend)
+        xp = self.xp
         self.x = _centered_coordinates(self.nx, self.dx, xp)
         self.qx = _centered_reciprocal_coordinates(self.nx, self.dx, xp)
         self.dqx = 2 * np.pi / (self.dx * self.nx)
         self.shape = (self.nx,)
         self.dimension = 1
-
-    @property
-    def xp(self):
-        """Return the numerical array module used by the grid."""
-
-        return _backend_module(self.backend)
-
-    def fft(self, field: Any) -> Any:
-        """Compute the centered continuous Fourier transform of a 1D field."""
-
-        self._validate_field_backend(field)
-        return _fft1d(field, self.dx)
-
-    def ifft(self, field: Any) -> Any:
-        """Compute the centered continuous inverse Fourier transform of a 1D spectrum."""
-
-        self._validate_field_backend(field)
-        return _ifft1d(field, self.dx)
-
-    def propagate(self, field: Any, z: float, k: float) -> Any:
-        """Fresnel-propagate a 1D field by ``z`` metres."""
-
-        self._validate_field_backend(field)
-        if z == 0:
-            return field.copy()
-        spectrum = self.fft(field)
-        transfer = self.xp.exp(-1j * (self.qx**2) * z / (2 * k))
-        return self.ifft(spectrum * transfer)
-
-    def convolve(self, field_a: Any, field_b: Any) -> Any:
-        """Convolve two 1D fields using the library's continuous FFT convention."""
-
-        self._validate_field_backend(field_a)
-        self._validate_field_backend(field_b)
-        return self.ifft(self.fft(field_a) * self.fft(field_b))
+        self._phase_cache: dict[int, Any] = {}
+        self._freeze_configuration()
 
 
 @dataclass
 class Grid2D(BaseGrid):
-    """Uniform two-dimensional transverse grid.
-
-    Parameters
-    ----------
-    dx, dy:
-        Spatial sampling steps in metres.
-    nx, ny:
-        Number of samples along x and y.
-    backend:
-        ``"cupy"`` or ``"numpy"``.
-    """
+    """Uniform 2D grid; fields have shape (ny, nx), distances are in metres."""
 
     dx: float
     dy: float
@@ -612,63 +726,25 @@ class Grid2D(BaseGrid):
     def __post_init__(self) -> None:
         _validate_positive("dx", self.dx)
         _validate_positive("dy", self.dy)
-        if self.nx < 2 or self.ny < 2:
-            raise ValueError("nx and ny must both be >= 2.")
+        _validate_count("nx", self.nx, 2)
+        _validate_count("ny", self.ny, 2)
         self.backend = self.backend.lower()
-        xp = _backend_module(self.backend)
-
-        x_axis = _centered_coordinates(self.nx, self.dx, xp)
-        y_axis = _centered_coordinates(self.ny, self.dy, xp)
-        qx_axis = _centered_reciprocal_coordinates(self.nx, self.dx, xp)
-        qy_axis = _centered_reciprocal_coordinates(self.ny, self.dy, xp)
-
-        self.x, self.y = xp.meshgrid(x_axis, y_axis)
-        self.qx, self.qy = xp.meshgrid(qx_axis, qy_axis)
-        self.x_axis = x_axis
-        self.y_axis = y_axis
-        self.qx_axis = qx_axis
-        self.qy_axis = qy_axis
+        xp = self.xp
+        self.x_axis = _centered_coordinates(self.nx, self.dx, xp)
+        self.y_axis = _centered_coordinates(self.ny, self.dy, xp)
+        self.qx_axis = _centered_reciprocal_coordinates(self.nx, self.dx, xp)
+        self.qy_axis = _centered_reciprocal_coordinates(self.ny, self.dy, xp)
+        self.shape = (self.ny, self.nx)
+        # Broadcast views preserve the public 2D interface without four dense maps.
+        self.x = xp.broadcast_to(self.x_axis[None, :], self.shape)
+        self.y = xp.broadcast_to(self.y_axis[:, None], self.shape)
+        self.qx = xp.broadcast_to(self.qx_axis[None, :], self.shape)
+        self.qy = xp.broadcast_to(self.qy_axis[:, None], self.shape)
         self.dqx = 2 * np.pi / (self.dx * self.nx)
         self.dqy = 2 * np.pi / (self.dy * self.ny)
-        self.shape = (self.ny, self.nx)
         self.dimension = 2
-
-    @property
-    def xp(self):
-        """Return the numerical array module used by the grid."""
-
-        return _backend_module(self.backend)
-
-    def fft(self, field: Any) -> Any:
-        """Compute the centered continuous Fourier transform of a 2D field."""
-
-        self._validate_field_backend(field)
-        return _fft2d(field, self.dx, self.dy)
-
-    def ifft(self, field: Any) -> Any:
-        """Compute the centered continuous inverse Fourier transform of a 2D spectrum."""
-
-        self._validate_field_backend(field)
-        return _ifft2d(field, self.dx, self.dy)
-
-    def propagate(self, field: Any, z: float, k: float) -> Any:
-        """Fresnel-propagate a 2D field by ``z`` metres."""
-
-        self._validate_field_backend(field)
-        if z == 0:
-            return field.copy()
-        spectrum = self.fft(field)
-        transfer = self.xp.exp(
-            -1j * (self.qx**2 + self.qy**2) * z / (2 * k)
-        )
-        return self.ifft(spectrum * transfer)
-
-    def convolve(self, field_a: Any, field_b: Any) -> Any:
-        """Convolve two 2D fields using the library's continuous FFT convention."""
-
-        self._validate_field_backend(field_a)
-        self._validate_field_backend(field_b)
-        return self.ifft(self.fft(field_a) * self.fft(field_b))
+        self._phase_cache: dict[int, Any] = {}
+        self._freeze_configuration()
 
 
 # ---------------------------------------------------------------------------
@@ -676,10 +752,14 @@ class Grid2D(BaseGrid):
 # ---------------------------------------------------------------------------
 
 
-class OpticalObject(ABC):
+class OpticalObject(_Configured, ABC):
     """Base class for every object that can produce or transform ``E``."""
 
     c = 299_792_458.0
+    _configuration_fields = frozenset({
+        "grid", "wavelength_m", "energy_kev", "k", "angular_frequency",
+        "x0", "y0", "radius", "center_offset",
+    })
 
     def __init__(
         self,
@@ -702,10 +782,12 @@ class OpticalObject(ABC):
             )
             self.k = 2 * np.pi / self.wavelength_m
             self.angular_frequency = 2 * np.pi * self.c / self.wavelength_m
+        self._freeze_configuration()
 
     def propagate(self, field: Any, z: float) -> Any:
         """Fresnel-propagate ``field`` on this object's grid by ``z`` metres."""
 
+        _validate_finite("z", z)
         if z < 0:
             raise ValueError("Propagation distance z must be >= 0.")
         if self.k is None:
@@ -761,6 +843,16 @@ class OpticalElement(OpticalObject):
             self.grid._validate_field_backend(input_field)
         self.input_field = input_field
 
+    @property
+    def input_field(self) -> Any:
+        return self._input_field
+
+    @input_field.setter
+    def input_field(self, field: Any) -> None:
+        if field is not None:
+            self.grid._validate_field_backend(field)
+        self._input_field = field
+
     def _require_input_field(self) -> Any:
         """Return the incident field or raise a clear error in geometry-only mode."""
         if self.input_field is None:
@@ -768,11 +860,13 @@ class OpticalElement(OpticalObject):
                 f"{type(self).__name__} field calculation requires input_field; "
                 "geometry-only operations remain available without it."
             )
+        self.grid._validate_field_backend(self.input_field)
         return self.input_field
 
     def E(self, z: float = 0.0) -> Any:
         """Return the element's transformed field and optionally propagate it by ``z``."""
 
+        _validate_finite("z", z)
         if z < 0:
             raise ValueError("Propagation distance z must be >= 0.")
         self._require_input_field()
@@ -832,10 +926,14 @@ class PointSource(OpticalObject):
             if len(position_tuple) != 2:
                 raise ValueError("A 2D point source position must contain x0 and y0.")
             self.x0, self.y0 = float(position_tuple[0]), float(position_tuple[1])
+        _validate_finite("source x0", self.x0)
+        if self.y0 is not None:
+            _validate_finite("source y0", self.y0)
 
     def E(self, z: float = 0.0) -> Any:
         """Create the source field at propagation distance ``z`` metres."""
 
+        _validate_positive("z", z)
         if z <= 0:
             raise ValueError("PointSource.E requires z > 0 because the point source is singular at z=0.")
         if self.k is None:
@@ -903,6 +1001,8 @@ class Hole(OpticalElement):
             if len(center) != 2:
                 raise ValueError("A 2D Hole center_offset must contain x0 and y0.")
             self.center_offset = (float(center[0]), float(center[1]))
+        for offset in np.atleast_1d(self.center_offset):
+            _validate_finite("center_offset", offset)
 
     def transmission_mask(self) -> Any:
         """Return the binary aperture mask for the two symmetric holes."""
@@ -913,12 +1013,12 @@ class Hole(OpticalElement):
             return (
                 ((self.grid.x - x0) ** 2 <= self.radius**2)
                 | ((self.grid.x + x0) ** 2 <= self.radius**2)
-            ).astype(self.input_field.dtype)
+            ).astype(self.input_field.dtype if self.input_field is not None else float)
 
         x0, y0 = self.center_offset
         first = (self.grid.x - x0) ** 2 + (self.grid.y - y0) ** 2 <= self.radius**2
         second = (self.grid.x + x0) ** 2 + (self.grid.y + y0) ** 2 <= self.radius**2
-        return (first | second).astype(self.input_field.dtype)
+        return (first | second).astype(self.input_field.dtype if self.input_field is not None else float)
 
     def _field_after_element(self) -> Any:
         """Multiply the input field by the hole mask."""
@@ -937,8 +1037,8 @@ class Blade(OpticalElement):
         """Return the binary blade mask for the object's grid."""
 
         if self.grid.dimension == 1:
-            return (self.grid.x >= 0).astype(self.input_field.dtype)
-        return ((self.grid.x >= 0) & (self.grid.y >= 0)).astype(self.input_field.dtype)
+            return (self.grid.x >= 0).astype(self.input_field.dtype if self.input_field is not None else float)
+        return ((self.grid.x >= 0) & (self.grid.y >= 0)).astype(self.input_field.dtype if self.input_field is not None else float)
 
     def _field_after_element(self) -> Any:
         """Multiply the input field by the blade mask."""
@@ -1000,89 +1100,85 @@ class InterpolatedThicknessDefect(ThicknessDefect):
             Value used outside the defect coordinate bounds (default is 0.0,
             meaning pure ideal thickness).
         """
-        self.defect_array = _to_numpy(defect_array)
+        values = _to_numpy(defect_array)
+        if values.ndim == 1:
+            data = SurfaceError([values, coords])
+            self.coords = data.x_axis
+        elif values.ndim == 2 and isinstance(coords, (tuple, list)) and len(coords) == 2:
+            data = SurfaceError([values, coords[0], coords[1]])
+            self.coords = (data.x_axis, data.y_axis)
+        else:
+            raise ValueError("Defect data must be 1D with x coordinates, or 2D with (x, y) axes.")
+        self.defect_array = data.error
+        _validate_finite("fill_value", fill_value)
         self.fill_value = float(fill_value)
 
-        if isinstance(coords, (tuple, list)):
-            self.coords = tuple(_to_numpy(c) for c in coords)
-        else:
-            self.coords = _to_numpy(coords)
-
     def apply(self, thickness: Any, grid: BaseGrid, element_index: int) -> Any:
-        """Interpolate the defect onto the CRL grid and add it to the thickness."""
+        """Interpolate and add the sampled defect on the calculation backend."""
+        grid._validate_field_backend(thickness)
+        if self.defect_array.ndim != grid.dimension:
+            raise ValueError("Defect dimensionality must match the calculation grid.")
         xp = grid.xp
-
+        coords = (self.coords,) if grid.dimension == 1 else self.coords
+        axes = (grid.x,) if grid.dimension == 1 else (grid.x_axis, grid.y_axis)
+        if any(_to_python_float(axis[0]) < points[0] or
+               _to_python_float(axis[-1]) > points[-1]
+               for axis, points in zip(axes, coords)):
+            warnings.warn(
+                "The defect coordinates do not fully cover the calculation grid. "
+                "Regions outside the defect bounds will use fill_value.",
+                RuntimeWarning, stacklevel=2,
+            )
         if grid.dimension == 1:
-            x_def = self.coords
-            if not isinstance(x_def, np.ndarray) or x_def.ndim != 1:
-                raise ValueError("1D defect coordinates must be a 1D array.")
-
-            grid_x = _to_numpy(grid.x)
-
-            if grid_x.min() < x_def.min() or grid_x.max() > x_def.max():
-                warnings.warn(
-                    "The defect coordinates do not fully cover the CRL grid range. "
-                    "Regions outside the defect bounds will use fill_value.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-
-            interpolated = np.interp(
-                grid_x, x_def, self.defect_array, 
-                left=self.fill_value, right=self.fill_value
-            )
-
+            values = xp.interp(grid.x, xp.asarray(self.coords), xp.asarray(self.defect_array),
+                               left=self.fill_value, right=self.fill_value)
         else:
-            if not (isinstance(self.coords, tuple) and len(self.coords) == 2):
-                raise ValueError("2D defect coordinates must be a tuple (x_def, y_def) of 1D arrays.")
-            
-            x_def, y_def = self.coords
-            if x_def.ndim != 1 or y_def.ndim != 1:
-                raise ValueError("2D defect coordinate axes must be 1D arrays.")
-
-            grid_x_axis = _to_numpy(grid.x_axis)
-            grid_y_axis = _to_numpy(grid.y_axis)
-
-            if (grid_x_axis.min() < x_def.min() or grid_x_axis.max() > x_def.max() or
-                grid_y_axis.min() < y_def.min() or grid_y_axis.max() > y_def.max()):
-                warnings.warn(
-                    "The defect coordinates do not fully cover the CRL grid range. "
-                    "Regions outside the defect bounds will use fill_value.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-
-            interp_func = RegularGridInterpolator(
-                (y_def, x_def),
-                self.defect_array,
-                method="linear",
-                bounds_error=False,
-                fill_value=self.fill_value
-            )
-
-            grid_x = _to_numpy(grid.x)
-            grid_y = _to_numpy(grid.y)
-            points = np.stack((grid_y.flat, grid_x.flat), axis=-1)
-            interpolated = interp_func(points).reshape(grid.shape)
-
-        interpolated_backend = xp.asarray(interpolated, dtype=thickness.dtype)
-        return thickness + interpolated_backend
+            values = _interpolate_map(self.defect_array, *self.coords, grid, self.fill_value)
+        return thickness + values.astype(thickness.dtype, copy=False)
 
 
-class SurfaceError:
+def _interpolate_map(values: Any, x_axis: Any, y_axis: Any,
+                     grid: BaseGrid, fill_value: float) -> Any:
+    """Interpolate a 2D map on its calculation backend when CuPy supports it."""
+    xp = grid.xp
+    interpolator_type = RegularGridInterpolator
+    if grid.backend == "cupy":
+        try:
+            from cupyx.scipy.interpolate import RegularGridInterpolator as interpolator_type
+        except ImportError:
+            # Older CuPy releases can still use the CPU interpolation fallback.
+            xp = np
+    interpolator = interpolator_type(
+        (xp.asarray(y_axis), xp.asarray(x_axis)), xp.asarray(values),
+        method="linear", bounds_error=False, fill_value=fill_value,
+    )
+    if xp is np and grid.backend == "cupy":
+        x_map, y_map = np.meshgrid(_to_numpy(grid.x_axis), _to_numpy(grid.y_axis))
+    else:
+        x_map, y_map = grid.x, grid.y
+    points = xp.stack((y_map.ravel(), x_map.ravel()), axis=-1)
+    return grid.xp.asarray(interpolator(points).reshape(grid.shape))
+
+
+class SurfaceError(_Configured):
     """Surface-height error sampled on an independent regular 1D/2D grid.
 
     Input is ``[error, x]`` or ``[error, x, y]``. For 2D data, ``x`` and
     ``y`` may be 1D axes or 2D ``meshgrid`` coordinate arrays. Values outside
-    the supplied coordinate range are zero.
+    the supplied coordinate range are zero. Data are copied into an immutable
+    snapshot, so later edits of the supplied arrays cannot invalidate lens caches.
     """
+
+    _configuration_fields = frozenset({"error", "x", "y", "x_axis", "y_axis"})
 
     def __init__(self, data: Sequence[Any]) -> None:
         if not isinstance(data, (list, tuple)) or len(data) not in (2, 3):
             raise ValueError("surface_error must be [error, x] or [error, x, y].")
-        self.error = _to_numpy(data[0]).astype(float, copy=False)
-        self.x = _to_numpy(data[1]).astype(float, copy=False)
-        self.y = _to_numpy(data[2]).astype(float, copy=False) if len(data) == 3 else None
+        self.error = _to_numpy(data[0]).astype(float, copy=True)
+        self.x = _to_numpy(data[1]).astype(float, copy=True)
+        self.y = _to_numpy(data[2]).astype(float, copy=True) if len(data) == 3 else None
+        if not all(np.all(np.isfinite(a)) for a in (self.error, self.x, self.y) if a is not None):
+            raise ValueError("Surface values and coordinates must be finite.")
         if self.error.ndim not in (1, 2):
             raise ValueError("surface_error values must be a 1D or 2D array.")
         if self.error.ndim == 1:
@@ -1101,6 +1197,7 @@ class SurfaceError:
             if (self.x_axis.size < 2 or self.y_axis.size < 2 or
                 np.any(np.diff(self.x_axis) <= 0) or np.any(np.diff(self.y_axis) <= 0)):
                 raise ValueError("surface_error coordinate axes must be strictly increasing.")
+        self._freeze_configuration()
 
     @staticmethod
     def _axis_from_coordinates(coords: np.ndarray, name: str) -> np.ndarray:
@@ -1119,16 +1216,11 @@ class SurfaceError:
         if grid.dimension == 1:
             if self.error.ndim != 1:
                 raise ValueError("A 2D surface_error cannot be used with Grid1D.")
-            values = np.interp(_to_numpy(grid.x), self.x_axis, self.error, left=0.0, right=0.0)
-            return grid.xp.asarray(values)
+            return grid.xp.interp(grid.x, grid.xp.asarray(self.x_axis),
+                                  grid.xp.asarray(self.error), left=0.0, right=0.0)
         if self.error.ndim != 2 or self.y_axis is None:
             raise ValueError("A 1D surface_error cannot be used with Grid2D.")
-        interpolator = RegularGridInterpolator(
-            (self.y_axis, self.x_axis), self.error, method="linear",
-            bounds_error=False, fill_value=0.0,
-        )
-        points = np.stack((_to_numpy(grid.y).ravel(), _to_numpy(grid.x).ravel()), axis=-1)
-        return grid.xp.asarray(interpolator(points).reshape(grid.shape))
+        return _interpolate_map(self.error, self.x_axis, self.y_axis, grid, 0.0)
 
 
 class ArrayObject(OpticalElement):
@@ -1140,6 +1232,10 @@ class ArrayObject(OpticalElement):
     the supplied map the object is absent. The map is linearly interpolated
     onto the calculation grid.
     """
+
+    _configuration_fields = OpticalObject._configuration_fields | frozenset({
+        "material", "_thickness_data", "delta", "beta",
+    })
 
     def __init__(
         self,
@@ -1160,6 +1256,8 @@ class ArrayObject(OpticalElement):
         super().__init__(input_field, grid, wavelength_m=wavelength_m, energy_kev=energy_kev)
         self.material = material
         self._thickness_data = SurfaceError(thickness)
+        if self._thickness_data.error.ndim != grid.dimension:
+            raise ValueError("Thickness-map dimensionality must match the calculation grid.")
         if np.any(self._thickness_data.error < 0):
             raise ValueError("ArrayObject thickness cannot be negative.")
         self._warn_if_clipped()
@@ -1171,14 +1269,16 @@ class ArrayObject(OpticalElement):
         else:
             self.delta, self.beta = material.optical_constants(self.energy_kev)
         if self.delta is not None:
-            _validate_positive("material delta", self.delta)
+            _validate_finite("material delta", self.delta)
         if self.beta is not None and self.beta < 0:
             raise ValueError("material beta must be >= 0.")
+        self.clear_cache()
 
     def _warn_if_clipped(self) -> None:
         """Warn only when the supplied object extends beyond the calculation grid."""
         d = self._thickness_data
-        axes = [("x", d.x_axis, _to_numpy(self.grid.x))]
+        x_axis = self.grid.x if self.grid.dimension == 1 else self.grid.x_axis
+        axes = [("x", d.x_axis, _to_numpy(x_axis))]
         if self.grid.dimension == 2 and d.y_axis is not None:
             axes.append(("y", d.y_axis, _to_numpy(self.grid.y_axis)))
         for name, coords, calc_coords in axes:
@@ -1192,11 +1292,9 @@ class ArrayObject(OpticalElement):
 
     def thickness_map(self) -> Any:
         """Return the object's thickness interpolated onto the calculation grid."""
-        values = self._thickness_data.on_grid(self.grid)
-        values_np = _to_numpy(values)
-        if np.any(values_np < 0):
-            raise ValueError("Interpolated ArrayObject thickness cannot be negative.")
-        return values
+        if self._thickness_cache is None:
+            self._thickness_cache = self._thickness_data.on_grid(self.grid)
+        return self._thickness_cache
 
     def transmission(self) -> Any:
         """Return the complex transmission function of the object."""
@@ -1204,14 +1302,20 @@ class ArrayObject(OpticalElement):
             raise ValueError("Transmission calculation requires wavelength_m or energy_kev.")
         if self.delta is None or self.beta is None:
             raise ValueError("Optical constants require energy_kev or explicit material delta/beta.")
-        thickness = self.thickness_map()
-        return self.grid.xp.exp(-1j * self.k * (self.delta - 1j * self.beta) * thickness)
+        if self._transmission_cache is None:
+            thickness = self.thickness_map()
+            self._transmission_cache = self.grid.xp.exp(
+                -1j * self.k * (self.delta - 1j * self.beta) * thickness
+            )
+        return self._transmission_cache
+
+    def clear_cache(self) -> None:
+        self._thickness_cache = None
+        self._transmission_cache = None
 
     def _field_after_element(self) -> Any:
-        """Apply material transmission where thickness is positive; block no material outside."""
-        thickness = self.thickness_map()
-        mask = (thickness > 0).astype(self.input_field.dtype)
-        return self.input_field * self.transmission() * mask
+        """Apply material transmission; zero thickness and out-of-map regions are vacuum."""
+        return self.input_field * self.transmission()
 
 
 # ---------------------------------------------------------------------------
@@ -1268,13 +1372,17 @@ class CRL(OpticalElement):
         The error is added to one parabolic surface, so its contribution to
         total thickness is doubled. Linear interpolation maps it to the CRL grid.
     reuse_element_geometry:
-        Reuse one calculated thickness/transmission map for every element when
-        the element geometry is identical. Per-element defect sequences automatically
-        disable this optimization.
+        Reuse one calculated thickness/transmission map for every element.
+        The current model uses identical geometry and surface error for all elements.
     wavelength_m, energy_kev:
         Optional photon wavelength or energy. Required for propagation and
         transmission calculations; not required for geometry-only use.
     """
+
+    _configuration_fields = OpticalObject._configuration_fields | frozenset({
+        "aperture", "bridge_thickness", "n_elements", "material", "transverse_length",
+        "rotation", "reuse_element_geometry", "_surface_error", "delta", "beta",
+    })
 
     def __init__(
         self,
@@ -1288,7 +1396,7 @@ class CRL(OpticalElement):
         material: Material,
         transverse_length: float | None = None,
         rotation: float = 0.0,
-        surface_error: Sequence[Any] | None = None,
+        surface_error: Sequence[Any] | SurfaceError | None = None,
         reuse_element_geometry: bool = True,
         wavelength_m: float | None = None,
         energy_kev: float | None = None,
@@ -1306,8 +1414,8 @@ class CRL(OpticalElement):
         _validate_positive("radius", radius)
         _validate_positive("aperture", aperture)
         _validate_positive("bridge_thickness", bridge_thickness)
-        if n_elements < 1:
-            raise ValueError("n_elements must be >= 1.")
+        _validate_count("n_elements", n_elements)
+        _validate_finite("rotation", rotation)
 
         self.radius = float(radius)
         self.aperture = float(aperture)
@@ -1317,7 +1425,12 @@ class CRL(OpticalElement):
         self.transverse_length = None if transverse_length is None else float(transverse_length)
         self.rotation = float(rotation)
         self.reuse_element_geometry = bool(reuse_element_geometry)
-        self._surface_error = None if surface_error is None else SurfaceError(surface_error)
+        self._surface_error = (
+            surface_error if isinstance(surface_error, SurfaceError) or surface_error is None
+            else SurfaceError(surface_error)
+        )
+        if self._surface_error is not None and self._surface_error.error.ndim != grid.dimension:
+            raise ValueError("Surface-error dimensionality must match the calculation grid.")
 
         if self.transverse_length is not None:
             _validate_positive("transverse_length", self.transverse_length)
@@ -1339,7 +1452,6 @@ class CRL(OpticalElement):
         if self.beta is not None and self.beta < 0:
             raise ValueError("material beta must be >= 0.")
 
-        self.element_length = self.bridge_thickness + self.aperture**2 / (4 * self.radius)
         self._thickness_cache: dict[int, Any] = {}
         self._transmission_cache: dict[int, Any] = {}
 
@@ -1352,6 +1464,32 @@ class CRL(OpticalElement):
                 RuntimeWarning,
                 stacklevel=2,
             )
+
+    def with_parameters(self, **changes: Any) -> "CRL":
+        """Construct a validated CRL with fresh caches and selected replacements.
+
+        The incident field is shared unless input_field is replaced. Surface maps
+        are immutable snapshots. The original lens remains valid if validation of
+        the replacement fails. Photon energy or wavelength can be replaced alone.
+        """
+        parameters = dict(
+            input_field=self.input_field, grid=self.grid, radius=self.radius,
+            aperture=self.aperture, bridge_thickness=self.bridge_thickness,
+            n_elements=self.n_elements, material=self.material,
+            transverse_length=self.transverse_length, rotation=self.rotation,
+            surface_error=self._surface_error,
+            reuse_element_geometry=self.reuse_element_geometry,
+            energy_kev=self.energy_kev,
+        )
+        if "wavelength_m" in changes and "energy_kev" not in changes:
+            parameters.pop("energy_kev")
+        parameters.update(changes)
+        return type(self)(**parameters)
+
+    @property
+    def element_length(self) -> float:
+        """Axial extent derived from the immutable geometry."""
+        return self.bridge_thickness + self.aperture**2 / (4 * self.radius)
 
     @property
     def element_period(self) -> float:
@@ -1424,11 +1562,14 @@ class CRL(OpticalElement):
         assert self._surface_error is not None
         error = self._surface_error
         half_x = self.aperture / 2
-        self._warn_extent_axis("x", error.x, -half_x, half_x)
+        half_y = (self.transverse_length / 2
+                  if self.transverse_length is not None else half_x)
+        if self.grid.dimension == 2 and self.transverse_length is not None:
+            c, s = abs(np.cos(self.rotation)), abs(np.sin(self.rotation))
+            half_x, half_y = c * half_x + s * half_y, s * half_x + c * half_y
+        self._warn_extent_axis("x", error.x_axis, -half_x, half_x)
         if error.error.ndim == 2 and error.y is not None:
-            half_y = (self.transverse_length / 2
-                      if self.transverse_length is not None else self.aperture / 2)
-            self._warn_extent_axis("y", error.y, -half_y, half_y)
+            self._warn_extent_axis("y", error.y_axis, -half_y, half_y)
 
     @staticmethod
     def _warn_extent_axis(axis: str, coords: np.ndarray, lower: float, upper: float) -> None:
@@ -1465,8 +1606,8 @@ class CRL(OpticalElement):
 
         if self._surface_error is not None:
             error_map = self._surface_error.on_grid(self.grid).astype(sag.dtype, copy=False)
-            # A surface defect is defined only inside the CRL aperture. Coordinates
-            # are interpreted in the CRL's local frame, including after rotation.
+            # Sampled errors use laboratory coordinates; the aperture mask follows
+            # the rotated lens geometry.
             if self.grid.dimension == 1:
                 aperture_mask = abs(x_local) <= self.aperture / 2
             elif self.transverse_length is not None:
@@ -1486,6 +1627,7 @@ class CRL(OpticalElement):
         geometry is constructed.
         """
 
+        _validate_count("element_index", element_index, 0)
         if not 0 <= element_index < self.n_elements:
             raise IndexError("element_index is outside the CRL range.")
         if self.reuse_element_geometry and self._thickness_cache:
@@ -1498,9 +1640,8 @@ class CRL(OpticalElement):
         self.grid._validate_field_backend(thickness)
         if not np.issubdtype(thickness.dtype, np.number):
             raise TypeError("CRL thickness defect returned a non-numeric array.")
-        thickness_values = _to_numpy(thickness)
-        if np.any(thickness_values <= 0):
-            min_thickness = float(np.min(thickness_values))
+        if bool(self.grid.xp.any(~self.grid.xp.isfinite(thickness) | (thickness <= 0)).item()):
+            min_thickness = _to_python_float(self.grid.xp.min(thickness))
             raise ValueError(
                 "surface_error removes too much material: the resulting CRL "
                 f"thickness must stay positive (minimum thickness is {min_thickness:g} m)."
@@ -1514,6 +1655,9 @@ class CRL(OpticalElement):
     def transmission(self, element_index: int = 0) -> Any:
         """Return the complex transmission function of one CRL element."""
 
+        _validate_count("element_index", element_index, 0)
+        if element_index >= self.n_elements:
+            raise IndexError("element_index is outside the CRL range.")
         if self.reuse_element_geometry and self._transmission_cache:
             return next(iter(self._transmission_cache.values()))
         if element_index in self._transmission_cache:
@@ -1548,7 +1692,8 @@ class CRL(OpticalElement):
     def theoretical_focus(self, *, n_elements: int | None = None) -> float:
         """Return the formal paraxial focal distance from the CRL exit reference plane."""
 
-        count = self.n_elements if n_elements is None else int(n_elements)
+        count = self.n_elements if n_elements is None else n_elements
+        _validate_count("n_elements", count)
         if count < 1:
             raise ValueError("n_elements must be >= 1.")
         critical = self.critical_element_count()
@@ -1571,7 +1716,8 @@ class CRL(OpticalElement):
         """Return the finite-object image distance from the CRL exit reference plane."""
 
         _validate_positive("source_distance", source_distance)
-        count = self.n_elements if n_elements is None else int(n_elements)
+        count = self.n_elements if n_elements is None else n_elements
+        _validate_count("n_elements", count)
         if count < 1:
             raise ValueError("n_elements must be >= 1.")
         if count > self.max_element_count():
@@ -1602,7 +1748,8 @@ class CRL(OpticalElement):
 
         _validate_positive("source_distance", source_distance)
         _validate_positive("image_distance", image_distance)
-        count = self.n_elements if n_elements is None else int(n_elements)
+        count = self.n_elements if n_elements is None else n_elements
+        _validate_count("n_elements", count)
         if count < 1:
             raise ValueError("n_elements must be >= 1.")
         lc = self.characteristic_length
@@ -1618,7 +1765,8 @@ class CRL(OpticalElement):
         """Return the analytical image/source distance ratio for a finite object."""
 
         _validate_positive("source_distance", source_distance)
-        count = self.n_elements if n_elements is None else int(n_elements)
+        count = self.n_elements if n_elements is None else n_elements
+        _validate_count("n_elements", count)
         if count > self.max_element_count():
             raise ValueError("The requested element count exceeds max_element_count().")
         lc = self.characteristic_length
@@ -1632,7 +1780,8 @@ class CRL(OpticalElement):
     def is_focus_outside_crl(self, *, n_elements: int | None = None) -> bool:
         """Return whether the specified integer element count gives an external focus."""
 
-        count = self.n_elements if n_elements is None else int(n_elements)
+        count = self.n_elements if n_elements is None else n_elements
+        _validate_count("n_elements", count)
         return count <= self.max_element_count()
 
     def focus_scan(
@@ -1642,60 +1791,49 @@ class CRL(OpticalElement):
         roi: Any = None,
         return_fields: bool = False,
         calculate_divergence: bool = False,
+        batch_size: int | None = None,
     ) -> "FocusScanResult":
-        """Propagate one CRL exit field to many positions and collect beam metrics.
+        """Scan detector planes with one CRL evaluation and one forward FFT.
 
-        The CRL itself is evaluated once. Only Fresnel propagation is repeated
-        for each requested ``z``. When ``return_fields=False`` no detector-image
-        stack is retained. ``roi`` is specified in physical transverse coordinates.
+        Independent planes use batched inverse FFTs on the calculation backend.
+        batch_size=None selects a conservative GPU memory heuristic; CPU defaults
+        to one plane. Set batch_size=1 for minimum working memory. Metrics stay
+        on the backend until reduction to a few scalars per plane. With
+        return_fields=True, only the final cropped stack is retained, without
+        views holding full-grid fields alive. Output storage is still O(nz).
         """
-
-        z_array = np.asarray(z_values, dtype=float)
-        if z_array.ndim != 1 or len(z_array) == 0:
-            raise ValueError("z_values must be a non-empty 1D sequence.")
-        if np.any(z_array < 0):
-            raise ValueError("z_values must contain non-negative distances.")
-
+        z_array = _validated_distances(z_values, nonnegative=True)
+        if batch_size is not None:
+            _validate_count("batch_size", batch_size)
+        slices = _roi_slices(self.grid, roi)
         if not self.is_focus_outside_crl():
             warnings.warn(
                 "CRL focus_scan skipped because the theoretical focus lies inside the CRL.",
-                RuntimeWarning,
-                stacklevel=2,
+                RuntimeWarning, stacklevel=2,
             )
             return FocusScanResult.invalid()
 
         E0 = self.E(z=0)
-        E_stack = []
+        spectrum = self.grid.fft(E0)
+        # Free-space propagation changes Fourier phase, not angular intensity.
+        div = _divergence_from_spectrum(spectrum, self.grid, self.k) if calculate_divergence else None
+        x_roi, y_roi = _coordinates_for_slices(self.grid, slices)
+        roi_shape = (x_roi.size,) if self.grid.dimension == 1 else (y_roi.size, x_roi.size)
+        E_array = (self.grid.xp.empty((len(z_array), *roi_shape), dtype=spectrum.dtype)
+                   if return_fields else None)
         metrics: list[BeamMetrics] = []
-        for z in z_array:
-            E = self.propagate(E0, float(z))
-            measured = beam_metrics(
-                E,
-                self.grid,
-                roi=roi,
-                calculate_divergence=calculate_divergence,
-                k=self.k,
-            )
-            metrics.append(measured)
+        for planes, fields in self.grid._iter_spectrum(E0, spectrum, z_array, self.k, batch_size):
+            metrics.extend(_beam_metrics_batch(fields, self.grid, slices, div))
             if return_fields:
-                E_stack.append(_crop_field(E, self.grid, roi))
+                E_array[planes] = fields[(slice(None), *slices)]
+            del fields
 
-        max_intensities = np.asarray([m.max_intensity for m in metrics], dtype=float)
-        peak_index = (
-            None
-            if len(max_intensities) == 0 or np.all(np.isnan(max_intensities))
-            else int(np.nanargmax(max_intensities))
-        )
-        E_array = self.grid.xp.stack(E_stack, axis=0) if return_fields else None
-        x_roi, y_roi = _roi_coordinates(self.grid, roi)
-        peak_z = None if peak_index is None else float(z_array[peak_index])
+        peaks = np.asarray([m.max_intensity for m in metrics])
+        peak_index = None if np.all(np.isnan(peaks)) else int(np.nanargmax(peaks))
         return FocusScanResult(
-            metrics=metrics,
-            peak_index=peak_index,
-            peak_z=peak_z,
-            E=E_array,
-            x_roi=x_roi,
-            y_roi=y_roi,
+            metrics=metrics, peak_index=peak_index,
+            peak_z=None if peak_index is None else float(z_array[peak_index]),
+            E=E_array, x_roi=x_roi, y_roi=y_roi,
         )
 
 
@@ -1710,7 +1848,7 @@ class BeamMetrics:
 
     max_intensity: float
     center: float | tuple[float, float] | None
-    fwhm: float | tuple[float, float] | None
+    fwhm: float | tuple[float | None, float | None] | None
     divergence: float | tuple[float, float] | None = None
 
 
@@ -1764,213 +1902,160 @@ def intensity(field: Any) -> Any:
     return abs(field) ** 2
 
 
-def _crossing_linear(x0: float, y0: float, x1: float, y1: float, target: float) -> float:
-    """Linearly interpolate an x-coordinate where a sampled curve reaches ``target``."""
+def _widths_batch(profiles: Any, coordinates: Any) -> Any:
+    """Vectorized, peak-crossing FWHM for (batch, samples) profiles on CPU/GPU."""
+    xp = _array_module(profiles)
+    batch, n = profiles.shape
+    if n < 2:
+        return xp.full(batch, xp.nan)
+    rows = xp.arange(batch)
+    indices = xp.arange(n)[None, :]
+    peak = xp.argmax(xp.where(xp.isnan(profiles), -xp.inf, profiles), axis=1)
+    maxima = profiles[rows, peak]
+    half = maxima[:, None] / 2
+    left = xp.max(xp.where((indices < peak[:, None]) & (profiles < half), indices, -1), axis=1)
+    right = xp.min(xp.where((indices > peak[:, None]) & (profiles < half), indices, n), axis=1)
+    li = xp.clip(left, 0, n - 2)
+    ri = xp.clip(right, 1, n - 1)
 
-    if y1 == y0:
-        return float((x0 + x1) / 2)
-    return float(x0 + (target - y0) * (x1 - x0) / (y1 - y0))
+    def crossing(i0, i1):
+        v0, v1 = profiles[rows, i0], profiles[rows, i1]
+        denominator = v1 - v0
+        fraction = (maxima / 2 - v0) / xp.where(denominator == 0, 1, denominator)
+        fraction = xp.where(denominator == 0, 0.5, fraction)
+        return coordinates[i0] + fraction * (coordinates[i1] - coordinates[i0])
+
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        widths = crossing(ri - 1, ri) - crossing(li, li + 1)
+    valid = (xp.all(xp.isfinite(profiles), axis=1) & (maxima > 0)
+             & (left >= 0) & (right < n) & (widths >= 0))
+    return xp.where(valid, widths, xp.nan)
 
 
-def full_width_half_max(
-    intensity_array: Any,
-    coordinate: Any,
-) -> float | None:
-    """Return FWHM of a 1D intensity profile or ``None`` if no valid pair exists.
+def _optional_float(value: float) -> float | None:
+    return float(value) if np.isfinite(value) else None
 
-    The profile may be any NumPy/CuPy array; ``axis`` identifies the 1D slice.
-    For multidimensional input the remaining dimensions must already represent
-    a single profile. The routine uses linear interpolation around the half-max
-    crossings and does not require an exactly Gaussian beam.
+
+def full_width_half_max(intensity_array: Any, coordinate: Any) -> float | None:
+    """Return interpolated FWHM around the largest peak, or None.
+
+    The profile stays on its backend; only the final scalar is transferred from
+    a GPU. Both half-maximum crossings must lie inside the sampled coordinates.
     """
-
-    arr = _to_numpy(intensity_array).astype(float, copy=False)
-    coord = _to_numpy(coordinate).astype(float, copy=False)
+    xp = cp if CUPY_AVAILABLE and isinstance(intensity_array, cp.ndarray) else np
+    arr = xp.asarray(intensity_array, dtype=float)
     if arr.ndim != 1:
-        arr = np.asarray(np.squeeze(arr))
-    if arr.ndim != 1 or coord.ndim != 1 or len(arr) != len(coord):
-        raise ValueError("full_width_half_max expects a one-dimensional profile and coordinate array.")
-    if not np.all(np.isfinite(arr)):
-        return None
-
-    max_value = float(np.max(arr))
-    if max_value <= 0:
-        return None
-    half = max_value / 2.0
-    peak = int(np.argmax(arr))
-
-    left_indices = np.where(arr[:peak] < half)[0]
-    right_indices = np.where(arr[peak + 1 :] < half)[0]
-    if len(left_indices) == 0 or len(right_indices) == 0:
-        return None
-
-    left_i = int(left_indices[-1])
-    right_i = int(peak + 1 + right_indices[0])
-    left_cross = _crossing_linear(
-        coord[left_i], arr[left_i], coord[left_i + 1], arr[left_i + 1], half
-    )
-    right_cross = _crossing_linear(
-        coord[right_i - 1], arr[right_i - 1], coord[right_i], arr[right_i], half
-    )
-    width = right_cross - left_cross
-    return float(width) if width >= 0 else None
+        arr = arr.squeeze()
+    coord = xp.asarray(_to_numpy(coordinate) if xp is np else coordinate, dtype=float)
+    if arr.ndim != 1 or coord.ndim != 1 or arr.size != coord.size:
+        raise ValueError("full_width_half_max expects matching one-dimensional arrays.")
+    if not bool(xp.all(xp.isfinite(coord)).item()) or bool(xp.any(xp.diff(coord) <= 0).item()):
+        raise ValueError("FWHM coordinates must be finite and strictly increasing.")
+    return _optional_float(_to_python_float(_widths_batch(arr[None, :], coord)[0]))
 
 
-def _roi_coordinates(grid: BaseGrid, roi: Any) -> tuple[Any, Any | None]:
-    """Return backend-preserving transverse coordinate axes after ROI cropping."""
-
-    if grid.dimension == 1:
-        x = grid.x
-        if roi is None:
-            return x, None
-        if not (isinstance(roi, Sequence) and len(roi) == 2):
-            raise ValueError("1D roi must be (xmin, xmax).")
-        xmin, xmax = map(float, roi)
-        mask = (x >= xmin) & (x <= xmax)
-        indices = _to_numpy(np.where(_to_numpy(mask))[0])
-        if len(indices) == 0:
-            raise ValueError("1D ROI does not overlap the grid.")
-        return x[int(indices[0]) : int(indices[-1]) + 1], None
-
-    x_axis, y_axis = grid.x_axis, grid.y_axis
+def _roi_slices(grid: BaseGrid, roi: Any) -> tuple[slice, ...]:
+    """Resolve physical bounds once using only 1D coordinate axes."""
     if roi is None:
-        return x_axis, y_axis
-    if not (isinstance(roi, Sequence) and len(roi) == 2):
-        raise ValueError("2D roi must be ((xmin, xmax), (ymin, ymax)).")
-    (xmin, xmax), (ymin, ymax) = roi
-    xmask = (x_axis >= float(xmin)) & (x_axis <= float(xmax))
-    ymask = (y_axis >= float(ymin)) & (y_axis <= float(ymax))
-    xi = _to_numpy(np.where(_to_numpy(xmask))[0])
-    yi = _to_numpy(np.where(_to_numpy(ymask))[0])
-    if len(xi) == 0 or len(yi) == 0:
-        raise ValueError("2D ROI does not overlap the grid.")
-    return (
-        x_axis[int(xi[0]) : int(xi[-1]) + 1],
-        y_axis[int(yi[0]) : int(yi[-1]) + 1],
-    )
+        return (slice(None),) * grid.dimension
+    if not isinstance(roi, Sequence) or len(roi) != 2:
+        raise ValueError("ROI must be (xmin, xmax) or ((xmin, xmax), (ymin, ymax)).")
+    bounds = [roi] if grid.dimension == 1 else [roi[1], roi[0]]
+    axes = [grid.x] if grid.dimension == 1 else [grid.y_axis, grid.x_axis]
+    result = []
+    for axis, limits in zip(axes, bounds):
+        limits = np.asarray(limits, dtype=float)
+        if limits.shape != (2,) or not np.all(np.isfinite(limits)) or limits[0] > limits[1]:
+            raise ValueError("ROI bounds must be finite, ordered pairs.")
+        coords = _to_numpy(axis)
+        start = int(np.searchsorted(coords, limits[0], side="left"))
+        stop = int(np.searchsorted(coords, limits[1], side="right"))
+        if start >= stop:
+            raise ValueError("ROI does not overlap the grid.")
+        result.append(slice(start, stop))
+    return tuple(result)
+
+
+def _coordinates_for_slices(grid: BaseGrid, slices: tuple[slice, ...]) -> tuple[Any, Any]:
+    if grid.dimension == 1:
+        return grid.x[slices[0]], None
+    return grid.x_axis[slices[1]], grid.y_axis[slices[0]]
+
+
+def _roi_coordinates(grid: BaseGrid, roi: Any) -> tuple[Any, Any]:
+    return _coordinates_for_slices(grid, _roi_slices(grid, roi))
 
 
 def _crop_field(field: Any, grid: BaseGrid, roi: Any) -> Any:
-    """Crop a field to a physical-coordinate ROI without changing its backend."""
+    return field[_roi_slices(grid, roi)]
 
-    if roi is None:
-        return field
 
+def _beam_metrics_batch(fields: Any, grid: BaseGrid, slices: tuple[slice, ...],
+                        divergence_value: Any = None) -> list[BeamMetrics]:
+    """Reduce intensities and peak-crossing slices without host image copies."""
+    xp = grid.xp
+    work = fields[(slice(None), *slices)]
+    values = abs(work)**2
+    batch = values.shape[0]
+    rows = xp.arange(batch)
+    flat = xp.where(xp.isnan(values), -xp.inf, values).reshape(batch, -1)
+    peaks = xp.argmax(flat, axis=1)
+    maxima = flat[rows, peaks]
+    finite = xp.any(xp.isfinite(values).reshape(batch, -1), axis=1)
+    x_axis, y_axis = _coordinates_for_slices(grid, slices)
     if grid.dimension == 1:
-        if not (isinstance(roi, Sequence) and len(roi) == 2):
-            raise ValueError("1D roi must be (xmin, xmax).")
-        xmin, xmax = map(float, roi)
-        mask = (grid.x >= xmin) & (grid.x <= xmax)
-        indices = _to_numpy(np.where(_to_numpy(mask))[0])
-        if len(indices) == 0:
-            raise ValueError("1D ROI does not overlap the grid.")
-        return field[int(indices[0]) : int(indices[-1]) + 1]
-
-    if not (isinstance(roi, Sequence) and len(roi) == 2):
-        raise ValueError("2D roi must be ((xmin, xmax), (ymin, ymax)).")
-    (xmin, xmax), (ymin, ymax) = roi
-    xmask = (grid.x_axis >= float(xmin)) & (grid.x_axis <= float(xmax))
-    ymask = (grid.y_axis >= float(ymin)) & (grid.y_axis <= float(ymax))
-    xi = _to_numpy(np.where(_to_numpy(xmask))[0])
-    yi = _to_numpy(np.where(_to_numpy(ymask))[0])
-    if len(xi) == 0 or len(yi) == 0:
-        raise ValueError("2D ROI does not overlap the grid.")
-    return field[int(yi[0]) : int(yi[-1]) + 1, int(xi[0]) : int(xi[-1]) + 1]
+        widths = _widths_batch(values, x_axis)
+        table = _to_numpy(xp.stack((maxima, x_axis[peaks], widths, finite), axis=1))
+        return [BeamMetrics(float(m), float(c), _optional_float(w), divergence_value)
+                if ok else BeamMetrics(np.nan, None, None, None) for m, c, w, ok in table]
+    j, i = peaks // values.shape[-1], peaks % values.shape[-1]
+    width_x = _widths_batch(values[rows, j, :], x_axis)
+    width_y = _widths_batch(values[rows, :, i], y_axis)
+    table = _to_numpy(xp.stack((maxima, x_axis[i], y_axis[j], width_x, width_y, finite), axis=1))
+    return [BeamMetrics(float(m), (float(cx), float(cy)),
+                        (_optional_float(wx), _optional_float(wy)), divergence_value)
+            if ok else BeamMetrics(np.nan, None, None, None)
+            for m, cx, cy, wx, wy, ok in table]
 
 
-def beam_metrics(
-    field: Any,
-    grid: BaseGrid,
-    *,
-    roi: Any = None,
-    calculate_divergence: bool = False,
-    k: float | None = None,
-) -> BeamMetrics:
-    """Measure peak intensity, beam center, FWHM and optionally divergence.
-
-    The optional ``roi`` is interpreted in physical coordinates and all peak/FWHM
-    measurements are performed in the cropped coordinate system.
-    """
-
+def beam_metrics(field: Any, grid: BaseGrid, *, roi: Any = None,
+                 calculate_divergence: bool = False, k: float | None = None) -> BeamMetrics:
+    """Measure peak, peak position and slice FWHM; divergence uses the full field."""
     grid._validate_field_backend(field)
+    slices = _roi_slices(grid, roi)
     if calculate_divergence and k is None:
         raise ValueError("k is required when calculate_divergence=True.")
-
-    work = _crop_field(field, grid, roi)
-    values_np = _to_numpy(intensity(work))
-    if not np.any(np.isfinite(values_np)):
-        return BeamMetrics(np.nan, None, None, None)
-
-    max_flat = int(np.nanargmax(values_np))
-    max_value = float(values_np.flat[max_flat])
-
-    if grid.dimension == 1:
-        if roi is None:
-            coord = _to_numpy(grid.x)
-        else:
-            xmin, xmax = map(float, roi)
-            full_coord = _to_numpy(grid.x)
-            coord = full_coord[(full_coord >= xmin) & (full_coord <= xmax)]
-
-        center_index = int(np.nanargmax(values_np))
-        center = float(coord[center_index])
-        fwhm_value = full_width_half_max(values_np, coord)
-        div = divergence(field, grid, k) if calculate_divergence else None
-        return BeamMetrics(max_value, center, fwhm_value, div)
-
-    local_j, local_i = np.unravel_index(max_flat, values_np.shape)
-    if roi is None:
-        x_axis = _to_numpy(grid.x_axis)
-        y_axis = _to_numpy(grid.y_axis)
-    else:
-        (xmin, xmax), (ymin, ymax) = roi
-        full_x = _to_numpy(grid.x_axis)
-        full_y = _to_numpy(grid.y_axis)
-        x_axis = full_x[(full_x >= float(xmin)) & (full_x <= float(xmax))]
-        y_axis = full_y[(full_y >= float(ymin)) & (full_y <= float(ymax))]
-
-    slice_y = values_np[:, local_i]
-    slice_x = values_np[local_j, :]
-    fwhm_y = full_width_half_max(slice_y, y_axis)
-    fwhm_x = full_width_half_max(slice_x, x_axis)
-    center = (float(x_axis[local_i]), float(y_axis[local_j]))
     div = divergence(field, grid, k) if calculate_divergence else None
-    return BeamMetrics(max_value, center, (fwhm_x, fwhm_y), div)
+    return _beam_metrics_batch(field[None, ...], grid, slices, div)[0]
 
 
-def divergence(
-    field: Any,
-    grid: BaseGrid,
-    k: float,
-) -> float | tuple[float, float] | None:
-    """Estimate far-field angular FWHM when the object's wavenumber is known."""
-
+def divergence(field: Any, grid: BaseGrid, k: float) -> float | tuple[float, float] | None:
+    """Far-field angular FWHM, reducing the Fourier intensity on its backend."""
     _validate_positive("k", k)
-    grid._validate_field_backend(field)
-    spectrum = grid.ifft(field)
-    values = _to_numpy(intensity(spectrum))
+    spectrum = grid.fft(field)
+    return _divergence_from_spectrum(spectrum, grid, k)
 
-    if grid.dimension == 1:
-        q = _to_numpy(grid.qx)
-        valid = np.abs(q) <= k
-        if np.count_nonzero(valid) < 3:
-            return None
-        theta = np.arcsin(np.clip(q[valid] / k, -1, 1))
-        return full_width_half_max(values[valid], theta)
 
-    qx = _to_numpy(grid.qx_axis)
-    qy = _to_numpy(grid.qy_axis)
-    valid_x = np.abs(qx) <= k
-    valid_y = np.abs(qy) <= k
-    if np.count_nonzero(valid_x) < 3 or np.count_nonzero(valid_y) < 3:
+def _divergence_from_spectrum(spectrum: Any, grid: BaseGrid, k: float) -> Any:
+    xp = grid.xp
+    values = abs(spectrum)**2
+    qx = grid.qx if grid.dimension == 1 else grid.qx_axis
+    valid_x = abs(qx) <= k
+    if int(xp.count_nonzero(valid_x).item()) < 3:
         return None
-
-    max_j, max_i = np.unravel_index(int(np.argmax(values)), values.shape)
-    theta_x = np.arcsin(np.clip(qx[valid_x] / k, -1, 1))
-    theta_y = np.arcsin(np.clip(qy[valid_y] / k, -1, 1))
-    fx = values[max_j, valid_x]
-    fy = values[valid_y, max_i]
-    return full_width_half_max(fx, theta_x), full_width_half_max(fy, theta_y)
+    theta_x = xp.arcsin(xp.clip(qx[valid_x] / k, -1, 1))
+    if grid.dimension == 1:
+        return _optional_float(_to_python_float(_widths_batch(values[None, valid_x], theta_x)[0]))
+    valid_y = abs(grid.qy_axis) <= k
+    if int(xp.count_nonzero(valid_y).item()) < 3:
+        return None
+    theta_y = xp.arcsin(xp.clip(grid.qy_axis[valid_y] / k, -1, 1))
+    peak = xp.argmax(values)
+    j, i = peak // grid.nx, peak % grid.nx
+    wx = _widths_batch(values[j, valid_x][None, :], theta_x)[0]
+    wy = _widths_batch(values[valid_y, i][None, :], theta_y)[0]
+    widths = _to_numpy(xp.stack((wx, wy)))
+    return _optional_float(widths[0]), _optional_float(widths[1])
 
 
 def gaussian_filter_1d(field: Any, coordinate: Any, sigma: float) -> Any:
