@@ -1,6 +1,6 @@
 # CRL focus explorer in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/97d9e7a15f00d9500d852217b16f3a8cfa0c5003/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/06689fe3e24ca5ec7c95c618ffba7933c90d818c/notebooks/CRL_Focus_Colab.ipynb).
 
 Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. The parameter fields are always shown in their own output and are never automatically collapsed or hidden by a calculation. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results remain in memory; no export or save/restore mechanism is included.
 
@@ -30,7 +30,9 @@ The structure-depth input appears for one-dimensional focusing on a 2D grid. Two
 
 CRL lengths are entered in µm, photon energy in keV, density in g/cm³, and source distance in metres. Source distance is measured to the CRL entrance. Detector distances are measured from the CRL exit; displayed units adapt to the range.
 
-## Point and Gaussian sources
+## Plane-wave, point and Gaussian illumination
+
+**Plane wave at CRL entrance** supplies a coherent field with uniform unit amplitude and constant phase inside the entrance pupil. Source distance and FWHM inputs are hidden and ignored. In the Python API use `source_type="plane"`; `source_distance_m` is normalized to `None`. The analytical reference is collimated BFL. Source magnification has no finite-object meaning here: the notebook displays **Not applicable · plane wave**, and the API returns `None` for each magnification axis.
 
 A point source has a finite source-to-CRL distance and spherical phase. A Gaussian source is spatially incoherent, centered, and specified by its intensity **FWHM**: x on a 1D grid, x and y on a 2D grid. Internally, sigma = FWHM / (2 sqrt(2 ln 2)). Zero width represents a point-like source along that axis.
 
@@ -69,19 +71,21 @@ Manual z bounds also bound the search. The analytical initial guess is clamped t
 
 ## Results and slider
 
-The top row reports numerical peak-intensity distance, collimated analytical focal distance, finite-source analytical image distance and transmission. The second row reports selected z, FWHM, peak intensity and magnification; these four cards update with the slider. Two-dimensional values carry x/y labels.
+The top row reports numerical peak-intensity distance, collimated analytical focal distance, finite-source analytical image distance and transmission. For plane-wave input, the finite-source card is replaced by the incident-field type. The second row reports selected z, FWHM, peak intensity and magnification; these four cards update with the slider. Two-dimensional values carry x/y labels.
 
 The left panel contains three plots with a shared horizontal z axis:
 
 1. **Intensity distribution near the focus**, using the central y row for a 2D grid;
 2. peak intensity versus z, in red;
-3. FWHM versus z, in green, with separate shades for x/y when both focus.
+3. FWHM versus z, in green, with separate shades and solid x / dashed y lines when both focus. The solid trace is slightly wider, so both remain visible when they coincide.
 
 Orange vertical cursors mark the selected plane, with orange intersection markers on the peak-intensity and FWHM curves. A dotted reference line marks the numerical peak-intensity distance. Single-curve plots omit a redundant legend.
 
 Peak intensity and FWHM are measured over the full detector plane; the longitudinal map remains a fixed central slice. For one-dimensional focusing, the main width graph shows x; the cards also report y for a 2D grid.
 
-The right panel shows the transverse image or a blue x/y profile through its intensity maximum. Its slider sits directly below the image. Track clicks, dragging and keyboard moves select discrete calculated display planes, including the numerical maximum. The displayed z value, both panels and the cards therefore refer to the same plane. The library's `result.plane_at(z_m)` still supports arbitrary detector distances independently of the notebook slider.
+The right panel shows a blue transverse profile for a 1D grid. For every 2D grid it shows **the intensity map on the left and both x/y profiles together on the right**, with no visualization selector. Both profiles pass through the current transverse maximum and share a physical coordinate scale and reference-intensity normalization. The x profile is blue and solid; y is purple and dashed, with different widths and mild transparency to keep identical traces visible. Matching guide lines identify their cuts on the map.
+
+Both main panels have equal widths and the same slightly taller image canvas. The common z slider sits immediately below both panels, so there is no unmatched blank area under the right image. Track clicks, dragging and keyboard moves select discrete calculated display planes, including the numerical maximum. Position changes are transmitted continuously rather than waiting for a mouse-release event; a short debounce coalesces rapid clicks into the latest requested plane. Pending updates are cancelled on recomputation. The displayed z value, both panels and the cards therefore refer to the same plane. The library's `result.plane_at(z_m)` still supports arbitrary detector distances independently of the notebook slider.
 
 Images update in place. Intensity normalization is linear and fixed to the reference peak over the displayed interval, making dimming visible as z changes. CMRmap is white at maximum intensity. Axes and readouts use up to two decimals without redundant zeros: `60`, `12.3`, `12.34`. Length units adapt to the viewed range; common powers of ten are placed on axis labels. Scientific values include spaces around the multiplication sign, for example −2.4 × 10⁻³.
 
@@ -124,6 +128,6 @@ For a new public notebook revision, commit the tested library first and pin that
 - If inputs are missing, confirm that the introduction says **Interface revision: separate parameter and results cells** and run cell 2 explicitly. A previously opened notebook or Drive copy does not automatically receive repository updates: use the current link at the top of this guide. If widgets themselves do not render, rerun setup in a fresh session and allow the standard custom-widget manager.
 - Colab session memory is temporary. Reopening starts with the parameter form; restarting a kernel loses entered values.
 
-CPU validation covers the existing optical/source/grid checks, Fourier-zoom equivalence and analytical Gaussian propagation, the renamed peak-search API and compatibility aliases, independent input/result outputs, first-run form visibility, density changes, selected-plane cards, formatting/colors and discrete slider callbacks. In a local live browser, actual radius, aperture, source type, source FWHM and source distance fields were edited before Compute; the calculated configuration was checked against those edits. The fields stayed rendered after calculation, and slider track clicks, dragging and keyboard interaction were exercised at desktop sizes. Actual CUDA hardware and the Google Colab frontend were not available for validation.
+CPU validation covers direct constant-phase plane-wave propagation on 1D/2D grids, the far-point-source limit, source-distance independence and Accurate plane-wave propagation, along with the existing optical/source/grid checks, Fourier-zoom equivalence and analytical Gaussian propagation, the renamed peak-search API and compatibility aliases, independent input/result outputs, first-run form visibility, density changes, selected-plane cards, formatting/colors and discrete slider callbacks. In a local live browser, actual radius, aperture, source type, source FWHM and source distance fields were edited before Compute; the calculated configuration was checked against those edits. The fields stayed rendered after calculation, and slider track clicks, presses before mouse release, rapid click bursts, dragging and keyboard interaction were exercised at desktop sizes. The 2D map and both profiles are displayed together, with equal panel canvas sizes. Actual CUDA hardware and the Google Colab frontend were not available for validation.
 
 An earlier silicon 2D Accurate CPU run with 15 display planes took approximately 45 seconds on a 2688×2688 propagation grid and 577×577 detector, resolving FWHM with over 40 detector samples. Runtime depends on hardware, z count, source nodes and grid size; this is one CPU benchmark.
