@@ -1,6 +1,6 @@
 # CRL focus explorer in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/3a29efa1f58d46adbd4d207e069207416e527290/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/6266283ce1c8c9d456f46dfc88d2fbf059139ce3/notebooks/CRL_Focus_Colab.ipynb).
 
 Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. The parameter fields are always shown in their own output and are never automatically collapsed or hidden by a calculation. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results remain in memory; no export or save/restore mechanism is included.
 
@@ -59,11 +59,15 @@ With **Adapt propagation window**, edge-power probes can enlarge automatic axes 
 
 This criterion finds a **local maximum of peak intensity**. It does not necessarily locate minimum FWHM or the geometrical image plane. Accordingly, the notebook labels the result **Numerical peak intensity distance** and reports **Analytical focal distance · parallel beam** and **Analytical image distance · finite source** separately.
 
-The finite-source analytical distance seeds the local basin. Default search bounds are 0.05–3 times that distance. Several diffraction maxima can exist; this is a local search, with no global-maximum guarantee. Boundary or unresolved maxima appear in diagnostics.
+The finite-source analytical image distance is the **first evaluated point** and seeds the local basin. Default search bounds are 0.05–3 times that distance. Several diffraction maxima can exist; this is a local search, with no global-maximum guarantee. Boundary or unresolved maxima appear in diagnostics.
 
-After the search:
+For a Gaussian source, the CRL workflow uses **only its central coherent source point** for the adaptive maximum search and automatic axial ROI. It reuses the coherent exit field/spectrum and delays preparation of the other source modes until those steps finish. It does not repeatedly sum all source nodes while choosing the reference distance. Convolution also uses the central-point search, so at a fixed propagation grid this reference is independent of source FWHM, quadrature order and extended-source method.
 
-1. The axial display ROI follows peak intensity down to **Axial ROI intensity fraction**, default 0.2 of the numerical peak.
+The output label adds **central point** for Gaussian illumination. This is a reference plane: the full Gaussian source can attain its maximum at a different distance. All displayed intensity maps, profiles, peak-intensity curves, FWHM values and transmission calculations still use the complete selected source model. **Model, mesh and diagnostics** also reports the highest full-source intensity among the displayed z samples; that sampled value is not a second iterative optimization.
+
+After the central-point search:
+
+1. The axial display ROI follows the central-point peak intensity down to **Axial ROI intensity fraction**, default 0.2 of the numerical peak.
 2. The interval is sampled for visualization, with the numerical maximum inserted explicitly. **Displayed z samples** changes the visualization grid, independently of the preceding optimization.
 3. Significant transverse intensity across that interval defines a padded x/y ROI, with default threshold 0.01 of its maximum.
 
@@ -71,7 +75,7 @@ Manual z bounds also bound the search. The analytical initial guess is clamped t
 
 ## Calculation progress and time estimates
 
-Compute displays a stage progress bar, completed work, elapsed wall time and **ETA for this stage**. Stages cover grid/window preparation, cached Gaussian source modes, adaptive peak search, axial ROI, detector-plane sampling, final metrics and rendering. Completion collapses to a compact elapsed-time indicator so the results workspace keeps its height. Errors leave a visible stopped state. Updates run synchronously in the existing computation callback, without threads or timers.
+Compute displays a stage progress bar, completed work, elapsed wall time and **ETA for this stage**. Stages cover grid/window preparation, central-point peak search, axial ROI, preparation of the full Gaussian source and its cached modes, detector-plane sampling, final metrics and rendering. Completion collapses to a compact elapsed-time indicator so the results workspace keeps its height. Errors leave a visible stopped state. Updates run synchronously in the existing computation callback, without threads or timers.
 
 For a stage with a known total, ETA is estimated from elapsed time per completed item. Detector-plane progress advances after a completed batch and its metric reductions, rather than forcing each plane into its own batch. This preserves GPU batching. Estimates can change as timings accumulate and do not promise an exact completion time.
 
@@ -127,10 +131,12 @@ config = xpos.CRLFocusConfig(
     backend="auto",
 )
 result = xpos.estimate_crl_focus(config)
-search = result.numerical_peak
+search = result.numerical_peak  # Central-point reference for a Gaussian source.
 plane = result.plane_at(search.z_m * 1.01)
 print(result.analytical_image_distance_m, result.magnification_at_peak)
 ```
+
+For Gaussian illumination, `result.numerical_peak.intensity` is the central coherent-point intensity; `result.peak_intensity` and `result.fwhm_m` describe the full source. `peak_z_m` and `fwhm_at_peak_m` refer to the numerical reference plane. `result.sampled_peak_z_m` gives the full-source maximum among displayed samples. Summary metadata records `peak_search_basis`, `peak_search_initial_z_m` and `axial_roi_basis`.
 
 All API lengths are metres. `find_peak_intensity_distance(objective, initial_z_m, ...)` also works independently of the CRL workflow. The older `find_numerical_focus` wrapper emits a `DeprecationWarning`; `NumericalFocusResult`, `result.numerical_focus`, `result.analytical_focus_m`, `result.magnification_at_focus` and `focus_tolerance_m` remain compatibility aliases. New summary keys use `peak_search_evaluations`, `peak_search_converged`, `analytical_image_distance_m` and `magnification_at_peak`. The workflow names `CRLFocusConfig`, `CRLFocusResult` and `estimate_crl_focus` remain available.
 
@@ -147,6 +153,6 @@ For a new public notebook revision, commit the tested library first and pin that
 - If inputs are missing, confirm that the introduction says **Interface revision: separate parameter and results cells** and run cell 2 explicitly. A previously opened notebook or Drive copy does not automatically receive repository updates: use the current link at the top of this guide. If widgets themselves do not render, rerun setup in a fresh session and allow the standard custom-widget manager.
 - Colab session memory is temporary. Reopening starts with the parameter form; restarting a kernel loses entered values.
 
-Progress validation checks deterministic stage ETA, unknown adaptive totals, observer error propagation, bit-identical results with/without reporting, preserved three-plane batches in Fast/Accurate and preserved source-mode batches. Live browser checks observe running progress/ETA updates and compact completion alongside the existing z controls. CPU validation also covers direct constant-phase plane-wave propagation on 1D/2D grids, the far-point-source limit, source-distance independence and Accurate plane-wave propagation, along with the existing optical/source/grid checks, Fourier-zoom equivalence and analytical Gaussian propagation, the renamed peak-search API and compatibility aliases, independent input/result outputs, first-run form visibility, density changes, selected-plane cards, formatting/colors and discrete slider callbacks. In a local live browser, actual radius, aperture, source type, source FWHM and source distance fields were edited before Compute; the calculated configuration was checked against those edits. The fields stayed rendered after calculation, and integer-slider track clicks, presses before mouse release, repeated clicks, dragging, keyboard, direct z entry and Previous/Next buttons were exercised at desktop sizes. Notebook-kernel checks assert that output is updated before each event handler returns, even when a notebook event loop is active; the former delayed handler fails that check. Injected rendering errors are visible and later selections recover. The 2D map and both profiles are displayed together, with equal panel canvas sizes. Actual CUDA hardware and the Google Colab frontend were not available for validation.
+Central-search validation checks the first analytical evaluation, guards against full-Gaussian evaluation during search/ROI, verifies deferred source modes and one coherent CRL evaluation, and compares reference distances across source sizes, quadrature orders and source methods on fixed Fast/Accurate grids. Progress validation checks deterministic stage ETA, unknown adaptive totals, observer error propagation, bit-identical results with/without reporting, preserved three-plane batches in Fast/Accurate and preserved source-mode batches. Live browser checks observe running progress/ETA updates and compact completion alongside the existing z controls. CPU validation also covers direct constant-phase plane-wave propagation on 1D/2D grids, the far-point-source limit, source-distance independence and Accurate plane-wave propagation, along with the existing optical/source/grid checks, Fourier-zoom equivalence and analytical Gaussian propagation, the renamed peak-search API and compatibility aliases, independent input/result outputs, first-run form visibility, density changes, selected-plane cards, formatting/colors and discrete slider callbacks. In a local live browser, actual radius, aperture, source type, source FWHM and source distance fields were edited before Compute; the calculated configuration was checked against those edits. The fields stayed rendered after calculation, and integer-slider track clicks, presses before mouse release, repeated clicks, dragging, keyboard, direct z entry and Previous/Next buttons were exercised at desktop sizes. Notebook-kernel checks assert that output is updated before each event handler returns, even when a notebook event loop is active; the former delayed handler fails that check. Injected rendering errors are visible and later selections recover. The 2D map and both profiles are displayed together, with equal panel canvas sizes. Actual CUDA hardware and the Google Colab frontend were not available for validation.
 
 An earlier silicon 2D Accurate CPU run with 15 display planes took approximately 45 seconds on a 2688×2688 propagation grid and 577×577 detector, resolving FWHM with over 40 detector samples. Runtime depends on hardware, z count, source nodes and grid size; this is one CPU benchmark.
