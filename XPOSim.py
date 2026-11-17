@@ -41,7 +41,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 
 __all__ = [
@@ -2388,6 +2388,9 @@ def find_peak_intensity_distance(peak_intensity: Callable[[float], float], initi
     success = False
     message = "The evaluation budget was exhausted."
     try:
+        # Start at the requested analytical/reference distance, then expand
+        # its bracket. It is cached when the middle point is visited again.
+        evaluate(center)
         for _ in range(max_evaluations):
             ya, yb, yc = evaluate(a), evaluate(b), evaluate(c)
             scale = max(abs(ya), abs(yb), abs(yc), np.finfo(float).tiny)
@@ -2799,7 +2802,10 @@ class _CRLFocusSession:
 class CRLFocusResult:
     """Display data and a live session for arbitrary z planes.
 
-    numerical_peak maximizes local transverse peak intensity. The finite-source
+    numerical_peak maximizes the central coherent source point for Gaussian
+    illumination; displayed intensities/widths still include the whole source.
+    It is a reference distance, not necessarily the Gaussian source's maximum.
+    The finite-source
     analytical_image_distance_m and collimated_focus_m are separate ray-optical
     distances; none is implicitly identified with minimum wave-optical FWHM.
     """
@@ -2834,6 +2840,15 @@ class CRLFocusResult:
         return self.numerical_peak.z_m
 
     @property
+    def peak_search_basis(self):
+        return "plane_wave" if self.configuration.source_type=="plane" else "central_point"
+
+    @property
+    def sampled_peak_z_m(self):
+        """Highest full-source intensity among the displayed samples only."""
+        return float(self.z_m[int(np.argmax(self.peak_intensity))])
+
+    @property
     def analytical_focus_m(self):
         """Legacy alias for the finite-source analytical image distance."""
         return self.analytical_image_distance_m
@@ -2845,6 +2860,7 @@ class CRLFocusResult:
 
     @property
     def fwhm_at_peak_m(self):
+        """Full-source FWHM at the numerical reference distance."""
         value=np.atleast_1d(self.fwhm_m[self.peak_index])
         widths=tuple(_optional_float(v) for v in value)
         return widths[0] if self.configuration.grid_dimension==1 else widths
@@ -2867,6 +2883,10 @@ class CRLFocusResult:
                 "backend":self.backend,"analytical_image_distance_m":self.analytical_image_distance_m,
                 "collimated_focus_m":self.collimated_focus_m,
                 "peak_z_m":self.peak_z_m,"fwhm_at_peak_m":self.fwhm_at_peak_m,
+                "peak_search_basis":self.peak_search_basis,
+                "axial_roi_basis":"manual" if self.configuration.scan_range_m is not None else self.peak_search_basis,
+                "peak_search_initial_z_m":self.numerical_peak.history[0][0],
+                "sampled_peak_z_m":self.sampled_peak_z_m,
                 "magnification_at_peak":self.magnification_at_peak,
                 "transmission":self.transmission,"grid_shape":self.grid_shape,
                 "grid_step_m":self.grid_step_m,"grid_step_y_m":self.grid_step_y_m,
@@ -3008,18 +3028,22 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None):
         probe=None
     if enlarged:
         messages.append("mesh_window: Geometry-fit window was expanded along "+', '.join(sorted(set(enlarged)))+" to reduce FFT-edge power.")
-    session=(probe if probe_cfg==cfg else _CRLFocusSession(cfg,grid,crl,incident,coherent_state=probe,progress=progress))
-    return grid,crl,session,messages
+    # Return the coherent state without preparing all incoherent source modes.
+    # The workflow finds the central-point reference before that costly work.
+    return grid,crl,probe,messages
 
 
 def estimate_crl_focus(configuration: CRLFocusConfig, *,
                        progress: Callable[[CRLProgressUpdate], None] | None = None) -> CRLFocusResult:
-    """Find a local peak-intensity distance, then sample a display ROI.
+    """Find a central-source reference distance, then sample the full source.
 
     Grid dimensionality and focusing dimensionality are independent. Extended
     Gaussian sources are specified by intensity FWHM and treated incoherently.
     Point sampling propagates Gaussian quadrature modes through the full stack;
     convolution uses a shift-invariant approximation with z-dependent ABCD scale.
+    The analytical image distance seeds the search. Gaussian illumination uses
+    only its central coherent point for peak search and automatic axial ROI;
+    all Gaussian modes/convolution are applied afterwards for displayed planes.
     No calculations are saved to files. The retained session evaluates slider z.
     progress receives synchronous stage updates without threads or timers.
     Unknown adaptive lengths have no percentage or ETA. Sampling ETA uses
@@ -3042,33 +3066,36 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
               reference.effective_focus(cfg.source_distance_m))
     if not np.isfinite(analytic) or analytic<=0:
         raise ValueError("This source/lens configuration has no finite real image after the CRL.")
-    grid,crl,session,messages=_build_focus_session(cfg,backend,parameters,analytic,reporter)
+    grid,crl,coherent,messages=_build_focus_session(cfg,backend,parameters,analytic,reporter)
+    search_cfg=(replace(cfg,source_type="point",source_fwhm_x_m=0.0,source_fwhm_y_m=0.0)
+                if cfg.source_type=="gaussian" else cfg)
+    search_session=(_CRLFocusSession(search_cfg,grid,crl,coherent.incident,coherent_state=coherent)
+                    if cfg.source_type=="gaussian" else coherent)
     reporter.start("detector",detail="Preparing the observation grid")
     if cfg.accuracy=="refined":
-        session.configure_refined_detector(analytic)
-    detector=session.detector_grid
+        search_session.configure_refined_detector(analytic)
     xp=grid.xp
     wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
     factor=.886 if cfg.geometry=="one-dimensional" else 1.028
-    messages.extend(session.diagnostics)
     search_bounds=cfg.scan_range_m or (max(1e-9,.05*analytic),3*analytic)
-    reporter.start("peak_search",detail="Adaptive local peak-intensity search")
+    basis="Plane wave" if cfg.source_type=="plane" else "Central point source"
+    reporter.start("peak_search",detail=basis+" · starting at the analytical image distance")
     evaluations=0
     def search_objective(z):
         nonlocal evaluations
-        value=session.objective(z)
+        value=search_session.objective(z)
         evaluations+=1
-        reporter.advance(evaluations,f"Evaluating z = {z*1e3:.2f} mm")
+        reporter.advance(evaluations,f"{basis} · evaluating z = {z*1e3:.2f} mm")
         return value
     numerical=find_peak_intensity_distance(search_objective,analytic,bounds_m=search_bounds,
                    tolerance_m=cfg.peak_search_tolerance_m)
     if not numerical.converged:
         messages.append("peak_search: "+numerical.message)
-    reporter.start("axial_roi",detail="Finding the axial display interval")
+    reporter.start("axial_roi",detail=basis+" · finding the axial display interval")
     roi_evaluations=0
     def roi_objective(z):
         nonlocal roi_evaluations
-        value=session.objective(z)
+        value=search_session.objective(z)
         roi_evaluations+=1
         reporter.advance(roi_evaluations)
         return value
@@ -3077,6 +3104,20 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         raise ArithmeticError("The peak-intensity ROI has zero extent.")
     if cfg.scan_range_m is None and (bounds[0]==search_bounds[0] or bounds[1]==search_bounds[1]):
         messages.append("z_roi_boundary: The axial ROI reached a search boundary; inspect the displayed range.")
+    if cfg.source_type=="gaussian":
+        messages.extend(search_session.diagnostics)
+        search_session=None  # Release the central detector before source-mode caching.
+        reporter.start("source_preparation",detail="Preparing the full Gaussian source after central-point search")
+        session=_CRLFocusSession(cfg,grid,crl,coherent.incident,coherent_state=coherent,progress=reporter)
+        if cfg.accuracy=="refined":
+            reporter.start("detector",detail="Preparing the full Gaussian-source detector")
+            session.configure_refined_detector(analytic)
+        messages.append("central_source_reference: Peak search and automatic z ROI use the central point; displayed intensities and widths include the full Gaussian source. Its maximum can occur at a different z.")
+    else:
+        session=search_session
+    coherent=None
+    detector=session.detector_grid
+    messages.extend(session.diagnostics)
     positions=np.unique(np.r_[np.linspace(*bounds,cfg.scan_points),numerical.z_m])
     metrics=[]
     lines=[]
