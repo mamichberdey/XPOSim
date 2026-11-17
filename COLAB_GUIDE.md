@@ -1,21 +1,24 @@
 # CRL focus explorer in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/4c26eb102e96ae96f5d81177ea6493ff3deed92c/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/b3075dbecd34c4764d69365b0d5d30b783c983cd/notebooks/CRL_Focus_Colab.ipynb).
 
-Run all once, change the English controls, then press **Compute focus**. The dynamic form retains entered values when its cell is initialized again in the same live session. Results are shown in a compact two-column workspace; the z slider is directly below the detector image. No calculation files are saved or exported. The notebook loads a pinned XPOSim revision and material tables automatically.
+Run all once to open the English parameter form. Enter the CRL and source parameters, then press **Compute**. No optical calculation starts automatically. Results appear in a compact two-column workspace with the z slider directly below the detector image. **Edit parameters** opens the form again. Reinitializing the explorer in the same live session preserves entered values and opens the form without starting another calculation. Calculation results remain in memory; no export or save/restore mechanism is included.
 
 ## Start
 
-1. Open the link and sign in to Colab. Optionally save a notebook copy to your own Drive.
-2. For GPU execution, use **Runtime → Change runtime type → GPU**, then run all cells. A CPU session also works.
-3. Setup checks the available dependencies and CUDA. Missing CuPy is installed only when a compatible CUDA 12/13 GPU environment is detected. The interface uses an actual GPU FFT probe and selects CuPy when CUDA works, otherwise NumPy. The hardware notice reports the actual CUDA device rather than relying on a GPU/TPU session label. For a CPU session it shows the Colab GPU-enabling steps. There is no backend picker to accidentally select unavailable hardware.
-4. The default example runs immediately: silicon at 12 keV, surface radius 6.25 µm, full aperture 50 µm, bridge thickness 2 µm, 26 elements and source distance 15 m. Material density is automatic by default; choose **Manual** to override a preset density. Change parameters and press **Compute focus** to update the analysis and slider.
+1. Open the link and sign in to Colab. Optionally save a copy to your Drive.
+2. For GPU execution, use **Runtime → Change runtime type → GPU → Save**, reconnect, and run all cells. CPU execution is also supported.
+3. Setup checks dependencies and actual CUDA execution. Missing CuPy is installed only when a compatible CUDA 12/13 environment is detected. A small GPU FFT probe selects CuPy when CUDA works, otherwise NumPy. The notice reports the actual CUDA device, independent of the session's GPU/TPU label. CPU sessions display the GPU-enabling instructions. There is no backend picker.
+4. The expanded form defaults to silicon at 12 keV, surface radius 6.25 µm, full aperture 50 µm, bridge thickness 2 µm, 26 elements and source distance 15 m. **Fast** sampling is selected initially.
+5. Check the parameters and press **Compute**. After a successful calculation, the form collapses to leave room for the results. Use **Edit parameters** to change the inputs and compute again.
 
-GPU availability, runtime limits and disconnections are controlled by Colab: [official FAQ](https://research.google.com/colaboratory/faq.html).
+In **Auto** density mode, the read-only **Density (g/cm³)** field shows the value actually used, and its label identifies the selected material. Presets are Be: 1.848, Si: 2.33, Al: 2.70 and diamond: 3.515 g/cm³. **Manual** allows an override. A custom chemical formula requires a manual density.
+
+GPU availability and session limits are controlled by Colab: [official FAQ](https://research.google.com/colaboratory/faq.html).
 
 ## Focusing and calculation grid
 
-These are separate choices:
+Focusing dimensionality describes the parabolic lens surfaces; it is independent of numerical-grid dimensionality.
 
 | Focusing | Grid | Model |
 | --- | --- | --- |
@@ -23,77 +26,66 @@ These are separate choices:
 | One-dimensional focusing | 2D | The same x-focusing profile with finite structure depth along y |
 | Two-dimensional focusing | 2D | Rotationally symmetric parabolic profile focusing along x and y |
 
-The structure-depth input appears for a one-dimensionally focusing CRL on a 2D grid. Two-dimensional focusing automatically selects a 2D grid. The terms describe focusing dimensions; the lens surfaces remain parabolic.
+The structure-depth input appears for one-dimensional focusing on a 2D grid. Two-dimensional focusing selects a 2D grid automatically.
 
-Lengths in the CRL controls are µm, photon energy is keV, density is g/cm³, source distance is metres, and detector z is millimetres from the CRL exit. Source distance is measured to the CRL entrance. The material presets set formula and density together.
+CRL lengths are entered in µm, photon energy in keV, density in g/cm³, and source distance in metres. Source distance is measured to the CRL entrance. Detector distances are measured from the CRL exit; displayed units adapt to the range.
 
 ## Point and Gaussian sources
 
-A point source has a finite source-to-CRL distance and spherical phase. The plane-wave option has been removed from this notebook.
-
-A Gaussian source is **spatially incoherent**, centered, and specified by its intensity **FWHM**. A 1D grid uses FWHM x; a 2D grid uses FWHM x and y. Internally, sigma = FWHM / (2 sqrt(2 ln 2)). A zero width on one axis represents a point-like source along that axis.
+A point source has a finite source-to-CRL distance and spherical phase. A Gaussian source is spatially incoherent, centered, and specified by its intensity **FWHM**: x on a 1D grid, x and y on a 2D grid. Internally, sigma = FWHM / (2 sqrt(2 ln 2)). Zero width represents a point-like source along that axis.
 
 Two methods are available:
 
-- **Gaussian convolution:** propagates the on-axis coherent field, then blurs the intensity with the Gaussian source projected to the requested detector z. The projection uses the discrete stack ABCD matrix, including the exit drift. It is a shift-invariant approximation: source-dependent clipping, vignetting and absorption changes within the CRL are not fully reproduced.
-- **Incoherent point sampling:** Gaussian quadrature splits the source into weighted points. Each field passes through the full CRL, and weighted **intensities** are added. Source modes use batched FFTs on the selected backend. For a 2D source with nonzero widths, N nodes per axis give N² modes. Increase the node count to test source-integration convergence.
+- **Gaussian convolution:** propagates the on-axis coherent field, then convolves its intensity with the source projected to detector z using the discrete-stack ray-transfer scale. This assumes a shift-invariant pupil response; source-dependent clipping, vignetting and absorption changes are not fully reproduced.
+- **Incoherent point sampling:** Gaussian quadrature splits the source into weighted points. Each field passes through the CRL, and weighted intensities are added. Independent modes use batched FFTs. N nodes per nonzero-width axis give N² modes for a 2D source. Increase the node count to check convergence.
 
-The direct method caches source spectra within a RAM/VRAM budget. Larger problems stream and recompute bounded batches instead of allocating an unbounded source stack. No cache is written to disk.
+Source spectra are cached within a RAM/VRAM budget. Larger problems stream bounded batches and recompute modes rather than allocating an unbounded source stack. No cache is written to disk.
 
 ## Geometry-based adaptive grid
 
-The initial transverse window encloses the full aperture and, where applicable, structure depth. Its default width is **1.3 times the corresponding geometric extent**. Sampling is chosen from the expected diffraction width and source-phase variation; **Quick / Refined** controls the resolution target.
+The initial transverse window encloses the aperture and, where applicable, structure depth, with a default width of 1.3 times each geometric extent. Point counts account for diffraction width and phase variation and use FFT-friendly factors 2, 3, 5 and 7.
 
-Point counts use FFT-friendly combinations of factors 2, 3, 5 and 7. Initial propagation probes check edge power. With **Adapt propagation window**, automatic axes can grow independently when their boundaries carry significant intensity. The number of points is recalculated to preserve the resolution target. Explicit point-count overrides retain user control.
+**Fast** uses the propagation grid directly for detector samples. **Accurate** evaluates the propagated complex field on a dense local detector grid using inverse Fourier chirp-z transforms, targeting at least 24 samples across the coherent diffraction-width estimate, within bounded sizes. This calculates the field at detector coordinates; it does not smooth an intensity image. It avoids enlarging the entire 2D grid just to resolve a nanometre-scale intensity peak.
 
-**Quick** uses the propagation grid directly for detector samples. **Refined** also calculates the complex propagated field on a dense, local detector grid using inverse Fourier chirp-z evaluation. This is a new field calculation at the detector coordinates, not interpolation of an intensity image. Its target is at least 24 points across the coherent diffraction-width estimate, with bounded detector size. It avoids globally enlarging the full 2D propagation grid merely to display a nanometre-scale focus smoothly.
+Dense detector sampling cannot recover frequencies missing from the entrance grid. Accurate also increases the propagation-grid budget. Both grids and their steps are shown under **Model, mesh and diagnostics**. The library's corresponding accuracy values remain `preview` and `refined`.
 
-The entrance grid still has to resolve amplitude and phase. Dense detector evaluation cannot reconstruct missing entrance frequencies or repair an underresolved lens calculation. Refined increases the propagation-grid budget too; propagation and detector grids are shown separately under **Model, mesh and diagnostics**. Direct point-source integration can require substantially more work than convolution.
+With **Adapt propagation window**, edge-power probes can enlarge automatic axes independently while preserving the resolution target. Explicit point-count overrides retain user control. Window expansion and detector sizes have memory limits. Check boundary warnings and compare finer grids, larger windows and more source nodes when quantitative accuracy matters. Automatic settings do not certify convergence.
 
-A geometry-fitting window alone does not prove sufficient padding for FFT propagation. Expansion and grid sizes have memory limits, and the final display ROI is checked too. A boundary warning requires inspecting a larger window at a comparable step. A finer grid, larger window and more source nodes should be compared when quantitative accuracy matters. Automatic settings do not certify convergence.
+## Peak-intensity distance and display ROI
 
-## Numerical focus and automatic display ROI
+`find_peak_intensity_distance` accepts a callable giving the transverse peak intensity at distance z. It expands a three-point bracket with variable steps and refines a local maximum with bounded scalar optimization. It consumes no precomputed z array and returns a `PeakIntensitySearchResult`.
 
-`find_numerical_focus` accepts a callable peak-intensity objective and an initial distance. It expands a three-point bracket with a variable step, then refines a local maximum with bounded scalar optimization. It does **not** take a precomputed array of z planes.
+This criterion finds a **local maximum of peak intensity**. It does not necessarily locate minimum FWHM or the geometrical image plane. Accordingly, the notebook labels the result **Numerical peak intensity distance** and reports **Analytical focal distance · parallel beam** and **Analytical image distance · finite source** separately.
 
-The analytical image distance seeds the local basin. The default search bounds are 0.05–3 times that distance. Several diffraction maxima may exist: this is a local search, not a guarantee of a global optimum. An unresolved or boundary maximum is reported.
+The finite-source analytical distance seeds the local basin. Default search bounds are 0.05–3 times that distance. Several diffraction maxima can exist; this is a local search, with no global-maximum guarantee. Boundary or unresolved maxima appear in diagnostics.
 
-After focus search:
+After the search:
 
-1. The axial display interval is estimated by following the peak intensity down to the **Axial ROI intensity fraction**, default 0.2 of the focus peak.
-2. The selected interval is sampled for visualization; changing **Displayed z samples** does not change the preceding focus search.
-3. Significant transverse intensity across that interval defines a padded x/y display ROI, with default threshold 0.01 of its maximum.
+1. The axial display ROI follows peak intensity down to **Axial ROI intensity fraction**, default 0.2 of the numerical peak.
+2. The interval is sampled for visualization, with the numerical maximum inserted explicitly. **Displayed z samples** changes the visualization grid, independently of the preceding optimization.
+3. Significant transverse intensity across that interval defines a padded x/y ROI, with default threshold 0.01 of its maximum.
 
-Manual z bounds are available in the advanced controls. They also bound the local focus search. The initial analytical guess is clamped to the selected interval.
+Manual z bounds also bound the search. The analytical initial guess is clamped to them. **Peak search tolerance** controls the optimizer's axial tolerance.
 
-## Compact results workspace
+## Results and slider
 
-Images use **linear intensity**, CMRmap and white at the maximum. The left side of the dashboard has three vertically aligned plots with a shared horizontal z axis:
+The top row reports numerical peak-intensity distance, collimated analytical focal distance, finite-source analytical image distance and transmission. The second row reports selected z, FWHM, peak intensity and magnification; these four cards update with the slider. Two-dimensional values carry x/y labels.
 
-1. x–z intensity map (the grid row closest to y = 0 for 2D), above the statistics;
-2. peak intensity versus z;
-3. transverse FWHM versus z.
+The left panel contains three plots with a shared horizontal z axis:
 
-Plane peak intensity and FWHM are measured over the full detector plane; the longitudinal map remains a fixed central slice rather than following a moving y maximum. The right side shows the transverse ROI or an x/y profile. Its z slider is below the image, next to the varying intensity/FWHM/magnification readout. Image widgets update in place so slider changes do not move the page. Intensity normalization remains fixed to the focus/reference peak as z changes, making dimming visible; a linked cursor marks the selected z on the left-hand plots. One-curve plots have no redundant legend.
+1. **Intensity distribution near the focus**, using the central y row for a 2D grid;
+2. peak intensity versus z, in red;
+3. FWHM versus z, in green, with separate shades for x/y when both focus.
 
-For a 2D field, each x profile passes through that plane's transverse intensity maximum, so the map, peak statistic and FWHM x use the same slice. Its y position can vary with z. For one-dimensional focusing, the main width plot shows the focused x width; the interactive plane also reports y width.
+Orange vertical cursors mark the selected plane, with orange intersection markers on the peak-intensity and FWHM curves. A dotted reference line marks the numerical peak-intensity distance. Single-curve plots omit a redundant legend.
 
-The Matplotlib **CMRmap** colormap is used with logarithmic normalization. Its maximum is white. The full map uses a common normalization; the interactive image is normalized within its selected plane.
+Peak intensity and FWHM are measured over the full detector plane; the longitudinal map remains a fixed central slice. For one-dimensional focusing, the main width graph shows x; the cards also report y for a 2D grid.
 
-A separate **z slider** evaluates the requested detector plane, including distances between the displayed samples. It reuses the lens and source state. A 1D grid shows the transverse profile; a 2D grid shows the image and x/y slices through its peak. Release the slider to trigger recalculation.
+The right panel shows the transverse image or a blue x/y profile through its intensity maximum. Its slider sits directly below the image. Track clicks, dragging and keyboard moves select discrete calculated display planes, including the numerical maximum. The displayed z value, both panels and the cards therefore refer to the same plane. The library's `result.plane_at(z_m)` still supports arbitrary detector distances independently of the notebook slider.
 
-The global table shows collimated analytical BFL, finite-source analytical image distance, numerical focus, source magnification at focus, CRL length, transmission, backend, grid and actual window. The interactive table shows current z, peak intensity, FWHM and z-dependent magnification.
+Images update in place. Intensity normalization is linear and fixed to the reference peak over the displayed interval, making dimming visible as z changes. CMRmap is white at maximum intensity. Axes and readouts use up to two decimals without redundant zeros: `60`, `12.3`, `12.34`. Length units adapt to the viewed range; common powers of ten are placed on axis labels. Scientific values include spaces around the multiplication sign, for example −2.4 × 10⁻³.
 
-Magnification is the signed source-to-plane displacement scale -B(z)/source distance from the ray model. At an image plane it is image magnification; away from conjugate planes it describes source-position shifts rather than a sharp image. The unfocused y axis uses free propagation through the stack length.
-
-## Limits and troubleshooting
-
-- Intensities are relative. The entrance amplitude is one and is clipped to the nominal aperture. Transmission is finite-window output power divided by incident power after the entrance pupil.
-- The optical model is scalar, monochromatic and paraxial. Polarization, back-reflections and high-angle propagation are outside it.
-- For memory errors, reduce the batch size first. Reducing point counts also reduces accuracy. An explicit source-node count can be expensive on 2D grids; convolution is faster under its stated assumptions.
-- A missing FWHM indicates that the required half-maximum crossings were not resolved within the computational window.
-- If widget controls do not appear, rerun setup in a fresh Colab session and allow the standard custom-widget manager. The notebook requires ipywidgets.
-- Colab session memory is temporary. Reopening the notebook recomputes the result; there is no save/restore/export mechanism.
+Magnification is the signed source-to-plane displacement scale −B(z)/source distance from the ray model. At a conjugate image plane it is image magnification; elsewhere it describes source-position shifts. The unfocused y axis uses free propagation through the stack length.
 
 ## Reusable Python API
 
@@ -108,22 +100,30 @@ config = xpos.CRLFocusConfig(
     source_fwhm_x_m=5e-6,
     source_fwhm_y_m=5e-6,
     source_method="convolution",  # or "points"
+    peak_search_tolerance_m=1e-6,
     backend="auto",
 )
 result = xpos.estimate_crl_focus(config)
-plane = result.plane_at(result.peak_z_m * 1.01)
+search = result.numerical_peak
+plane = result.plane_at(search.z_m * 1.01)
+print(result.analytical_image_distance_m, result.magnification_at_peak)
 ```
 
-All API lengths are metres. `CRL.apply_to_fields` handles a bounded batch of independent source fields. `CRL.source_magnification` and `CRL.ray_transfer_matrix` expose the discrete-stack ray model. The established low-level NumPy/CuPy interfaces remain available.
+All API lengths are metres. `find_peak_intensity_distance(objective, initial_z_m, ...)` also works independently of the CRL workflow. The older `find_numerical_focus` wrapper emits a `DeprecationWarning`; `NumericalFocusResult`, `result.numerical_focus`, `result.analytical_focus_m`, `result.magnification_at_focus` and `focus_tolerance_m` remain compatibility aliases. New summary keys use `peak_search_evaluations`, `peak_search_converged`, `analytical_image_distance_m` and `magnification_at_peak`. The workflow names `CRLFocusConfig`, `CRLFocusResult` and `estimate_crl_focus` remain available.
 
-For a new public notebook version, first commit the tested library, then pin that commit and its module SHA-256 in setup. Commit the notebook afterwards and point the Colab link to the immutable notebook commit. Notebook outputs and execution counts should remain cleared in GitHub.
+`CRL.apply_to_fields` handles bounded batches of independent source fields. `CRL.source_magnification` and `CRL.ray_transfer_matrix` expose the discrete-stack ray model. Established low-level NumPy/CuPy interfaces are retained.
 
-Validation for this revision: 13 existing CPU regression checks and 6 focused source/search/grid checks pass. The notebook was executed end to end in a Jupyter kernel, including conditional controls and live-slider callbacks. A real Colab front end and CUDA hardware were not available for validation; GPU execution remains to be checked in a GPU session.
+For a new public notebook revision, commit the tested library first and pin that commit and the module SHA-256 in setup. Commit the notebook afterwards, then update the immutable Colab link. Keep notebook outputs and execution counts cleared.
 
-## Display conventions and validation
+## Limits and validation
 
-Axes use fixed two-decimal tick labels. Length units adapt to the viewed range; large/small intensity values carry a power-of-ten scale on the axis. Parameters collapse after a successful calculation, and less frequently needed model/mesh details remain in an accordion. The workspace is width-limited and responsive instead of stretching plots across a wide monitor.
+- Intensities are relative. Incident amplitude is one within the nominal entrance pupil. Transmission is finite-window output power divided by power after that pupil.
+- The model is scalar, monochromatic and paraxial. It excludes polarization, back-reflections and high-angle propagation.
+- For memory errors, reduce batch size first. Reducing grid sizes reduces accuracy. Direct source integration can be considerably more expensive than convolution.
+- An unresolved FWHM means the required half-maximum crossings were not found within the numerical window.
+- If controls do not appear, rerun setup in a fresh session and allow the standard custom-widget manager. The dynamic form requires cell initialization.
+- Colab session memory is temporary. Reopening starts with the parameter form; restarting a kernel loses entered values.
 
-The interface was exercised in a local browser at 1366×768 and 1920×1080, including a real frontend slider event and unchanged page position. Colab adds its own toolbar/sidebar, so available cell width can vary. The dynamic form requires one initialization; rerunning it preserves inputs and waits for Compute focus rather than automatically repeating a potentially expensive run.
+CPU validation covers the existing optical/source/grid checks, Fourier-zoom equivalence and analytical Gaussian propagation, the renamed peak-search API and compatibility aliases, first-run form visibility, density changes, selected-plane cards, formatting/colors and discrete slider callbacks. A local live browser exercises real slider track clicks, dragging and keyboard interaction at desktop sizes. Actual CUDA hardware and the Google Colab frontend were not available for validation.
 
-Numerical validation covers native-grid equivalence of chirp-z propagation, an analytical Gaussian field, batched propagation and incoherent source limits, in addition to the earlier CPU checks. A silicon 2D Refined run with 15 displayed z planes took approximately 45 seconds on the validation CPU and resolved the focal FWHM with over 40 detector samples. Runtime depends on hardware, z sample count, source nodes and grid size; actual CUDA timing remains unverified in this environment.
+An earlier silicon 2D Accurate CPU run with 15 display planes took approximately 45 seconds on a 2688×2688 propagation grid and 577×577 detector, resolving FWHM with over 40 detector samples. Runtime depends on hardware, z count, source nodes and grid size; this is one CPU benchmark.
