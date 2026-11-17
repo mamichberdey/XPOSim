@@ -40,7 +40,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 
 __all__ = [
@@ -73,7 +73,9 @@ __all__ = [
     "CRLFocusConfig",
     "CRLFocusResult",
     "estimate_crl_focus",
-    "NumericalFocusResult",
+    "PeakIntensitySearchResult",
+    "find_peak_intensity_distance",
+    "NumericalFocusResult",  # Compatibility names; use the peak-intensity API.
     "find_numerical_focus",
 ]
 
@@ -1948,6 +1950,8 @@ class CRL(OpticalElement):
         on the backend until reduction to a few scalars per plane. With
         return_fields=True, only the final cropped stack is retained, without
         views holding full-grid fields alive. Output storage is still O(nz).
+        The reported peak plane maximizes sampled transverse peak intensity;
+        it need not coincide with minimum width or a geometrical image plane.
         """
         z_array = _validated_distances(z_values, nonnegative=True)
         if batch_size is not None:
@@ -2001,7 +2005,7 @@ class BeamMetrics:
 
 @dataclass
 class FocusScanResult:
-    """Result of a multi-distance focus scan.
+    """Result of a multi-distance scan, selecting highest sampled peak intensity.
 
     ``E`` has shape ``(nz, nx_roi)`` for 1D grids and
     ``(nz, ny_roi, nx_roi)`` for 2D grids. Its array backend matches the grid.
@@ -2027,7 +2031,7 @@ class FocusScanResult:
 
     @property
     def fwhm_at_peak(self) -> float | tuple[float, float] | None:
-        """Return the FWHM measured at the best-focus sampled plane."""
+        """Return the FWHM at the highest-peak-intensity sampled plane."""
 
         if self.peak_index is None or not self.metrics:
             return None
@@ -2035,7 +2039,7 @@ class FocusScanResult:
 
     @property
     def divergence_at_peak(self) -> float | tuple[float, float] | None:
-        """Return the divergence measured at the best-focus sampled plane."""
+        """Return the divergence at the highest-peak-intensity sampled plane."""
 
         if self.peak_index is None or not self.metrics:
             return None
@@ -2275,8 +2279,12 @@ def select_backend(preferred: str = "auto") -> str:
 
 
 @dataclass(frozen=True)
-class NumericalFocusResult:
-    """A local intensity maximum, found independently of any display z grid."""
+class PeakIntensitySearchResult:
+    """Distance of a local peak-intensity maximum, independent of a display grid.
+
+    This intensity criterion need not coincide with minimum beam width or the
+    geometrical image plane. It does not identify a unique physical focus.
+    """
     z_m: float
     intensity: float
     bracket_m: tuple[float, float]
@@ -2286,23 +2294,25 @@ class NumericalFocusResult:
     history: tuple[tuple[float, float], ...]
 
 
-def find_numerical_focus(peak_intensity: Callable[[float], float], initial_z_m: float,
+def find_peak_intensity_distance(peak_intensity: Callable[[float], float], initial_z_m: float,
                          *, bounds_m: tuple[float, float] | None = None,
                          initial_step_m: float | None = None,
                          tolerance_m: float | None = None,
-                         max_evaluations: int = 80) -> NumericalFocusResult:
+                         max_evaluations: int = 80) -> PeakIntensitySearchResult:
     """Bracket a local maximum with growing steps, then use bounded Brent search.
 
     No precomputed z array is consumed. The initial guess selects a local basin;
     diffraction may have several maxima, so this is not a global-optimum claim.
     The returned history can be used to inspect the adaptive search.
+    The maximized quantity is the transverse peak intensity at each distance,
+    not minimum FWHM or a geometrical imaging condition.
     """
     from scipy.optimize import minimize_scalar
     _validate_positive("initial_z_m", initial_z_m)
     _validate_count("max_evaluations", max_evaluations, 8)
     bounds = _validated_distances(bounds_m or (0.0, 3 * initial_z_m), nonnegative=True)
     if bounds.size != 2 or bounds[1] <= bounds[0]:
-        raise ValueError("Focus bounds must be an increasing pair.")
+        raise ValueError("Peak-intensity search bounds must be an increasing pair.")
     lo, hi = map(float, bounds)
     step = initial_step_m if initial_step_m is not None else 0.04 * initial_z_m
     tolerance = tolerance_m if tolerance_m is not None else 1e-5 * initial_z_m
@@ -2321,7 +2331,7 @@ def find_numerical_focus(peak_intensity: Callable[[float], float], initial_z_m: 
                 raise BudgetReached
             value = float(peak_intensity(z))
             if not np.isfinite(value):
-                raise ArithmeticError("Focus objective returned non-finite intensity.")
+                raise ArithmeticError("Peak-intensity objective returned non-finite intensity.")
             cache[z] = value
         return cache[z]
 
@@ -2334,7 +2344,7 @@ def find_numerical_focus(peak_intensity: Callable[[float], float], initial_z_m: 
             ya, yb, yc = evaluate(a), evaluate(b), evaluate(c)
             scale = max(abs(ya), abs(yb), abs(yc), np.finfo(float).tiny)
             if max(ya, yb, yc)-min(ya, yb, yc) <= scale*1e-12:
-                message = "The objective is locally flat; a focus was not resolved."
+                message = "The objective is locally flat; a peak-intensity distance was not resolved."
                 break
             if yb > ya and yb > yc:
                 bracketed = True
@@ -2360,23 +2370,34 @@ def find_numerical_focus(peak_intensity: Callable[[float], float], initial_z_m: 
     except BudgetReached:
         pass
     if not cache:
-        raise ArithmeticError("The focus search made no evaluations.")
+        raise ArithmeticError("The peak-intensity search made no evaluations.")
     best = max(cache, key=cache.get)
-    return NumericalFocusResult(best, cache[best], (float(a), float(c)), success,
+    return PeakIntensitySearchResult(best, cache[best], (float(a), float(c)), success,
                                 len(cache), message, tuple(cache.items()))
 
 
-def _focus_z_roi(objective: Callable[[float], float], focus: NumericalFocusResult,
+NumericalFocusResult = PeakIntensitySearchResult
+
+
+def find_numerical_focus(*args, **kwargs) -> PeakIntensitySearchResult:
+    """Compatibility wrapper for :func:`find_peak_intensity_distance`."""
+    warnings.warn("find_numerical_focus is deprecated; use find_peak_intensity_distance. "
+                  "The objective maximizes peak intensity, not a unique focus criterion.",
+                  DeprecationWarning, stacklevel=2)
+    return find_peak_intensity_distance(*args, **kwargs)
+
+
+def _peak_z_roi(objective: Callable[[float], float], peak: PeakIntensitySearchResult,
                   bounds: tuple[float, float], level: float) -> tuple[float, float]:
     """Find the connected peak-intensity ROI by expanding and root refinement."""
     from scipy.optimize import brentq
-    if focus.intensity <= 0:
+    if peak.intensity <= 0:
         return bounds
-    target = level * focus.intensity
-    initial = max(0.005*max(focus.z_m, 1e-9), 1e-8)
+    target = level * peak.intensity
+    initial = max(0.005*max(peak.z_m, 1e-9), 1e-8)
     crossings = []
     for direction, limit in [(-1, bounds[0]), (1, bounds[1])]:
-        inside = focus.z_m
+        inside = peak.z_m
         step = initial
         while True:
             outside = float(np.clip(inside+direction*step, bounds[0], bounds[1]))
@@ -2404,6 +2425,8 @@ class CRLFocusConfig:
     Focusing dimension and numerical-grid dimension are independent. A one-
     dimensionally focusing lens on a 2D grid requires its unfocused transverse
     structure depth. Gaussian source points are mutually incoherent.
+    peak_search_tolerance_m controls the axial peak-intensity optimizer;
+    focus_tolerance_m is retained as a legacy keyword alias.
     """
     energy_kev: float = 12.0
     material_formula: str = "Be"
@@ -2433,6 +2456,7 @@ class CRLFocusConfig:
     axial_roi_level: float = 0.2
     transverse_roi_level: float = 0.01
     focus_tolerance_m: float | None = None
+    peak_search_tolerance_m: float | None = None
 
     def __post_init__(self):
         aliases = {"cylindrical": "one-dimensional", "axisymmetric": "two-dimensional"}
@@ -2478,6 +2502,11 @@ class CRLFocusConfig:
             if value>=1: raise ValueError("ROI levels must be between zero and one.")
         if self.focus_tolerance_m is not None:
             _validate_positive("focus_tolerance_m",self.focus_tolerance_m)
+            if self.peak_search_tolerance_m is not None and self.peak_search_tolerance_m != self.focus_tolerance_m:
+                raise ValueError("Specify only one peak-search tolerance; focus_tolerance_m is a legacy alias.")
+            object.__setattr__(self,"peak_search_tolerance_m",self.focus_tolerance_m)
+        if self.peak_search_tolerance_m is not None:
+            _validate_positive("peak_search_tolerance_m",self.peak_search_tolerance_m)
         if self.scan_range_m is not None:
             bounds=_validated_distances(self.scan_range_m,nonnegative=True)
             if bounds.size!=2 or bounds[1]<=bounds[0]: raise ValueError("Invalid z ROI.")
@@ -2694,12 +2723,17 @@ class _CRLFocusSession:
 
 @dataclass
 class CRLFocusResult:
-    """Display data with a live, bounded-memory session for arbitrary z planes."""
+    """Display data and a live session for arbitrary z planes.
+
+    numerical_peak maximizes local transverse peak intensity. The finite-source
+    analytical_image_distance_m and collimated_focus_m are separate ray-optical
+    distances; none is implicitly identified with minimum wave-optical FWHM.
+    """
     configuration: CRLFocusConfig
     backend: str
-    analytical_focus_m: float
+    analytical_image_distance_m: float
     collimated_focus_m: float
-    numerical_focus: NumericalFocusResult
+    numerical_peak: PeakIntensitySearchResult
     z_m: np.ndarray
     peak_intensity: np.ndarray
     fwhm_m: np.ndarray
@@ -2723,7 +2757,17 @@ class CRLFocusResult:
 
     @property
     def peak_z_m(self):
-        return self.numerical_focus.z_m
+        return self.numerical_peak.z_m
+
+    @property
+    def analytical_focus_m(self):
+        """Legacy alias for the finite-source analytical image distance."""
+        return self.analytical_image_distance_m
+
+    @property
+    def numerical_focus(self):
+        """Legacy alias for the peak-intensity search result."""
+        return self.numerical_peak
 
     @property
     def fwhm_at_peak_m(self):
@@ -2732,8 +2776,13 @@ class CRLFocusResult:
         return widths[0] if self.configuration.grid_dimension==1 else widths
 
     @property
-    def magnification_at_focus(self):
+    def magnification_at_peak(self):
         return self._session.magnification(self.peak_z_m)
+
+    @property
+    def magnification_at_focus(self):
+        """Legacy alias for source-position scaling at peak intensity."""
+        return self.magnification_at_peak
 
     def plane_at(self,z_m: float) -> CRLPlaneResult:
         """Evaluate any detector z, reusing lens/source state on CPU or GPU."""
@@ -2741,17 +2790,17 @@ class CRLFocusResult:
 
     def summary(self):
         return {"xposim_version":__version__,"configuration":asdict(self.configuration),
-                "backend":self.backend,"analytical_focus_m":self.analytical_focus_m,
+                "backend":self.backend,"analytical_image_distance_m":self.analytical_image_distance_m,
                 "collimated_focus_m":self.collimated_focus_m,
                 "peak_z_m":self.peak_z_m,"fwhm_at_peak_m":self.fwhm_at_peak_m,
-                "magnification_at_focus":self.magnification_at_focus,
+                "magnification_at_peak":self.magnification_at_peak,
                 "transmission":self.transmission,"grid_shape":self.grid_shape,
                 "grid_step_m":self.grid_step_m,"grid_step_y_m":self.grid_step_y_m,
                 "detector_shape":self.detector_shape,"detector_step_m":self.detector_step_m,
                 "detector_step_y_m":self.detector_step_y_m,
                 "lens_length_m":self.lens_length_m,"diagnostics":list(self.diagnostics),
-                "focus_evaluations":self.numerical_focus.evaluations,
-                "focus_converged":self.numerical_focus.converged,
+                "peak_search_evaluations":self.numerical_peak.evaluations,
+                "peak_search_converged":self.numerical_peak.converged,
                 "source_width_convention":"FWHM", "distance_reference":"CRL exit",
                 "intensity_units":"relative", "convergence_checked":False}
 
@@ -2879,7 +2928,7 @@ def _build_focus_session(cfg,backend,parameters,analytic):
 
 
 def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
-    """Find a local focus adaptively, then sample an intensity-based display ROI.
+    """Find a local peak-intensity distance, then sample a display ROI.
 
     Grid dimensionality and focusing dimensionality are independent. Extended
     Gaussian sources are specified by intensity FWHM and treated incoherently.
@@ -2910,13 +2959,13 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
     factor=.886 if cfg.geometry=="one-dimensional" else 1.028
     messages.extend(session.diagnostics)
     search_bounds=cfg.scan_range_m or (max(1e-9,.05*analytic),3*analytic)
-    numerical=find_numerical_focus(session.objective,analytic,bounds_m=search_bounds,
-                   tolerance_m=cfg.focus_tolerance_m)
+    numerical=find_peak_intensity_distance(session.objective,analytic,bounds_m=search_bounds,
+                   tolerance_m=cfg.peak_search_tolerance_m)
     if not numerical.converged:
-        messages.append("focus_search: "+numerical.message)
-    bounds=cfg.scan_range_m or _focus_z_roi(session.objective,numerical,search_bounds,cfg.axial_roi_level)
+        messages.append("peak_search: "+numerical.message)
+    bounds=cfg.scan_range_m or _peak_z_roi(session.objective,numerical,search_bounds,cfg.axial_roi_level)
     if bounds[1]<=bounds[0]:
-        raise ArithmeticError("The focus ROI has zero extent.")
+        raise ArithmeticError("The peak-intensity ROI has zero extent.")
     if cfg.scan_range_m is None and (bounds[0]==search_bounds[0] or bounds[1]==search_bounds[1]):
         messages.append("z_roi_boundary: The axial ROI reached a search boundary; inspect the displayed range.")
     positions=np.unique(np.r_[np.linspace(*bounds,cfg.scan_points),numerical.z_m])
