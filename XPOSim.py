@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass, replace
 from numbers import Integral
 from pathlib import Path
 import re
+from time import perf_counter
 from typing import Any, Callable, Iterable, Iterator, Sequence
 import warnings
 
@@ -40,7 +41,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 
 __all__ = [
@@ -73,6 +74,7 @@ __all__ = [
     "CRLFocusConfig",
     "CRLFocusResult",
     "estimate_crl_focus",
+    "CRLProgressUpdate",
     "PeakIntensitySearchResult",
     "find_peak_intensity_distance",
     "NumericalFocusResult",  # Compatibility names; use the peak-intensity API.
@@ -2279,6 +2281,52 @@ def select_backend(preferred: str = "auto") -> str:
 
 
 @dataclass(frozen=True)
+class CRLProgressUpdate:
+    """Synchronous calculation progress; ETA refers to the current stage only.
+
+    Adaptive stages have total=None and eta_s=None. Timings are wall seconds;
+    sampling updates follow completed batches, including metric reductions.
+    """
+    stage: str
+    completed: int
+    total: int | None
+    elapsed_s: float
+    stage_elapsed_s: float
+    eta_s: float | None
+    detail: str = ""
+
+
+class _CRLProgressReporter:
+    def __init__(self, callback, *, clock=perf_counter):
+        if callback is not None and not callable(callback):
+            raise TypeError("progress must be callable or None.")
+        self.callback,self.clock=callback,clock
+        self.started=self.stage_started=clock()
+        self.stage,self.total,self.detail="preparing",None,""
+
+    def start(self,stage,total=None,detail=""):
+        self.stage,self.total,self.detail=stage,total,detail
+        self.stage_started=self.clock()
+        self.advance(0)
+
+    def advance(self,completed,detail=None):
+        if detail is not None:
+            self.detail=detail
+        if self.callback is None:
+            return
+        now=self.clock()
+        elapsed=max(0.0,now-self.stage_started)
+        eta=None if self.total is None or completed==0 else elapsed*max(0,self.total-completed)/completed
+        self.callback(CRLProgressUpdate(self.stage,int(completed),self.total,
+            max(0.0,now-self.started),elapsed,eta,self.detail))
+
+    def finish(self):
+        self.stage,self.total,self.detail="complete",1,"Calculation complete"
+        self.stage_started=self.clock()
+        self.advance(1)
+
+
+@dataclass(frozen=True)
 class PeakIntensitySearchResult:
     """Distance of a local peak-intensity maximum, independent of a display grid.
 
@@ -2536,7 +2584,7 @@ class _CRLFocusSession:
     """Reusable GPU/CPU propagation state; no files or full detector stacks."""
     _mode_cache_budget_bytes = 512*1024**2
 
-    def __init__(self, cfg, grid, crl, incident, coherent_state=None):
+    def __init__(self, cfg, grid, crl, incident, coherent_state=None, progress=None):
         self.cfg,self.grid,self.crl,self.incident=cfg,grid,crl,incident
         self.xp=grid.xp
         self.exit_field=crl.E() if coherent_state is None else coherent_state.exit_field
@@ -2576,7 +2624,10 @@ class _CRLFocusSession:
             needed=len(self.weights)*int(np.prod(grid.shape))*self.spectrum.dtype.itemsize
             self._source_transmission_ready=False
             if needed<=cache_budget:
-                self._modes=list(self._generate_modes())
+                if progress is not None:
+                    progress.start("source_modes",len(self.weights),
+                        f"{grid.backend} · source modes in batches of {self.mode_batch}")
+                self._modes=list(self._generate_modes(progress))
             else:
                 self.diagnostics.append("source_streaming: Source spectra exceed the RAM/VRAM cache budget; modes are recomputed in bounded batches.")
         elif cfg.source_type=="gaussian":
@@ -2623,7 +2674,7 @@ class _CRLFocusSession:
         self._peak_cache.clear()
         self.slices=(slice(None),)*detector.dimension
 
-    def _generate_modes(self):
+    def _generate_modes(self,progress=None):
         total_power=0.0
         xp=self.xp
         extra=(None,)*self.grid.dimension
@@ -2642,6 +2693,8 @@ class _CRLFocusSession:
             spectrum=self.grid._transform_batch(fields)
             del fields,phase
             yield spectrum,weights
+            if progress is not None:
+                progress.advance(stop)
         if not self._source_transmission_ready:
             self.transmission=total_power/self.input_power
             self._source_transmission_ready=True
@@ -2691,24 +2744,35 @@ class _CRLFocusSession:
             abs(magnification[1])*self.source_sigma[1]/self.detector_grid.dy,sigma_x)
         return gaussian_filter(image,sigmas,mode="constant",cval=0.0,truncate=5.0)
 
-    def iter_intensities(self,z_values):
+    def iter_intensities(self,z_values,progress=None):
         if self._point_model:
-            for z in z_values:
+            if progress is not None:
+                progress.advance(0,f"{self.grid.backend} · {self.mode_batch} source modes per batch; z planes sequential")
+            for index,z in enumerate(z_values):
                 yield float(z),self.intensity(float(z))
+                if progress is not None:
+                    progress.advance(index+1)
         elif self._zoom_plan is not None:
             size=self.grid._batch_size(len(z_values),self.spectrum.dtype,self.cfg.batch_size)
+            if progress is not None:
+                progress.advance(0,f"{self.grid.backend} · up to {size} z planes per batch")
             for start in range(0,len(z_values),size):
                 positions=z_values[start:start+size]
                 fields=self._zoom_plan.propagate_many(self.spectrum,positions,self.crl.k)
                 images=abs(fields)**2
                 for z,image in zip(positions,images):
                     yield float(z),self._blur(image,float(z))
+                if progress is not None:
+                    progress.advance(min(start+size,len(z_values)))
         else:
             for planes,fields in self.grid._iter_spectrum(
                     self.exit_field,self.spectrum,z_values,self.crl.k,self.cfg.batch_size):
                 images=abs(fields)**2
                 for z,image in zip(z_values[planes],images):
                     yield float(z),self._blur(image,float(z))
+                if progress is not None:
+                    progress.advance(planes.stop,
+                        f"{self.grid.backend} · {planes.stop-planes.start} z planes in the completed batch")
 
     def objective(self,z):
         z=float(z)
@@ -2854,7 +2918,7 @@ def _edge_power_fractions(image,xp):
     return tuple(fractions)
 
 
-def _build_focus_session(cfg,backend,parameters,analytic):
+def _build_focus_session(cfg,backend,parameters,analytic,progress=None):
     """Fit CRL geometry first, resolve its physics, then check propagation edges."""
     wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
     factor=.886 if cfg.geometry=="one-dimensional" else 1.028
@@ -2874,6 +2938,8 @@ def _build_focus_session(cfg,backend,parameters,analytic):
     enlarged=[]
     probe=None
     for attempt in range(4):
+        if progress is not None:
+            progress.start("grid",detail=f"Window attempt {attempt+1}: preparing the CRL field")
         messages=[]
         required_x=_fast_grid_size(max(256,width_x/target_x))
         if cfg.accuracy=="refined":
@@ -2920,8 +2986,12 @@ def _build_focus_session(cfg,backend,parameters,analytic):
         if not cfg.adaptive_window:
             break
         edge=np.zeros(grid.dimension)
-        for z in (.8*analytic,analytic,1.2*analytic):
+        if progress is not None:
+            progress.start("window_checks",3,f"{backend} · propagation grid {grid.shape}")
+        for index,z in enumerate((.8*analytic,analytic,1.2*analytic)):
             edge=np.maximum(edge,_edge_power_fractions(probe.intensity(z),xp))
+            if progress is not None:
+                progress.advance(index+1)
         grow_x=edge[0]>1e-3 and cfg.grid_points is None
         grow_y=grid.dimension==2 and edge[1]>1e-3 and cfg.grid_points_y is None
         if not grow_x and not grow_y:
@@ -2938,11 +3008,12 @@ def _build_focus_session(cfg,backend,parameters,analytic):
         probe=None
     if enlarged:
         messages.append("mesh_window: Geometry-fit window was expanded along "+', '.join(sorted(set(enlarged)))+" to reduce FFT-edge power.")
-    session=(probe if probe_cfg==cfg else _CRLFocusSession(cfg,grid,crl,incident,coherent_state=probe))
+    session=(probe if probe_cfg==cfg else _CRLFocusSession(cfg,grid,crl,incident,coherent_state=probe,progress=progress))
     return grid,crl,session,messages
 
 
-def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
+def estimate_crl_focus(configuration: CRLFocusConfig, *,
+                       progress: Callable[[CRLProgressUpdate], None] | None = None) -> CRLFocusResult:
     """Find a local peak-intensity distance, then sample a display ROI.
 
     Grid dimensionality and focusing dimensionality are independent. Extended
@@ -2950,9 +3021,14 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
     Point sampling propagates Gaussian quadrature modes through the full stack;
     convolution uses a shift-invariant approximation with z-dependent ABCD scale.
     No calculations are saved to files. The retained session evaluates slider z.
+    progress receives synchronous stage updates without threads or timers.
+    Unknown adaptive lengths have no percentage or ETA. Sampling ETA uses
+    completed batches, preserving GPU batching and bounding progress overhead.
     """
     if not isinstance(configuration,CRLFocusConfig):
         raise TypeError("Pass a CRLFocusConfig instance.")
+    reporter=_CRLProgressReporter(progress)
+    reporter.start("preparing",detail="Selecting backend and material properties")
     cfg=configuration
     backend=select_backend(cfg.backend)
     material=Material(cfg.material_formula,cfg.density_g_cm3)
@@ -2966,7 +3042,8 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
               reference.effective_focus(cfg.source_distance_m))
     if not np.isfinite(analytic) or analytic<=0:
         raise ValueError("This source/lens configuration has no finite real image after the CRL.")
-    grid,crl,session,messages=_build_focus_session(cfg,backend,parameters,analytic)
+    grid,crl,session,messages=_build_focus_session(cfg,backend,parameters,analytic,reporter)
+    reporter.start("detector",detail="Preparing the observation grid")
     if cfg.accuracy=="refined":
         session.configure_refined_detector(analytic)
     detector=session.detector_grid
@@ -2975,11 +3052,27 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
     factor=.886 if cfg.geometry=="one-dimensional" else 1.028
     messages.extend(session.diagnostics)
     search_bounds=cfg.scan_range_m or (max(1e-9,.05*analytic),3*analytic)
-    numerical=find_peak_intensity_distance(session.objective,analytic,bounds_m=search_bounds,
+    reporter.start("peak_search",detail="Adaptive local peak-intensity search")
+    evaluations=0
+    def search_objective(z):
+        nonlocal evaluations
+        value=session.objective(z)
+        evaluations+=1
+        reporter.advance(evaluations,f"Evaluating z = {z*1e3:.2f} mm")
+        return value
+    numerical=find_peak_intensity_distance(search_objective,analytic,bounds_m=search_bounds,
                    tolerance_m=cfg.peak_search_tolerance_m)
     if not numerical.converged:
         messages.append("peak_search: "+numerical.message)
-    bounds=cfg.scan_range_m or _peak_z_roi(session.objective,numerical,search_bounds,cfg.axial_roi_level)
+    reporter.start("axial_roi",detail="Finding the axial display interval")
+    roi_evaluations=0
+    def roi_objective(z):
+        nonlocal roi_evaluations
+        value=session.objective(z)
+        roi_evaluations+=1
+        reporter.advance(roi_evaluations)
+        return value
+    bounds=cfg.scan_range_m or _peak_z_roi(roi_objective,numerical,search_bounds,cfg.axial_roi_level)
     if bounds[1]<=bounds[0]:
         raise ArithmeticError("The peak-intensity ROI has zero extent.")
     if cfg.scan_range_m is None and (bounds[0]==search_bounds[0] or bounds[1]==search_bounds[1]):
@@ -2989,7 +3082,8 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
     lines=[]
     transverse_x=xp.zeros(detector.nx,dtype=xp.float64)
     transverse_y=None if grid.dimension==1 else xp.zeros(detector.ny,dtype=xp.float64)
-    for z,image in session.iter_intensities(positions):
+    reporter.start("sampling",len(positions),"Calculating detector planes and beam metrics")
+    for z,image in session.iter_intensities(positions,reporter):
         metric=session.metrics(image)
         metrics.append(metric)
         if grid.dimension==1:
@@ -3002,6 +3096,7 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
             transverse_x=xp.maximum(transverse_x,xp.max(image,axis=0))
             transverse_y=xp.maximum(transverse_y,xp.max(image,axis=1))
         lines.append(_to_numpy(line).copy())
+    reporter.start("finalizing",detail="Finalizing transverse ROI and beam metrics")
     x_full=_to_numpy(detector.x if grid.dimension==1 else detector.x_axis)
     x_slice=_display_slice(x_full,_to_numpy(transverse_x),cfg.transverse_roi_level)
     y_full=None if grid.dimension==1 else _to_numpy(detector.y_axis)
@@ -3040,9 +3135,11 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
         point_width=factor*wavelength*analytic/cfg.aperture_m
         if np.max(shift)*np.pi/np.sqrt(2*cfg.source_points)>point_width/2:
             messages.append("source_quadrature: Gaussian source nodes may be too sparse; compare with a higher point count.")
-    return CRLFocusResult(cfg,backend,float(analytic),reference.theoretical_focus(),numerical,
+    result=CRLFocusResult(cfg,backend,float(analytic),reference.theoretical_focus(),numerical,
         positions,np.asarray([m.max_intensity for m in metrics]),widths,best_index,
         best.x_m,best.y_m,best.intensity,np.stack(lines)[:,x_slice].copy(),
         session.transmission,float(crl.delta),float(crl.beta),grid.dx,grid.shape,
         None if grid.dimension==1 else grid.dy,detector.shape,detector.dx,
         None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session)
+    reporter.finish()
+    return result
