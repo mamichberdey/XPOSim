@@ -40,7 +40,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 
 __all__ = [
@@ -559,6 +559,74 @@ def _ifft2d(array: Any, dx: float, dy: float) -> Any:
     return _transform2d(array, dx, dy, True)
 
 
+class _InverseFourierAxis:
+    """Cached Bluestein/CZT quadrature of a continuous inverse Fourier axis."""
+    def __init__(self, n, q0, dq, output_axis, xp):
+        from scipy.fft import next_fast_len
+        self.xp=xp
+        self.n=n
+        self.m=int(output_axis.size)
+        self.length=next_fast_len(n+self.m-1)
+        first=float(_to_python_float(output_axis[0]))
+        step=float(_to_python_float(output_axis[1]-output_axis[0]))
+        angle=dq*step
+        j=xp.arange(n,dtype=xp.float64)
+        d=xp.arange(-(n-1),self.m,dtype=xp.float64)
+        l=xp.arange(self.m,dtype=xp.float64)
+        self.pre=xp.exp(1j*(dq*first*j+angle*j*j/2))
+        self.kernel=xp.fft.fft(xp.exp(-.5j*angle*d*d),n=self.length)
+        self.post=xp.exp(.5j*angle*l*l+1j*q0*output_axis)*(dq/(2*np.pi))
+
+    def apply(self,array,axis=-1):
+        xp=self.xp
+        work=xp.moveaxis(array,axis,-1)
+        work=xp.fft.fft(work*self.pre,n=self.length,axis=-1)
+        work*=self.kernel
+        result=xp.fft.ifft(work,axis=-1)[...,self.n-1:self.n-1+self.m]*self.post
+        return xp.moveaxis(result,-1,axis)
+
+
+class _DetectorFourierPlan:
+    """Evaluate the propagated complex Fourier field on a dense local grid."""
+    def __init__(self,grid,detector):
+        self.grid=grid
+        self.detector=detector
+        xp=grid.xp
+        x=detector.x if grid.dimension==1 else detector.x_axis
+        qx=grid.qx if grid.dimension==1 else grid.qx_axis
+        self.x=_InverseFourierAxis(grid.nx,_to_python_float(qx[0]),grid.dqx,x,xp)
+        self.y=None
+        if grid.dimension==2:
+            self.y=_InverseFourierAxis(grid.ny,_to_python_float(grid.qy_axis[0]),
+                                      grid.dqy,detector.y_axis,xp)
+
+    def _inverse(self,work):
+        work=self.x.apply(work,axis=-1)
+        if self.y is not None:
+            work=self.y.apply(work,axis=-2)
+        return work
+
+    def propagate_many(self,spectrum,z_values,k):
+        grid=self.grid
+        xp=grid.xp
+        z=xp.asarray(z_values)[:,None]
+        qx=grid.qx if grid.dimension==1 else grid.qx_axis
+        phase=xp.exp((-.5j/k)*z*qx**2)
+        work=spectrum[None,...]*(phase if grid.dimension==1 else phase[:,None,:])
+        if grid.dimension==2:
+            work*=xp.exp((-.5j/k)*z*grid.qy_axis**2)[:,:,None]
+        return self._inverse(work)
+
+    def propagate(self,spectra,z,k):
+        grid=self.grid
+        xp=grid.xp
+        qx=grid.qx if grid.dimension==1 else grid.qx_axis
+        work=spectra*xp.exp((-.5j*z/k)*qx**2)
+        if grid.dimension==2:
+            work*=xp.exp((-.5j*z/k)*grid.qy_axis**2)[:,None]
+        return self._inverse(work)
+
+
 class BaseGrid(_Configured, ABC):
     """Immutable numerical-grid parameters and shared CPU/GPU operations.
 
@@ -639,6 +707,21 @@ class BaseGrid(_Configured, ABC):
         if z == 0:
             return field.copy()
         return self._propagate_spectrum(self.fft(field), np.asarray([z]), k)[0]
+
+    def propagate_to_grid(self, field: Any, z: float, k: float, detector: "BaseGrid") -> Any:
+        """Evaluate Fresnel propagation on a local uniform detector grid.
+
+        This samples the propagated complex Fourier field with chirp-z transforms.
+        It does not interpolate a previously calculated intensity or create
+        frequencies missing from the entrance grid. The entrance grid must
+        still resolve the optical field and phase.
+        """
+        self._validate_field_backend(field)
+        _validate_finite("z",z)
+        _validate_positive("k",k)
+        if detector.dimension!=self.dimension or detector.backend!=self.backend:
+            raise ValueError("Detector dimension/backend must match the propagation grid.")
+        return _DetectorFourierPlan(self,detector).propagate(self.fft(field),z,k)
 
     def _batch_size(self, n_planes: int, dtype: Any, batch_size: int | None) -> int:
         if batch_size is not None:
@@ -2426,6 +2509,8 @@ class _CRLFocusSession:
         self._last_z,self._last_image=None,None
         self._peak_cache={}
         self.slices=(slice(None),)*grid.dimension
+        self.detector_grid=grid
+        self._zoom_plan=None
         self.diagnostics=[]
         self._modes=None
         sigma_factor=1/(2*np.sqrt(2*np.log(2)))
@@ -2459,6 +2544,47 @@ class _CRLFocusSession:
                 self.diagnostics.append("source_streaming: Source spectra exceed the RAM/VRAM cache budget; modes are recomputed in bounded batches.")
         elif cfg.source_type=="gaussian":
             self.diagnostics.append("convolution_model: Gaussian intensity convolution assumes a shift-invariant pupil response; use point sampling to include source-dependent clipping and absorption.")
+
+    def configure_refined_detector(self,analytic):
+        """Resolve the detector peak without globally oversampling the lens plane."""
+        cfg=self.cfg
+        wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
+        factor=.886 if cfg.geometry=="one-dimensional" else 1.028
+        coherent_width=factor*wavelength*analytic/cfg.aperture_m
+        projected=np.abs(self.magnification(analytic))*np.array(self.source_sigma[:self.grid.dimension])*2*np.sqrt(2*np.log(2))
+        if cfg.source_type=="point":
+            projected*=0
+        widths=[24*max(coherent_width,projected[0])]
+        targets=[coherent_width/24]
+        if self.grid.dimension==2:
+            if cfg.geometry=="two-dimensional":
+                widths.append(24*max(coherent_width,projected[1]))
+                targets.append(coherent_width/24)
+            else:
+                widths.append(max(2*cfg.structure_depth_m,12*projected[1]))
+                targets.append(min(cfg.structure_depth_m/192,np.sqrt(wavelength*analytic)/24))
+        propagation_widths=[self.grid.nx*self.grid.dx]
+        if self.grid.dimension==2:
+            propagation_widths.append(self.grid.ny*self.grid.dy)
+        for axis,(wanted,available) in enumerate(zip(widths,propagation_widths)):
+            if wanted>available*.98:
+                widths[axis]=available*.98
+                self.diagnostics.append("detector_window: Refined detector ROI is limited by the propagation window; enlarge the propagation window at fixed step.")
+        counts=[]
+        for width,target in zip(widths,targets):
+            desired=max(257,int(np.ceil(width/target)))
+            if desired%2==0: desired+=1
+            count=min(2049,desired)
+            if count<desired:
+                self.diagnostics.append("detector_cap: Refined detector sampling reached its cap; reduce source extent or compare a smaller detector ROI.")
+            counts.append(count)
+        detector=(Grid1D(widths[0]/counts[0],counts[0],backend=self.grid.backend)
+                  if self.grid.dimension==1 else Grid2D(widths[0]/counts[0],widths[1]/counts[1],counts[0],counts[1],backend=self.grid.backend))
+        self.detector_grid=detector
+        self._zoom_plan=_DetectorFourierPlan(self.grid,detector)
+        self._last_z,self._last_image=None,None
+        self._peak_cache.clear()
+        self.slices=(slice(None),)*detector.dimension
 
     def _generate_modes(self):
         total_power=0.0
@@ -2497,15 +2623,17 @@ class _CRLFocusSession:
         if z==self._last_z:
             return self._last_image
         if self._point_model:
-            image=self.xp.zeros(self.grid.shape,dtype=self.xp.float64)
+            image=self.xp.zeros(self.detector_grid.shape,dtype=self.xp.float64)
             modes=self._modes if self._modes is not None else self._generate_modes()
             extra=(None,)*self.grid.dimension
             for spectra,weights in modes:
-                fields=self.grid._propagate_mode_spectra(spectra,z,self.crl.k)
+                fields=(self.grid._propagate_mode_spectra(spectra,z,self.crl.k) if self._zoom_plan is None else
+                        self._zoom_plan.propagate(spectra,z,self.crl.k))
                 image+=self.xp.sum(abs(fields)**2*weights[(slice(None),*extra)],axis=0)
                 del fields
         else:
-            field=self.exit_field if z==0 else self.grid._propagate_spectrum(self.spectrum,np.asarray([z]),self.crl.k)[0]
+            field=(self._zoom_plan.propagate(self.spectrum,z,self.crl.k) if self._zoom_plan is not None else
+                   (self.exit_field if z==0 else self.grid._propagate_spectrum(self.spectrum,np.asarray([z]),self.crl.k)[0]))
             image=abs(field)**2
             image=self._blur(image,z)
         self._last_z,self._last_image=z,image
@@ -2519,15 +2647,23 @@ class _CRLFocusSession:
         else:
             from scipy.ndimage import gaussian_filter
         magnification=self.magnification(z)
-        sigma_x=abs(magnification[0])*self.source_sigma[0]/self.grid.dx
+        sigma_x=abs(magnification[0])*self.source_sigma[0]/self.detector_grid.dx
         sigmas=sigma_x if self.grid.dimension==1 else (
-            abs(magnification[1])*self.source_sigma[1]/self.grid.dy,sigma_x)
+            abs(magnification[1])*self.source_sigma[1]/self.detector_grid.dy,sigma_x)
         return gaussian_filter(image,sigmas,mode="constant",cval=0.0,truncate=5.0)
 
     def iter_intensities(self,z_values):
         if self._point_model:
             for z in z_values:
                 yield float(z),self.intensity(float(z))
+        elif self._zoom_plan is not None:
+            size=self.grid._batch_size(len(z_values),self.spectrum.dtype,self.cfg.batch_size)
+            for start in range(0,len(z_values),size):
+                positions=z_values[start:start+size]
+                fields=self._zoom_plan.propagate_many(self.spectrum,positions,self.crl.k)
+                images=abs(fields)**2
+                for z,image in zip(positions,images):
+                    yield float(z),self._blur(image,float(z))
         else:
             for planes,fields in self.grid._iter_spectrum(
                     self.exit_field,self.spectrum,z_values,self.crl.k,self.cfg.batch_size):
@@ -2542,14 +2678,14 @@ class _CRLFocusSession:
         return self._peak_cache[z]
 
     def metrics(self,image):
-        return _intensity_metrics_batch(image[None,...],self.grid,
+        return _intensity_metrics_batch(image[None,...],self.detector_grid,
                        (slice(None),)*self.grid.dimension)[0]
 
     def plane(self,z):
         image=self.intensity(z)
         metrics=self.metrics(image)
-        x=self.grid.x if self.grid.dimension==1 else self.grid.x_axis
-        y=None if self.grid.dimension==1 else self.grid.y_axis
+        x=self.detector_grid.x if self.grid.dimension==1 else self.detector_grid.x_axis
+        y=None if self.grid.dimension==1 else self.detector_grid.y_axis
         return CRLPlaneResult(float(z),_to_numpy(image[self.slices]).copy(),
             _to_numpy(x[self.slices[-1]]).copy(),
             None if y is None else _to_numpy(y[self.slices[0]]).copy(),
@@ -2578,6 +2714,9 @@ class CRLFocusResult:
     grid_step_m: float
     grid_shape: tuple[int,...]
     grid_step_y_m: float | None
+    detector_shape: tuple[int,...]
+    detector_step_m: float
+    detector_step_y_m: float | None
     lens_length_m: float
     diagnostics: tuple[str,...]
     _session: _CRLFocusSession
@@ -2608,6 +2747,8 @@ class CRLFocusResult:
                 "magnification_at_focus":self.magnification_at_focus,
                 "transmission":self.transmission,"grid_shape":self.grid_shape,
                 "grid_step_m":self.grid_step_m,"grid_step_y_m":self.grid_step_y_m,
+                "detector_shape":self.detector_shape,"detector_step_m":self.detector_step_m,
+                "detector_step_y_m":self.detector_step_y_m,
                 "lens_length_m":self.lens_length_m,"diagnostics":list(self.diagnostics),
                 "focus_evaluations":self.numerical_focus.evaluations,
                 "focus_converged":self.numerical_focus.converged,
@@ -2658,9 +2799,14 @@ def _build_focus_session(cfg,backend,parameters,analytic):
     """Fit CRL geometry first, resolve its physics, then check propagation edges."""
     wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
     factor=.886 if cfg.geometry=="one-dimensional" else 1.028
-    target_x=factor*wavelength*analytic/cfg.aperture_m/(6 if cfg.accuracy=="preview" else 12)
+    target_x=factor*wavelength*analytic/cfg.aperture_m/6
     target_x=min(target_x,wavelength*cfg.source_distance_m/(2*cfg.aperture_m))
-    cap=65536 if cfg.grid_dimension==1 else (2048 if backend=="cupy" or cfg.accuracy=="refined" else 1024)
+    quick_cap=65536 if cfg.grid_dimension==1 else (2048 if backend=="cupy" else 1024)
+    cap=65536 if cfg.grid_dimension==1 else (4096 if cfg.accuracy=="refined" else quick_cap)
+    k=2*np.pi/wavelength
+    delta=parameters['material'].optical_constants(cfg.energy_kev)[0]
+    phase_slope=k*delta*cfg.n_elements*cfg.aperture_m/cfg.radius_m+k*cfg.aperture_m/(2*cfg.source_distance_m)
+    phase_target=(np.pi/3)/phase_slope
     width_x=cfg.window_factor*cfg.aperture_m
     depth=cfg.aperture_m if cfg.geometry=="two-dimensional" else cfg.structure_depth_m
     width_y=None if cfg.grid_dimension==1 else cfg.window_factor*depth
@@ -2669,6 +2815,8 @@ def _build_focus_session(cfg,backend,parameters,analytic):
     for attempt in range(4):
         messages=[]
         required_x=_fast_grid_size(max(256,width_x/target_x))
+        if cfg.accuracy=="refined":
+            required_x=max(_fast_grid_size(1.25*min(required_x,quick_cap)),_fast_grid_size(width_x/phase_target))
         nx=cfg.grid_points or min(required_x,cap)
         if cfg.grid_points is None and nx<required_x:
             messages.append("grid_cap: Automatic x sampling reached its memory cap; refine the grid to check spot size.")
@@ -2680,6 +2828,10 @@ def _build_focus_session(cfg,backend,parameters,analytic):
             else:
                 target_y=min(depth/128,wavelength*analytic/(6*depth),wavelength*cfg.source_distance_m/(2*depth))
             required_y=_fast_grid_size(max(128,width_y/target_y))
+            if cfg.accuracy=="refined":
+                required_y=_fast_grid_size(1.25*min(required_y,quick_cap))
+                if cfg.geometry=="two-dimensional":
+                    required_y=max(required_y,_fast_grid_size(width_y/phase_target))
             ny=cfg.grid_points_y or min(required_y,cap)
             if cfg.grid_points_y is None and ny<required_y:
                 messages.append("grid_cap_y: Automatic y sampling reached its memory cap; refine the grid.")
@@ -2750,6 +2902,9 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
     if not np.isfinite(analytic) or analytic<=0:
         raise ValueError("This source/lens configuration has no finite real image after the CRL.")
     grid,crl,session,messages=_build_focus_session(cfg,backend,parameters,analytic)
+    if cfg.accuracy=="refined":
+        session.configure_refined_detector(analytic)
+    detector=session.detector_grid
     xp=grid.xp
     wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
     factor=.886 if cfg.geometry=="one-dimensional" else 1.028
@@ -2767,8 +2922,8 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
     positions=np.unique(np.r_[np.linspace(*bounds,cfg.scan_points),numerical.z_m])
     metrics=[]
     lines=[]
-    transverse_x=xp.zeros(grid.nx,dtype=xp.float64)
-    transverse_y=None if grid.dimension==1 else xp.zeros(grid.ny,dtype=xp.float64)
+    transverse_x=xp.zeros(detector.nx,dtype=xp.float64)
+    transverse_y=None if grid.dimension==1 else xp.zeros(detector.ny,dtype=xp.float64)
     for z,image in session.iter_intensities(positions):
         metric=session.metrics(image)
         metrics.append(metric)
@@ -2777,21 +2932,21 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
             transverse_x=xp.maximum(transverse_x,image)
         else:
             flat=xp.argmax(image)
-            j,i=flat//grid.nx,flat%grid.nx
-            line=image[grid.ny//2,:]
+            j,i=flat//detector.nx,flat%detector.nx
+            line=image[detector.ny//2,:]
             transverse_x=xp.maximum(transverse_x,xp.max(image,axis=0))
             transverse_y=xp.maximum(transverse_y,xp.max(image,axis=1))
         lines.append(_to_numpy(line).copy())
-    x_full=_to_numpy(grid.x if grid.dimension==1 else grid.x_axis)
+    x_full=_to_numpy(detector.x if grid.dimension==1 else detector.x_axis)
     x_slice=_display_slice(x_full,_to_numpy(transverse_x),cfg.transverse_roi_level)
-    y_full=None if grid.dimension==1 else _to_numpy(grid.y_axis)
+    y_full=None if grid.dimension==1 else _to_numpy(detector.y_axis)
     y_slice=None if grid.dimension==1 else _display_slice(y_full,_to_numpy(transverse_y),cfg.transverse_roi_level)
     session.slices=(x_slice,) if grid.dimension==1 else (y_slice,x_slice)
     best=session.plane(numerical.z_m)
     best_index=int(np.flatnonzero(positions==numerical.z_m)[0])
     widths=np.asarray([np.nan if m.fwhm is None else m.fwhm for m in metrics],dtype=float)
     best_widths=np.atleast_1d(widths[best_index])
-    steps=np.array([grid.dx] if grid.dimension==1 else [grid.dx,grid.dy])
+    steps=np.array([detector.dx] if grid.dimension==1 else [detector.dx,detector.dy])
     if np.any(~np.isfinite(best_widths)):
         messages.append("fwhm_missing: Half-maximum crossings are outside the calculation window.")
     elif np.any(best_widths/steps<6):
@@ -2801,16 +2956,16 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
     if slope>np.pi/2:
         messages.append("phase_sampling: Phase changes too rapidly between x samples; refine the grid.")
     image=session.intensity(numerical.z_m)
-    rim_x=max(1,grid.nx//20)
+    rim_x=max(1,detector.nx//20)
     if grid.dimension==1:
         edge=xp.sum(image[:rim_x])+xp.sum(image[-rim_x:])
     else:
-        rim_y=max(1,grid.ny//20)
+        rim_y=max(1,detector.ny//20)
         edge=(xp.sum(image[:rim_y])+xp.sum(image[-rim_y:])+
               xp.sum(image[rim_y:-rim_y,:rim_x])+xp.sum(image[rim_y:-rim_y,-rim_x:]))
     total=_to_python_float(xp.sum(image))
     if total>0 and _to_python_float(edge)/total>1e-3:
-        messages.append("window_boundary: Significant power reaches the numerical window edge; enlarge the window at fixed step.")
+        messages.append(("detector_boundary: Significant power reaches the refined detector ROI edge." if cfg.accuracy=="refined" else "window_boundary: Significant power reaches the numerical window edge; enlarge the window at fixed step."))
     if session.transmission<1e-12:
         messages.append("low_transmission: The transmitted intensity is very small.")
     if cfg.source_type=="gaussian" and cfg.source_method=="points":
@@ -2823,4 +2978,5 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
         positions,np.asarray([m.max_intensity for m in metrics]),widths,best_index,
         best.x_m,best.y_m,best.intensity,np.stack(lines)[:,x_slice].copy(),
         session.transmission,float(crl.delta),float(crl.beta),grid.dx,grid.shape,
-        None if grid.dimension==1 else grid.dy,crl.length,tuple(messages),session)
+        None if grid.dimension==1 else grid.dy,detector.shape,detector.dx,
+        None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session)
