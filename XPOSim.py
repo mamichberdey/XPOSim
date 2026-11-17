@@ -2778,7 +2778,7 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
         else:
             flat=xp.argmax(image)
             j,i=flat//grid.nx,flat%grid.nx
-            line=image[j,:]
+            line=image[grid.ny//2,:]
             transverse_x=xp.maximum(transverse_x,xp.max(image,axis=0))
             transverse_y=xp.maximum(transverse_y,xp.max(image,axis=1))
         lines.append(_to_numpy(line).copy())
@@ -2821,6 +2821,6 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
             messages.append("source_quadrature: Gaussian source nodes may be too sparse; compare with a higher point count.")
     return CRLFocusResult(cfg,backend,float(analytic),reference.theoretical_focus(),numerical,
         positions,np.asarray([m.max_intensity for m in metrics]),widths,best_index,
-        best.x_m,best.y_m,best.intensity,np.stack(lines)[:,x_slice],
+        best.x_m,best.y_m,best.intensity,np.stack(lines)[:,x_slice].copy(),
         session.transmission,float(crl.delta),float(crl.beta),grid.dx,grid.shape,
         None if grid.dimension==1 else grid.dy,crl.length,tuple(messages),session)
