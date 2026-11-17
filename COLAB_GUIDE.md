@@ -1,16 +1,16 @@
 # CRL focus explorer in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/b3075dbecd34c4764d69365b0d5d30b783c983cd/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/97d9e7a15f00d9500d852217b16f3a8cfa0c5003/notebooks/CRL_Focus_Colab.ipynb).
 
-Run all once to open the English parameter form. Enter the CRL and source parameters, then press **Compute**. No optical calculation starts automatically. Results appear in a compact two-column workspace with the z slider directly below the detector image. **Edit parameters** opens the form again. Reinitializing the explorer in the same live session preserves entered values and opens the form without starting another calculation. Calculation results remain in memory; no export or save/restore mechanism is included.
+Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. The parameter fields are always shown in their own output and are never automatically collapsed or hidden by a calculation. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results remain in memory; no export or save/restore mechanism is included.
 
 ## Start
 
 1. Open the link and sign in to Colab. Optionally save a copy to your Drive.
 2. For GPU execution, use **Runtime → Change runtime type → GPU → Save**, reconnect, and run all cells. CPU execution is also supported.
 3. Setup checks dependencies and actual CUDA execution. Missing CuPy is installed only when a compatible CUDA 12/13 environment is detected. A small GPU FFT probe selects CuPy when CUDA works, otherwise NumPy. The notice reports the actual CUDA device, independent of the session's GPU/TPU label. CPU sessions display the GPU-enabling instructions. There is no backend picker.
-4. The expanded form defaults to silicon at 12 keV, surface radius 6.25 µm, full aperture 50 µm, bridge thickness 2 µm, 26 elements and source distance 15 m. **Fast** sampling is selected initially.
-5. Check the parameters and press **Compute**. After a successful calculation, the form collapses to leave room for the results. Use **Edit parameters** to change the inputs and compute again.
+4. Run **2 · CRL and source parameters** to display the editable fields below that cell. The form defaults to silicon at 12 keV, surface radius 6.25 µm, full aperture 50 µm, bridge thickness 2 µm, 26 elements and source distance 15 m. **Fast** sampling is selected initially.
+5. Run **3 · Results**, then press **Compute** after setting the inputs. To change the lens or source, edit the still-visible fields in cell 2 and press **Compute** again. The results stay in their own compact workspace, so using the detector slider does not move the input form.
 
 In **Auto** density mode, the read-only **Density (g/cm³)** field shows the value actually used, and its label identifies the selected material. Presets are Be: 1.848, Si: 2.33, Al: 2.70 and diamond: 3.515 g/cm³. **Manual** allows an override. A custom chemical formula requires a manual density.
 
@@ -121,9 +121,9 @@ For a new public notebook revision, commit the tested library first and pin that
 - The model is scalar, monochromatic and paraxial. It excludes polarization, back-reflections and high-angle propagation.
 - For memory errors, reduce batch size first. Reducing grid sizes reduces accuracy. Direct source integration can be considerably more expensive than convolution.
 - An unresolved FWHM means the required half-maximum crossings were not found within the numerical window.
-- If controls do not appear, rerun setup in a fresh session and allow the standard custom-widget manager. The dynamic form requires cell initialization.
+- If inputs are missing, confirm that the introduction says **Interface revision: separate parameter and results cells** and run cell 2 explicitly. A previously opened notebook or Drive copy does not automatically receive repository updates: use the current link at the top of this guide. If widgets themselves do not render, rerun setup in a fresh session and allow the standard custom-widget manager.
 - Colab session memory is temporary. Reopening starts with the parameter form; restarting a kernel loses entered values.
 
-CPU validation covers the existing optical/source/grid checks, Fourier-zoom equivalence and analytical Gaussian propagation, the renamed peak-search API and compatibility aliases, first-run form visibility, density changes, selected-plane cards, formatting/colors and discrete slider callbacks. A local live browser exercises real slider track clicks, dragging and keyboard interaction at desktop sizes. Actual CUDA hardware and the Google Colab frontend were not available for validation.
+CPU validation covers the existing optical/source/grid checks, Fourier-zoom equivalence and analytical Gaussian propagation, the renamed peak-search API and compatibility aliases, independent input/result outputs, first-run form visibility, density changes, selected-plane cards, formatting/colors and discrete slider callbacks. In a local live browser, actual radius, aperture, source type, source FWHM and source distance fields were edited before Compute; the calculated configuration was checked against those edits. The fields stayed rendered after calculation, and slider track clicks, dragging and keyboard interaction were exercised at desktop sizes. Actual CUDA hardware and the Google Colab frontend were not available for validation.
 
 An earlier silicon 2D Accurate CPU run with 15 display planes took approximately 45 seconds on a 2688×2688 propagation grid and 577×577 detector, resolving FWHM with over 40 detector samples. Runtime depends on hardware, z count, source nodes and grid size; this is one CPU benchmark.
