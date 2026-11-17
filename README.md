@@ -2,9 +2,9 @@
 
 **X-ray Paraxial Optical Simulation — wave optics with GPU acceleration.**
 
-[![Open CRL Focus in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/c111ba075b078eff3a8205e76acbc7024c1a1ed4/notebooks/CRL_Focus_Colab.ipynb)
+[![Open CRL Focus in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/4c26eb102e96ae96f5d81177ea6493ff3deed92c/notebooks/CRL_Focus_Colab.ipynb)
 
-**Explore a CRL focus without a local environment.** The [English Colab notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/c111ba075b078eff3a8205e76acbc7024c1a1ed4/notebooks/CRL_Focus_Colab.ipynb) has compact interactive controls, independent focusing/grid dimensions, incoherent Gaussian sources by point sampling or convolution, geometry-fit adaptive grids, local numerical focus search, automatic display ROI and a live detector-z slider. Longitudinal intensity, peak intensity and FWHM share a horizontal z axis. Calculations are kept in memory; there are no exports. CPU works by default, and CuPy accelerates 2D calculations when a usable GPU is available. See the [Colab guide](COLAB_GUIDE.md) for model assumptions and numerical checks.
+**Explore a CRL focus without a local environment.** The [English Colab workspace](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/4c26eb102e96ae96f5d81177ea6493ff3deed92c/notebooks/CRL_Focus_Colab.ipynb) provides a persistent dynamic parameter form, automatic CUDA/CPU detection, independent focusing/grid dimensions, Gaussian-source models, adaptive focus/ROI search and a compact two-column results view. The detector slider sits below its image. Intensities are linear; Refined evaluates the complex field on a dense detector ROI with Fourier zoom propagation. The default is a 12 keV silicon CRL with 26 elements. Calculations remain in memory. See the [Colab guide](COLAB_GUIDE.md).
 
 [Download ZIP](https://github.com/mamichberdey/XPOSim/archive/refs/heads/main.zip) · [Installation](#2-installation) · [Tutorial](DOCUMENTATION.md#2-complete-example-point-source-crl-and-detector) · [API reference](DOCUMENTATION.md#8-api-reference) · [Repository](https://github.com/mamichberdey/XPOSim)
 

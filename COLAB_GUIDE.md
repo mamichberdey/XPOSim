@@ -1,15 +1,15 @@
 # CRL focus explorer in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/c111ba075b078eff3a8205e76acbc7024c1a1ed4/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/4c26eb102e96ae96f5d81177ea6493ff3deed92c/notebooks/CRL_Focus_Colab.ipynb).
 
-Run all once, change the English controls, then press **Compute focus**. No calculation files are saved or exported. The notebook loads a pinned XPOSim revision and material tables automatically.
+Run all once, change the English controls, then press **Compute focus**. The dynamic form retains entered values when its cell is initialized again in the same live session. Results are shown in a compact two-column workspace; the z slider is directly below the detector image. No calculation files are saved or exported. The notebook loads a pinned XPOSim revision and material tables automatically.
 
 ## Start
 
 1. Open the link and sign in to Colab. Optionally save a notebook copy to your own Drive.
 2. For GPU execution, use **Runtime → Change runtime type → GPU**, then run all cells. A CPU session also works.
-3. Setup checks the available dependencies and CUDA. Missing CuPy is installed only when a compatible CUDA 12/13 GPU environment is detected. **Auto** uses an actual GPU FFT probe and falls back to NumPy when necessary; an explicit **CuPy / GPU** request reports an error rather than silently switching backend.
-4. The default example runs immediately. Change parameters and press **Compute focus** to update the analysis and slider.
+3. Setup checks the available dependencies and CUDA. Missing CuPy is installed only when a compatible CUDA 12/13 GPU environment is detected. The interface uses an actual GPU FFT probe and selects CuPy when CUDA works, otherwise NumPy. The hardware notice reports the actual CUDA device rather than relying on a GPU/TPU session label. For a CPU session it shows the Colab GPU-enabling steps. There is no backend picker to accidentally select unavailable hardware.
+4. The default example runs immediately: silicon at 12 keV, surface radius 6.25 µm, full aperture 50 µm, bridge thickness 2 µm, 26 elements and source distance 15 m. Material density is automatic by default; choose **Manual** to override a preset density. Change parameters and press **Compute focus** to update the analysis and slider.
 
 GPU availability, runtime limits and disconnections are controlled by Colab: [official FAQ](https://research.google.com/colaboratory/faq.html).
 
@@ -46,6 +46,10 @@ The initial transverse window encloses the full aperture and, where applicable, 
 
 Point counts use FFT-friendly combinations of factors 2, 3, 5 and 7. Initial propagation probes check edge power. With **Adapt propagation window**, automatic axes can grow independently when their boundaries carry significant intensity. The number of points is recalculated to preserve the resolution target. Explicit point-count overrides retain user control.
 
+**Quick** uses the propagation grid directly for detector samples. **Refined** also calculates the complex propagated field on a dense, local detector grid using inverse Fourier chirp-z evaluation. This is a new field calculation at the detector coordinates, not interpolation of an intensity image. Its target is at least 24 points across the coherent diffraction-width estimate, with bounded detector size. It avoids globally enlarging the full 2D propagation grid merely to display a nanometre-scale focus smoothly.
+
+The entrance grid still has to resolve amplitude and phase. Dense detector evaluation cannot reconstruct missing entrance frequencies or repair an underresolved lens calculation. Refined increases the propagation-grid budget too; propagation and detector grids are shown separately under **Model, mesh and diagnostics**. Direct point-source integration can require substantially more work than convolution.
+
 A geometry-fitting window alone does not prove sufficient padding for FFT propagation. Expansion and grid sizes have memory limits, and the final display ROI is checked too. A boundary warning requires inspecting a larger window at a comparable step. A finer grid, larger window and more source nodes should be compared when quantitative accuracy matters. Automatic settings do not certify convergence.
 
 ## Numerical focus and automatic display ROI
@@ -62,15 +66,15 @@ After focus search:
 
 Manual z bounds are available in the advanced controls. They also bound the local focus search. The initial analytical guess is clamped to the selected interval.
 
-## Plots and interactive detector plane
+## Compact results workspace
 
-Images use CMRmap with white at the maximum. The main panel has three vertically aligned plots with a shared horizontal z axis:
+Images use **linear intensity**, CMRmap and white at the maximum. The left side of the dashboard has three vertically aligned plots with a shared horizontal z axis:
 
 1. x–z intensity map (the grid row closest to y = 0 for 2D), above the statistics;
 2. peak intensity versus z;
 3. transverse FWHM versus z.
 
-Plane peak intensity and FWHM are measured over the full detector plane; the longitudinal map remains a fixed central slice rather than following a moving y maximum. The interactive panel shows the full transverse ROI and peak-crossing profiles.
+Plane peak intensity and FWHM are measured over the full detector plane; the longitudinal map remains a fixed central slice rather than following a moving y maximum. The right side shows the transverse ROI or an x/y profile. Its z slider is below the image, next to the varying intensity/FWHM/magnification readout. Image widgets update in place so slider changes do not move the page. Intensity normalization remains fixed to the focus/reference peak as z changes, making dimming visible; a linked cursor marks the selected z on the left-hand plots. One-curve plots have no redundant legend.
 
 For a 2D field, each x profile passes through that plane's transverse intensity maximum, so the map, peak statistic and FWHM x use the same slice. Its y position can vary with z. For one-dimensional focusing, the main width plot shows the focused x width; the interactive plane also reports y width.
 
@@ -115,3 +119,11 @@ All API lengths are metres. `CRL.apply_to_fields` handles a bounded batch of ind
 For a new public notebook version, first commit the tested library, then pin that commit and its module SHA-256 in setup. Commit the notebook afterwards and point the Colab link to the immutable notebook commit. Notebook outputs and execution counts should remain cleared in GitHub.
 
 Validation for this revision: 13 existing CPU regression checks and 6 focused source/search/grid checks pass. The notebook was executed end to end in a Jupyter kernel, including conditional controls and live-slider callbacks. A real Colab front end and CUDA hardware were not available for validation; GPU execution remains to be checked in a GPU session.
+
+## Display conventions and validation
+
+Axes use fixed two-decimal tick labels. Length units adapt to the viewed range; large/small intensity values carry a power-of-ten scale on the axis. Parameters collapse after a successful calculation, and less frequently needed model/mesh details remain in an accordion. The workspace is width-limited and responsive instead of stretching plots across a wide monitor.
+
+The interface was exercised in a local browser at 1366×768 and 1920×1080, including a real frontend slider event and unchanged page position. Colab adds its own toolbar/sidebar, so available cell width can vary. The dynamic form requires one initialization; rerunning it preserves inputs and waits for Compute focus rather than automatically repeating a potentially expensive run.
+
+Numerical validation covers native-grid equivalence of chirp-z propagation, an analytical Gaussian field, batched propagation and incoherent source limits, in addition to the earlier CPU checks. A silicon 2D Refined run with 15 displayed z planes took approximately 45 seconds on the validation CPU and resolved the focal FWHM with over 40 detector samples. Runtime depends on hardware, z sample count, source nodes and grid size; actual CUDA timing remains unverified in this environment.
