@@ -40,7 +40,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 
 __all__ = [
@@ -2424,7 +2424,10 @@ class CRLFocusConfig:
 
     Focusing dimension and numerical-grid dimension are independent. A one-
     dimensionally focusing lens on a 2D grid requires its unfocused transverse
-    structure depth. Gaussian source points are mutually incoherent.
+    structure depth. Gaussian source points are mutually incoherent. With
+    source_type='plane', a uniform unit-amplitude, constant-phase field enters
+    the pupil; source_distance_m is normalized to None and magnification is
+    undefined. The analytical image distance then equals collimated BFL.
     peak_search_tolerance_m controls the axial peak-intensity optimizer;
     focus_tolerance_m is retained as a legacy keyword alias.
     """
@@ -2435,7 +2438,7 @@ class CRLFocusConfig:
     aperture_m: float = 100e-6
     bridge_thickness_m: float = 30e-6
     n_elements: int = 10
-    source_distance_m: float = 15.0
+    source_distance_m: float | None = 15.0
     geometry: str = "one-dimensional"
     grid_dimension: int | None = None
     structure_depth_m: float | None = 50e-6
@@ -2468,7 +2471,14 @@ class CRLFocusConfig:
         if dimension not in (1, 2) or (self.geometry == "two-dimensional" and dimension != 2):
             raise ValueError("Two-dimensional focusing requires a 2D grid.")
         object.__setattr__(self, "grid_dimension", int(dimension))
-        for name in ("energy_kev", "density_g_cm3", "radius_m", "aperture_m", "bridge_thickness_m", "source_distance_m", "window_factor"):
+        if self.source_type not in {"point", "gaussian", "plane"}:
+            raise ValueError("source_type must be point, gaussian or plane.")
+        if self.source_type == "plane":
+            object.__setattr__(self,"source_distance_m",None)
+        else:
+            _validate_positive("source_distance_m",self.source_distance_m)
+            object.__setattr__(self,"source_distance_m",float(self.source_distance_m))
+        for name in ("energy_kev", "density_g_cm3", "radius_m", "aperture_m", "bridge_thickness_m", "window_factor"):
             _validate_positive(name, getattr(self, name))
             object.__setattr__(self, name, float(getattr(self, name)))
         if self.window_factor <= 1:
@@ -2485,8 +2495,6 @@ class CRLFocusConfig:
             if value is not None:
                 _validate_count(name,value,1 if name=="batch_size" else 32)
                 object.__setattr__(self,name,int(value))
-        if self.source_type not in {"point", "gaussian"}:
-            raise ValueError("source_type must be point or gaussian.")
         if self.source_method not in {"convolution", "points"}:
             raise ValueError("source_method must be convolution or points.")
         for name in ("source_fwhm_x_m", "source_fwhm_y_m"):
@@ -2521,7 +2529,7 @@ class CRLPlaneResult:
     x_m: np.ndarray
     y_m: np.ndarray | None
     metrics: BeamMetrics
-    magnification: tuple[float, ...]
+    magnification: tuple[float | None, ...]
 
 
 class _CRLFocusSession:
@@ -2580,9 +2588,9 @@ class _CRLFocusSession:
         wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
         factor=.886 if cfg.geometry=="one-dimensional" else 1.028
         coherent_width=factor*wavelength*analytic/cfg.aperture_m
-        projected=np.abs(self.magnification(analytic))*np.array(self.source_sigma[:self.grid.dimension])*2*np.sqrt(2*np.log(2))
-        if cfg.source_type=="point":
-            projected*=0
+        projected=np.zeros(self.grid.dimension)
+        if cfg.source_type=="gaussian":
+            projected=np.abs(self.magnification(analytic))*np.array(self.source_sigma[:self.grid.dimension])*2*np.sqrt(2*np.log(2))
         widths=[24*max(coherent_width,projected[0])]
         targets=[coherent_width/24]
         if self.grid.dimension==2:
@@ -2639,6 +2647,8 @@ class _CRLFocusSession:
             self._source_transmission_ready=True
 
     def magnification(self,z):
+        if self.cfg.source_type=="plane":
+            return (None,)*self.grid.dimension
         values=[self.crl.source_magnification(z,self.cfg.source_distance_m)]
         if self.grid.dimension==2:
             values.append(self.crl.source_magnification(z,self.cfg.source_distance_m,
@@ -2849,12 +2859,14 @@ def _build_focus_session(cfg,backend,parameters,analytic):
     wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
     factor=.886 if cfg.geometry=="one-dimensional" else 1.028
     target_x=factor*wavelength*analytic/cfg.aperture_m/6
-    target_x=min(target_x,wavelength*cfg.source_distance_m/(2*cfg.aperture_m))
+    if cfg.source_type!="plane":
+        target_x=min(target_x,wavelength*cfg.source_distance_m/(2*cfg.aperture_m))
     quick_cap=65536 if cfg.grid_dimension==1 else (2048 if backend=="cupy" else 1024)
     cap=65536 if cfg.grid_dimension==1 else (4096 if cfg.accuracy=="refined" else quick_cap)
     k=2*np.pi/wavelength
     delta=parameters['material'].optical_constants(cfg.energy_kev)[0]
-    phase_slope=k*delta*cfg.n_elements*cfg.aperture_m/cfg.radius_m+k*cfg.aperture_m/(2*cfg.source_distance_m)
+    source_curvature=0.0 if cfg.source_type=="plane" else 1/cfg.source_distance_m
+    phase_slope=k*delta*cfg.n_elements*cfg.aperture_m/cfg.radius_m+k*cfg.aperture_m*source_curvature/2
     phase_target=(np.pi/3)/phase_slope
     width_x=cfg.window_factor*cfg.aperture_m
     depth=cfg.aperture_m if cfg.geometry=="two-dimensional" else cfg.structure_depth_m
@@ -2875,7 +2887,9 @@ def _build_focus_session(cfg,backend,parameters,analytic):
             if cfg.geometry=="two-dimensional":
                 target_y=target_x
             else:
-                target_y=min(depth/128,wavelength*analytic/(6*depth),wavelength*cfg.source_distance_m/(2*depth))
+                target_y=min(depth/128,wavelength*analytic/(6*depth))
+                if cfg.source_type!="plane":
+                    target_y=min(target_y,wavelength*cfg.source_distance_m/(2*depth))
             required_y=_fast_grid_size(max(128,width_y/target_y))
             if cfg.accuracy=="refined":
                 required_y=_fast_grid_size(1.25*min(required_y,quick_cap))
@@ -2887,7 +2901,8 @@ def _build_focus_session(cfg,backend,parameters,analytic):
             grid=Grid2D(width_x/nx,width_y/ny,nx,ny,backend=backend)
         xp=grid.xp
         position=0.0 if grid.dimension==1 else (0.0,0.0)
-        incident=PointSource(grid=grid,position=position,energy_kev=cfg.energy_kev).E(cfg.source_distance_m)
+        incident=(xp.ones(grid.shape,dtype=xp.complex128) if cfg.source_type=="plane" else
+                  PointSource(grid=grid,position=position,energy_kev=cfg.energy_kev).E(cfg.source_distance_m))
         lens_parameters=dict(parameters)
         if grid.dimension==1:
             pupil=abs(grid.x)<=cfg.aperture_m/2
@@ -2947,7 +2962,8 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
     reference=CRL(grid=Grid1D(cfg.aperture_m,2,backend="numpy"),**parameters)
     if not reference.is_focus_outside_crl():
         raise ValueError("The element count puts the formal focus inside the CRL.")
-    analytic=reference.effective_focus(cfg.source_distance_m)
+    analytic=(reference.theoretical_focus() if cfg.source_type=="plane" else
+              reference.effective_focus(cfg.source_distance_m))
     if not np.isfinite(analytic) or analytic<=0:
         raise ValueError("This source/lens configuration has no finite real image after the CRL.")
     grid,crl,session,messages=_build_focus_session(cfg,backend,parameters,analytic)
@@ -3001,7 +3017,8 @@ def estimate_crl_focus(configuration: CRLFocusConfig) -> CRLFocusResult:
     elif np.any(best_widths/steps<6):
         messages.append("sampling: Fewer than six points across a transverse FWHM; refine the grid.")
     slope=crl.k*crl.delta*cfg.n_elements*cfg.aperture_m/cfg.radius_m*grid.dx
-    slope+=crl.k*cfg.aperture_m/(2*cfg.source_distance_m)*grid.dx
+    if cfg.source_type!="plane":
+        slope+=crl.k*cfg.aperture_m/(2*cfg.source_distance_m)*grid.dx
     if slope>np.pi/2:
         messages.append("phase_sampling: Phase changes too rapidly between x samples; refine the grid.")
     image=session.intensity(numerical.z_m)
