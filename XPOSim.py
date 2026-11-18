@@ -41,7 +41,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 
 
 __all__ = [
@@ -1942,12 +1942,15 @@ class CRL(OpticalElement):
 
         Uses the full propagation grid and the current coherent incident field,
         including absorption and propagation through every element. On a 2D
-        grid, returns (x, y) slice widths through the intensity maximum. Missing
-        half-maximum crossings give None, just as in beam_metrics.
+        grid, returns (x, y) slice widths through the intensity maximum. The y
+        width is None for a finite-depth, one-axis CRL; it is not measured.
+        Missing half-maximum crossings give None, just as in beam_metrics.
         CRLFocusResult.effective_aperture_m additionally handles incoherent
         Gaussian sources, using their weighted exit intensity.
         """
-        return beam_metrics(self.E(), self.grid).fwhm
+        return _beam_metrics_batch(self.E()[None,...],self.grid,
+            (slice(None),)*self.grid.dimension,
+            measure_y_fwhm=self.transverse_length is None)[0].fwhm
 
     def focus_scan(
         self,
@@ -1968,6 +1971,8 @@ class CRL(OpticalElement):
         views holding full-grid fields alive. Output storage is still O(nz).
         The reported peak plane maximizes sampled transverse peak intensity;
         it need not coincide with minimum width or a geometrical image plane.
+        For a finite-depth, one-axis CRL, y FWHM is deliberately unmeasured
+        (None in each metric); its full diffraction field is still propagated.
         """
         z_array = _validated_distances(z_values, nonnegative=True)
         if batch_size is not None:
@@ -1990,7 +1995,8 @@ class CRL(OpticalElement):
                    if return_fields else None)
         metrics: list[BeamMetrics] = []
         for planes, fields in self.grid._iter_spectrum(E0, spectrum, z_array, self.k, batch_size):
-            metrics.extend(_beam_metrics_batch(fields, self.grid, slices, div))
+            metrics.extend(_beam_metrics_batch(fields, self.grid, slices, div,
+                measure_y_fwhm=self.transverse_length is None))
             if return_fields:
                 E_array[planes] = fields[(slice(None), *slices)]
             del fields
@@ -2158,16 +2164,17 @@ def _crop_field(field: Any, grid: BaseGrid, roi: Any) -> Any:
 
 
 def _beam_metrics_batch(fields: Any, grid: BaseGrid, slices: tuple[slice, ...],
-                        divergence_value: Any = None) -> list[BeamMetrics]:
+                        divergence_value: Any = None, *, measure_y_fwhm: bool = True) -> list[BeamMetrics]:
     """Reduce intensities and peak-crossing slices without host image copies."""
     xp = grid.xp
     work = fields[(slice(None), *slices)]
     values = abs(work)**2
-    return _intensity_metrics_batch(values, grid, slices, divergence_value)
+    return _intensity_metrics_batch(values, grid, slices, divergence_value,
+        measure_y_fwhm=measure_y_fwhm)
 
 
 def _intensity_metrics_batch(values: Any, grid: BaseGrid, slices: tuple[slice, ...],
-                             divergence_value: Any = None) -> list[BeamMetrics]:
+                             divergence_value: Any = None, *, measure_y_fwhm: bool = True) -> list[BeamMetrics]:
     """Measure already-incoherent intensities without creating artificial fields."""
     xp = grid.xp
     batch = values.shape[0]
@@ -2184,7 +2191,8 @@ def _intensity_metrics_batch(values: Any, grid: BaseGrid, slices: tuple[slice, .
                 if ok else BeamMetrics(np.nan, None, None, None) for m, c, w, ok in table]
     j, i = peaks // values.shape[-1], peaks % values.shape[-1]
     width_x = _widths_batch(values[rows, j, :], x_axis)
-    width_y = _widths_batch(values[rows, :, i], y_axis)
+    width_y = (_widths_batch(values[rows, :, i], y_axis) if measure_y_fwhm else
+               xp.full(batch,xp.nan))
     table = _to_numpy(xp.stack((maxima, x_axis[i], y_axis[j], width_x, width_y, finite), axis=1))
     return [BeamMetrics(float(m), (float(cx), float(cy)),
                         (_optional_float(wx), _optional_float(wy)), divergence_value)
@@ -2501,7 +2509,8 @@ class CRLFocusConfig:
     Actual spacings are quantized to scale-adaptive multiples of five. The
     automatic axial spacing or scan_step_m uses 1/2.5/5 times a power of ten;
     scan_points is a target count. The z ROI expands outward to that uniform
-    lattice, while peak optimization remains independent of its samples.
+    lattice anchored at the full-precision numerical peak distance. Peak
+    optimization remains independent of the display spacing.
     """
     energy_kev: float = 12.0
     material_formula: str | None = "Be"
@@ -2746,7 +2755,8 @@ class _CRLFocusSession:
         if not self._point_model:
             exit_intensity=self._blur(abs(self.exit_field)**2,0.0,grid=self.grid)
             self._exit_metrics=_intensity_metrics_batch(exit_intensity[None,...],self.grid,
-                (slice(None),)*self.grid.dimension)[0]
+                (slice(None),)*self.grid.dimension,
+                measure_y_fwhm=self.cfg.geometry=="two-dimensional")[0]
 
     def configure_refined_detector(self,analytic):
         """Resolve the detector peak without globally oversampling the lens plane."""
@@ -2834,7 +2844,8 @@ class _CRLFocusSession:
             self._source_transmission_ready=True
         if exit_intensity is not None:
             self._exit_metrics=_intensity_metrics_batch(exit_intensity[None,...],self.grid,
-                (slice(None),)*self.grid.dimension)[0]
+                (slice(None),)*self.grid.dimension,
+                measure_y_fwhm=self.cfg.geometry=="two-dimensional")[0]
 
     def magnification(self,z):
         if self.cfg.source_type=="plane":
@@ -2920,7 +2931,8 @@ class _CRLFocusSession:
 
     def metrics(self,image):
         return _intensity_metrics_batch(image[None,...],self.detector_grid,
-                       (slice(None),)*self.grid.dimension)[0]
+                       (slice(None),)*self.grid.dimension,
+                       measure_y_fwhm=self.cfg.geometry=="two-dimensional")[0]
 
     def plane(self,z):
         image=self.intensity(z)
@@ -2943,8 +2955,8 @@ class CRLFocusResult:
     The finite-source
     analytical_image_distance_m and collimated_focus_m are separate ray-optical
     distances; none is implicitly identified with minimum wave-optical FWHM.
-    z_m is a uniform display grid. peak_index indexes its nearest plane to the
-    numerical reference, which need not itself be on this grid. best_intensity,
+    z_m is a uniform display grid anchored at the numerical peak distance.
+    peak_index indexes that exact reference plane. best_intensity,
     reference_metrics and fwhm_at_peak_m refer to the exact numerical distance.
     """
     configuration: CRLFocusConfig
@@ -2988,6 +3000,11 @@ class CRLFocusResult:
         return float(self.z_m[int(np.argmax(self.peak_intensity))])
 
     @property
+    def fwhm_axes(self):
+        """Axes on which focal/exit intensity FWHM is physically reported."""
+        return ("x","y") if self.configuration.geometry=="two-dimensional" else ("x",)
+
+    @property
     def analytical_focus_m(self):
         """Legacy alias for the finite-source analytical image distance."""
         return self.analytical_image_distance_m
@@ -3021,6 +3038,7 @@ class CRLFocusResult:
         """Full-source exit-intensity FWHM on the native propagation grid.
 
         A scalar for a 1D grid, or (x, y) peak-crossing slice widths for 2D.
+        The unfocused y width is None for one-axis focusing on a 2D grid.
         Gaussian point modes are summed incoherently at the exit, before any
         detector zoom/crop. The convolution model applies its native-grid blur
         at z=0. No extra source propagations or detector scans are required.
@@ -3051,6 +3069,8 @@ class CRLFocusResult:
                 "peak_search_initial_z_m":self.numerical_peak.history[0][0],
                 "sampled_peak_z_m":self.sampled_peak_z_m,
                 "scan_step_m":self.scan_step_m,"scan_grid_uniform":True,
+                "scan_anchor_m":self.peak_z_m,
+                "fwhm_axes":list(self.fwhm_axes),
                 "reference_scan_index":self.peak_index,
                 "intensity_reference":self.intensity_reference,
                 "magnification_at_peak":self.magnification_at_peak,
@@ -3144,24 +3164,39 @@ def _focus_axis_sampling(width,required,count,requested_step,cap,minimum):
     return int(n),float(step)
 
 
-def _uniform_scan_positions(bounds,target_count,requested_step,accuracy):
-    """Snap ROI outward to one uniform, readable lattice, without peak insertion."""
+def _uniform_scan_positions(bounds,target_count,requested_step,accuracy,anchor_m):
+    """Expand the ROI on z=anchor+k*step, retaining the exact optimizer result.
+
+    Only the spacing is rounded. Absolute coordinates inherit the full
+    precision of anchor_m; the numerical reference is a regular lattice point,
+    not an extra sample inserted into a zero-anchored grid.
+    """
+    _validate_finite("scan anchor",anchor_m)
+    if anchor_m<0:raise ValueError("The scan anchor must be non-negative.")
     target=(bounds[1]-bounds[0])/(target_count-1)
     step=_nice_scan_step(requested_step) if requested_step is not None else _nice_scan_step(
         target,"down" if accuracy=="refined" else "up")
-    start=max(0,int(np.floor(bounds[0]/step+1e-10)))
-    stop=int(np.ceil(bounds[1]/step-1e-10))
+    def indices(spacing):
+        start=max(int(np.ceil(-anchor_m/spacing)),
+                  int(np.floor((bounds[0]-anchor_m)/spacing+1e-10)))
+        stop=int(np.ceil((bounds[1]-anchor_m)/spacing-1e-10))
+        return start,stop
+    start,stop=indices(step)
     if requested_step is None:
         while stop-start+1<5:
             step=_nice_scan_step(step*.9,"down")
-            start=max(0,int(np.floor(bounds[0]/step+1e-10)))
-            stop=int(np.ceil(bounds[1]/step-1e-10))
+            start,stop=indices(step)
     count=stop-start+1
     if count<2:
         raise ValueError("The axial grid must contain at least two planes.")
     if count>10001:
         raise ValueError(f"The requested z spacing needs {count} planes; increase it to use at most 10001.")
-    return (start+np.arange(count,dtype=float))*step
+    positions=anchor_m+(start+np.arange(count,dtype=float))*step
+    # Cancelled floating-point roundoff at z=0 must not reach the propagator
+    # as a tiny negative distance. This does not round the lattice origin.
+    if positions[0]<0 and abs(positions[0])<=8*np.spacing(max(anchor_m,step)):
+        positions[0]=0.0
+    return positions
 
 
 def _edge_power_fractions(image,xp):
@@ -3357,7 +3392,7 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     coherent=None
     detector=session.detector_grid
     messages.extend(session.diagnostics)
-    positions=_uniform_scan_positions(bounds,cfg.scan_points,cfg.scan_step_m,cfg.accuracy)
+    positions=_uniform_scan_positions(bounds,cfg.scan_points,cfg.scan_step_m,cfg.accuracy,numerical.z_m)
     metrics=[]
     lines=[]
     transverse_x=xp.zeros(detector.nx,dtype=xp.float64)
@@ -3385,8 +3420,9 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     best=session.plane(numerical.z_m)
     best_index=int(np.argmin(abs(positions-numerical.z_m)))
     widths=np.asarray([np.nan if m.fwhm is None else m.fwhm for m in metrics],dtype=float)
-    best_widths=np.asarray([np.nan if v is None else v for v in np.atleast_1d(best.metrics.fwhm)],dtype=float)
-    steps=np.array([detector.dx] if grid.dimension==1 else [detector.dx,detector.dy])
+    active_count=len(("x","y") if cfg.geometry=="two-dimensional" else ("x",))
+    best_widths=np.asarray([np.nan if v is None else v for v in np.atleast_1d(best.metrics.fwhm)[:active_count]],dtype=float)
+    steps=np.array([detector.dx] if active_count==1 else [detector.dx,detector.dy])
     if np.any(~np.isfinite(best_widths)):
         messages.append("fwhm_missing: Half-maximum crossings are outside the calculation window.")
     elif np.any(best_widths/steps<6):
