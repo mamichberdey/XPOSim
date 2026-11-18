@@ -41,7 +41,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 
 __all__ = [
@@ -1937,6 +1937,18 @@ class CRL(OpticalElement):
         _validate_count("n_elements", count)
         return count <= self.max_element_count()
 
+    def effective_aperture(self) -> float | tuple[float | None, float | None] | None:
+        """Numerical intensity FWHM at the CRL exit, in metres.
+
+        Uses the full propagation grid and the current coherent incident field,
+        including absorption and propagation through every element. On a 2D
+        grid, returns (x, y) slice widths through the intensity maximum. Missing
+        half-maximum crossings give None, just as in beam_metrics.
+        CRLFocusResult.effective_aperture_m additionally handles incoherent
+        Gaussian sources, using their weighted exit intensity.
+        """
+        return beam_metrics(self.E(), self.grid).fwhm
+
     def focus_scan(
         self,
         z_values: Sequence[float],
@@ -2675,6 +2687,7 @@ class _CRLFocusSession:
         self.slices=(slice(None),)*grid.dimension
         self.detector_grid=grid
         self._zoom_plan=None
+        self._exit_metrics=None
         self.diagnostics=[]
         self._modes=None
         sigma_factor=1/(2*np.sqrt(2*np.log(2)))
@@ -2711,6 +2724,10 @@ class _CRLFocusSession:
                 self.diagnostics.append("source_streaming: Source spectra exceed the RAM/VRAM cache budget; modes are recomputed in bounded batches.")
         elif cfg.source_type=="gaussian":
             self.diagnostics.append("convolution_model: Gaussian intensity convolution assumes a shift-invariant pupil response; use point sampling to include source-dependent clipping and absorption.")
+        if not self._point_model:
+            exit_intensity=self._blur(abs(self.exit_field)**2,0.0,grid=self.grid)
+            self._exit_metrics=_intensity_metrics_batch(exit_intensity[None,...],self.grid,
+                (slice(None),)*self.grid.dimension)[0]
 
     def configure_refined_detector(self,analytic):
         """Resolve the detector peak without globally oversampling the lens plane."""
@@ -2757,6 +2774,8 @@ class _CRLFocusSession:
         total_power=0.0
         xp=self.xp
         extra=(None,)*self.grid.dimension
+        exit_intensity=(xp.zeros(self.grid.shape,dtype=xp.float64)
+                        if self._exit_metrics is None else None)
         for start in range(0,len(self.weights),self.mode_batch):
             stop=min(start+self.mode_batch,len(self.weights))
             points=xp.asarray(self.positions[start:stop])
@@ -2767,8 +2786,12 @@ class _CRLFocusSession:
             fields=self.crl.apply_to_fields(fields)
             weights=xp.asarray(self.weights[start:stop])
             if not self._source_transmission_ready:
+                values=abs(fields)**2
                 axes=tuple(range(1,fields.ndim))
-                total_power+=_to_python_float(xp.sum(weights*xp.sum(abs(fields)**2,axis=axes)))
+                total_power+=_to_python_float(xp.sum(weights*xp.sum(values,axis=axes)))
+                if exit_intensity is not None:
+                    exit_intensity+=xp.sum(values*weights[(slice(None),*extra)],axis=0)
+                del values
             spectrum=self.grid._transform_batch(fields)
             del fields,phase
             yield spectrum,weights
@@ -2777,6 +2800,9 @@ class _CRLFocusSession:
         if not self._source_transmission_ready:
             self.transmission=total_power/self.input_power
             self._source_transmission_ready=True
+        if exit_intensity is not None:
+            self._exit_metrics=_intensity_metrics_batch(exit_intensity[None,...],self.grid,
+                (slice(None),)*self.grid.dimension)[0]
 
     def magnification(self,z):
         if self.cfg.source_type=="plane":
@@ -2810,17 +2836,18 @@ class _CRLFocusSession:
         self._last_z,self._last_image=z,image
         return image
 
-    def _blur(self,image,z):
+    def _blur(self,image,z,*,grid=None):
         if self.cfg.source_type!="gaussian":
             return image
         if self.grid.backend=="cupy":
             from cupyx.scipy.ndimage import gaussian_filter
         else:
             from scipy.ndimage import gaussian_filter
+        grid=self.detector_grid if grid is None else grid
         magnification=self.magnification(z)
-        sigma_x=abs(magnification[0])*self.source_sigma[0]/self.detector_grid.dx
+        sigma_x=abs(magnification[0])*self.source_sigma[0]/grid.dx
         sigmas=sigma_x if self.grid.dimension==1 else (
-            abs(magnification[1])*self.source_sigma[1]/self.detector_grid.dy,sigma_x)
+            abs(magnification[1])*self.source_sigma[1]/grid.dy,sigma_x)
         return gaussian_filter(image,sigmas,mode="constant",cval=0.0,truncate=5.0)
 
     def iter_intensities(self,z_values,progress=None):
@@ -2942,6 +2969,18 @@ class CRLFocusResult:
         return widths[0] if self.configuration.grid_dimension==1 else widths
 
     @property
+    def effective_aperture_m(self):
+        """Full-source exit-intensity FWHM on the native propagation grid.
+
+        A scalar for a 1D grid, or (x, y) peak-crossing slice widths for 2D.
+        Gaussian point modes are summed incoherently at the exit, before any
+        detector zoom/crop. The convolution model applies its native-grid blur
+        at z=0. No extra source propagations or detector scans are required.
+        This numerical definition is not an absorption-only aperture estimate.
+        """
+        return self._session._exit_metrics.fwhm
+
+    @property
     def magnification_at_peak(self):
         return self._session.magnification(self.peak_z_m)
 
@@ -2965,6 +3004,8 @@ class CRLFocusResult:
                 "sampled_peak_z_m":self.sampled_peak_z_m,
                 "magnification_at_peak":self.magnification_at_peak,
                 "transmission":self.transmission,"grid_shape":self.grid_shape,
+                "effective_aperture_m":self.effective_aperture_m,
+                "effective_aperture_convention":"exit_intensity_FWHM",
                 "grid_step_m":self.grid_step_m,"grid_step_y_m":self.grid_step_y_m,
                 "detector_shape":self.detector_shape,"detector_step_m":self.detector_step_m,
                 "detector_step_y_m":self.detector_step_y_m,
