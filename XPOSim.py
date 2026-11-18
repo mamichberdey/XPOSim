@@ -41,7 +41,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 
 __all__ = [
@@ -72,6 +72,8 @@ __all__ = [
     "gaussian_filter_2d",
     "select_backend",
     "CRLFocusConfig",
+    "CRLAnalyticalResult",
+    "analyze_crl",
     "CRLFocusResult",
     "estimate_crl_focus",
     "CRLProgressUpdate",
@@ -2480,11 +2482,13 @@ class CRLFocusConfig:
     the pupil; source_distance_m is normalized to None and magnification is
     undefined. The analytical image distance then equals collimated BFL.
     peak_search_tolerance_m controls the axial peak-intensity optimizer;
-    focus_tolerance_m is retained as a legacy keyword alias.
+    focus_tolerance_m is retained as a legacy keyword alias. material_delta and
+    material_beta together select fixed direct optical constants instead of a
+    formula/density; their formula and density metadata are normalized to None.
     """
     energy_kev: float = 12.0
-    material_formula: str = "Be"
-    density_g_cm3: float = 1.848
+    material_formula: str | None = "Be"
+    density_g_cm3: float | None = 1.848
     radius_m: float = 50e-6
     aperture_m: float = 100e-6
     bridge_thickness_m: float = 30e-6
@@ -2511,6 +2515,8 @@ class CRLFocusConfig:
     transverse_roi_level: float = 0.01
     focus_tolerance_m: float | None = None
     peak_search_tolerance_m: float | None = None
+    material_delta: float | None = None
+    material_beta: float | None = None
 
     def __post_init__(self):
         aliases = {"cylindrical": "one-dimensional", "axisymmetric": "two-dimensional"}
@@ -2529,7 +2535,21 @@ class CRLFocusConfig:
         else:
             _validate_positive("source_distance_m",self.source_distance_m)
             object.__setattr__(self,"source_distance_m",float(self.source_distance_m))
-        for name in ("energy_kev", "density_g_cm3", "radius_m", "aperture_m", "bridge_thickness_m", "window_factor"):
+        if (self.material_delta is None)!=(self.material_beta is None):
+            raise ValueError("material_delta and material_beta must be supplied together.")
+        if self.material_delta is not None:
+            _validate_positive("material_delta",self.material_delta)
+            _validate_finite("material_beta",self.material_beta)
+            if self.material_beta<0:
+                raise ValueError("material_beta must be non-negative.")
+            object.__setattr__(self,"material_delta",float(self.material_delta))
+            object.__setattr__(self,"material_beta",float(self.material_beta))
+            object.__setattr__(self,"material_formula",None)
+            object.__setattr__(self,"density_g_cm3",None)
+        else:
+            _validate_positive("density_g_cm3",self.density_g_cm3)
+            object.__setattr__(self,"density_g_cm3",float(self.density_g_cm3))
+        for name in ("energy_kev", "radius_m", "aperture_m", "bridge_thickness_m", "window_factor"):
             _validate_positive(name, getattr(self, name))
             object.__setattr__(self, name, float(getattr(self, name)))
         if self.window_factor <= 1:
@@ -2570,7 +2590,63 @@ class CRLFocusConfig:
             bounds=_validated_distances(self.scan_range_m,nonnegative=True)
             if bounds.size!=2 or bounds[1]<=bounds[0]: raise ValueError("Invalid z ROI.")
             object.__setattr__(self,"scan_range_m",tuple(map(float,bounds)))
-        Material(self.material_formula,self.density_g_cm3).composition()
+        if self.material_delta is None:
+            self.create_material().composition()
+
+    def create_material(self) -> Material:
+        """Build the selected material; explicit coefficients bypass tables.
+
+        Direct delta/beta are fixed values used at energy_kev. They are not
+        rescaled automatically when photon energy changes.
+        """
+        if self.material_delta is not None:
+            return Material(delta=self.material_delta,beta=self.material_beta)
+        return Material(self.material_formula,self.density_g_cm3)
+
+
+@dataclass(frozen=True)
+class CRLAnalyticalResult:
+    """Preflight optics/geometry, calculated without propagation or GPU use."""
+    delta: float
+    beta: float
+    collimated_focus_m: float | None
+    image_distance_m: float | None
+    max_element_count: int
+    lens_length_m: float
+    external_focus: bool
+    real_image: bool
+
+
+def analyze_crl(configuration: CRLFocusConfig) -> CRLAnalyticalResult:
+    """Return cheap analytical material/lens parameters for any material mode.
+
+    Focal and image distances use the CRL exit reference. Counts and geometry
+    delegate to CRL.max_element_count and its existing analytical methods.
+    For N above the external-focus limit, distances are None while material
+    constants, maximum N and total length remain available. A finite source
+    can produce a negative (virtual) or infinite image distance.
+    """
+    if not isinstance(configuration,CRLFocusConfig):
+        raise TypeError("Pass a CRLFocusConfig instance.")
+    cfg=configuration
+    delta,beta=cfg.create_material().optical_constants(cfg.energy_kev)
+    # One reference element avoids warnings from a temporarily excessive N
+    # while editing the form. Even N=1 can be invalid for extreme constants;
+    # report that case via external_focus/max_element_count instead of stdout.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore",RuntimeWarning)
+        reference=CRL(grid=Grid1D(cfg.aperture_m,2,backend="numpy"),
+            radius=cfg.radius_m,aperture=cfg.aperture_m,
+            bridge_thickness=cfg.bridge_thickness_m,n_elements=1,
+            material=Material(delta=delta,beta=beta),energy_kev=cfg.energy_kev)
+    maximum=reference.max_element_count()
+    external=cfg.n_elements<=maximum
+    focal=reference.theoretical_focus(n_elements=cfg.n_elements) if external else None
+    image=(focal if cfg.source_type=="plane" else
+           reference.effective_focus(cfg.source_distance_m,n_elements=cfg.n_elements)) if external else None
+    real=image is not None and np.isfinite(image) and image>0
+    return CRLAnalyticalResult(float(delta),float(beta),focal,image,maximum,
+        float(reference.element_period*cfg.n_elements),bool(external),bool(real))
 
 
 @dataclass
@@ -3055,7 +3131,7 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     reporter.start("preparing",detail="Selecting backend and material properties")
     cfg=configuration
     backend=select_backend(cfg.backend)
-    material=Material(cfg.material_formula,cfg.density_g_cm3)
+    material=cfg.create_material()
     parameters=dict(radius=cfg.radius_m,aperture=cfg.aperture_m,
         bridge_thickness=cfg.bridge_thickness_m,n_elements=cfg.n_elements,
         material=material,energy_kev=cfg.energy_kev)
