@@ -41,7 +41,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 
 
 __all__ = [
@@ -2646,7 +2646,13 @@ class CRLFocusConfig:
 
 @dataclass(frozen=True)
 class CRLAnalyticalResult:
-    """Preflight optics/geometry, calculated without propagation or GPU use."""
+    """Preflight optics/geometry, calculated without propagation or GPU use.
+
+    magnification_at_image uses the signed discrete-stack source displacement
+    scale at image_distance_m, with one entry per calculation axis. For an
+    unfocused y axis this is a source displacement scale, not conjugate image
+    magnification. Plane-wave, absent and infinite image planes return None.
+    """
     delta: float
     beta: float
     collimated_focus_m: float | None
@@ -2655,6 +2661,7 @@ class CRLAnalyticalResult:
     lens_length_m: float
     external_focus: bool
     real_image: bool
+    magnification_at_image: tuple[float | None, ...] = ()
 
 
 def analyze_crl(configuration: CRLFocusConfig) -> CRLAnalyticalResult:
@@ -2685,8 +2692,16 @@ def analyze_crl(configuration: CRLFocusConfig) -> CRLAnalyticalResult:
     image=(focal if cfg.source_type=="plane" else
            reference.effective_focus(cfg.source_distance_m,n_elements=cfg.n_elements)) if external else None
     real=image is not None and np.isfinite(image) and image>0
+    magnification=(None,)*cfg.grid_dimension
+    if cfg.source_type!="plane" and image is not None and np.isfinite(image):
+        lens=reference.with_parameters(n_elements=cfg.n_elements)
+        values=[lens.source_magnification(image,cfg.source_distance_m)]
+        if cfg.grid_dimension==2:
+            values.append(lens.source_magnification(image,cfg.source_distance_m,
+                focusing=cfg.geometry=="two-dimensional"))
+        magnification=tuple(values)
     return CRLAnalyticalResult(float(delta),float(beta),focal,image,maximum,
-        float(reference.element_period*cfg.n_elements),bool(external),bool(real))
+        float(reference.element_period*cfg.n_elements),bool(external),bool(real),magnification)
 
 
 @dataclass
