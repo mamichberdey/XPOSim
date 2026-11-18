@@ -41,7 +41,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 
 __all__ = [
@@ -2497,6 +2497,11 @@ class CRLFocusConfig:
     focus_tolerance_m is retained as a legacy keyword alias. material_delta and
     material_beta together select fixed direct optical constants instead of a
     formula/density; their formula and density metadata are normalized to None.
+    grid_step_x_m/grid_step_y_m request transverse spacing instead of counts.
+    Actual spacings are quantized to scale-adaptive multiples of five. The
+    automatic axial spacing or scan_step_m uses 1/2.5/5 times a power of ten;
+    scan_points is a target count. The z ROI expands outward to that uniform
+    lattice, while peak optimization remains independent of its samples.
     """
     energy_kev: float = 12.0
     material_formula: str | None = "Be"
@@ -2529,6 +2534,9 @@ class CRLFocusConfig:
     peak_search_tolerance_m: float | None = None
     material_delta: float | None = None
     material_beta: float | None = None
+    grid_step_x_m: float | None = None
+    grid_step_y_m: float | None = None
+    scan_step_m: float | None = None
 
     def __post_init__(self):
         aliases = {"cylindrical": "one-dimensional", "axisymmetric": "two-dimensional"}
@@ -2578,6 +2586,17 @@ class CRLFocusConfig:
             if value is not None:
                 _validate_count(name,value,1 if name=="batch_size" else 32)
                 object.__setattr__(self,name,int(value))
+        for name in ("grid_step_x_m","grid_step_y_m","scan_step_m"):
+            value=getattr(self,name)
+            if value is not None:
+                _validate_positive(name,value)
+                object.__setattr__(self,name,float(value))
+        if self.grid_points is not None and self.grid_step_x_m is not None:
+            raise ValueError("Choose either grid_points or grid_step_x_m, not both.")
+        if self.grid_points_y is not None and self.grid_step_y_m is not None:
+            raise ValueError("Choose either grid_points_y or grid_step_y_m, not both.")
+        if dimension==1 and self.grid_step_y_m is not None:
+            raise ValueError("grid_step_y_m requires a 2D grid.")
         if self.source_method not in {"convolution", "points"}:
             raise ValueError("source_method must be convolution or points.")
         for name in ("source_fwhm_x_m", "source_fwhm_y_m"):
@@ -2755,15 +2774,28 @@ class _CRLFocusSession:
                 widths[axis]=available*.98
                 self.diagnostics.append("detector_window: Refined detector ROI is limited by the propagation window; enlarge the propagation window at fixed step.")
         counts=[]
-        for width,target in zip(widths,targets):
+        spacings=[]
+        for width,target,available in zip(widths,targets,propagation_widths):
             desired=max(257,int(np.ceil(width/target)))
             if desired%2==0: desired+=1
-            count=min(2049,desired)
+            step=_nice_grid_step(width/desired,"down")
+            count=max(257,int(np.ceil(width/step-1e-10)))
+            if count%2==0:count+=1
+            if count>2049:
+                step=_nice_grid_step(width/2049,"up")
+                count=int(np.ceil(width/step-1e-10))
+                if count%2==0:count+=1
+            limit=min(2049,int(np.floor(.98*available/step)))
+            if limit%2==0:limit-=1
+            count=min(count,limit)
+            if count<3:
+                raise ValueError("The detector spacing does not fit the propagation window.")
             if count<desired:
                 self.diagnostics.append("detector_cap: Refined detector sampling reached its cap; reduce source extent or compare a smaller detector ROI.")
             counts.append(count)
-        detector=(Grid1D(widths[0]/counts[0],counts[0],backend=self.grid.backend)
-                  if self.grid.dimension==1 else Grid2D(widths[0]/counts[0],widths[1]/counts[1],counts[0],counts[1],backend=self.grid.backend))
+            spacings.append(step)
+        detector=(Grid1D(spacings[0],counts[0],backend=self.grid.backend)
+                  if self.grid.dimension==1 else Grid2D(spacings[0],spacings[1],counts[0],counts[1],backend=self.grid.backend))
         self.detector_grid=detector
         self._zoom_plan=_DetectorFourierPlan(self.grid,detector)
         self._last_z,self._last_image=None,None
@@ -2911,6 +2943,9 @@ class CRLFocusResult:
     The finite-source
     analytical_image_distance_m and collimated_focus_m are separate ray-optical
     distances; none is implicitly identified with minimum wave-optical FWHM.
+    z_m is a uniform display grid. peak_index indexes its nearest plane to the
+    numerical reference, which need not itself be on this grid. best_intensity,
+    reference_metrics and fwhm_at_peak_m refer to the exact numerical distance.
     """
     configuration: CRLFocusConfig
     backend: str
@@ -2937,6 +2972,7 @@ class CRLFocusResult:
     lens_length_m: float
     diagnostics: tuple[str,...]
     _session: _CRLFocusSession
+    reference_metrics: BeamMetrics | None = None
 
     @property
     def peak_z_m(self):
@@ -2964,9 +3000,21 @@ class CRLFocusResult:
     @property
     def fwhm_at_peak_m(self):
         """Full-source FWHM at the numerical reference distance."""
-        value=np.atleast_1d(self.fwhm_m[self.peak_index])
-        widths=tuple(_optional_float(v) for v in value)
+        value=np.atleast_1d(self.reference_metrics.fwhm if self.reference_metrics is not None
+                          else self.fwhm_m[self.peak_index])
+        widths=tuple(None if v is None else _optional_float(v) for v in value)
         return widths[0] if self.configuration.grid_dimension==1 else widths
+
+    @property
+    def scan_step_m(self):
+        """Spacing of the uniform overview z grid; the optimizer is separate."""
+        return float(self.z_m[1]-self.z_m[0])
+
+    @property
+    def intensity_reference(self):
+        """Common full-source peak for overview and selected-plane display."""
+        reference=0.0 if self.reference_metrics is None else self.reference_metrics.max_intensity
+        return max(float(np.max(self.peak_intensity)),float(reference))
 
     @property
     def effective_aperture_m(self):
@@ -3002,6 +3050,9 @@ class CRLFocusResult:
                 "axial_roi_basis":"manual" if self.configuration.scan_range_m is not None else self.peak_search_basis,
                 "peak_search_initial_z_m":self.numerical_peak.history[0][0],
                 "sampled_peak_z_m":self.sampled_peak_z_m,
+                "scan_step_m":self.scan_step_m,"scan_grid_uniform":True,
+                "reference_scan_index":self.peak_index,
+                "intensity_reference":self.intensity_reference,
                 "magnification_at_peak":self.magnification_at_peak,
                 "transmission":self.transmission,"grid_shape":self.grid_shape,
                 "effective_aperture_m":self.effective_aperture_m,
@@ -3040,6 +3091,77 @@ def _fast_grid_size(required):
         if remainder==1:
             return n
         n=next_fast_len(n+1)
+
+
+def _nice_grid_step(value,rounding="nearest"):
+    """Quantize transverse spacing in SI to a scale-adaptive multiple of five.
+
+    E.g. 31.74 nm becomes 30 nm and 126.95 nm becomes 125 nm.
+    The quantum is 5 nm for larger spacings, 0.5 nm below 5 nm, etc.;
+    no arbitrary minimum resolution is imposed.
+    """
+    _validate_positive("grid step",value)
+    quantum=5e-9*10.0**min(0,np.floor(np.log10(value/(5e-9))))
+    ratio=value/quantum
+    integer=(np.floor(ratio+1e-10) if rounding=="down" else
+             np.ceil(ratio-1e-10) if rounding=="up" else np.floor(ratio+.5))
+    return float(max(1,integer)*quantum)
+
+
+def _nice_scan_step(value,rounding="nearest"):
+    """Preferred axial steps: 1, 2.5, 5 times a power of ten (SI)."""
+    _validate_positive("scan step",value)
+    scale=10.0**np.floor(np.log10(value))
+    candidates=scale*np.array([.5,1.,2.5,5.,10.])
+    if rounding=="up":
+        return float(candidates[np.flatnonzero(candidates>=value*(1-1e-10))[0]])
+    if rounding=="down":
+        return float(candidates[np.flatnonzero(candidates<=value*(1+1e-10))[-1]])
+    return float(candidates[np.argmin(abs(candidates-value))])
+
+
+def _focus_axis_sampling(width,required,count,requested_step,cap,minimum):
+    """Keep actual spacings readable while covering the full requested window."""
+    if requested_step is not None:
+        step=_nice_grid_step(requested_step)
+        n=_fast_grid_size(max(minimum,np.ceil(width/step-1e-10)))
+        manual_cap=65536 if cap==65536 else 4096
+        if n>manual_cap:
+            raise ValueError(f"Requested propagation spacing needs {n} points on one axis; "
+                             f"the {manual_cap}-point spacing-control limit would be exceeded. "
+                             "Increase the spacing or use an explicit point count.")
+    elif count is not None:
+        n=count
+        step=_nice_grid_step(width/n,"up")
+    else:
+        step=_nice_grid_step(width/min(required,cap),"down")
+        n=_fast_grid_size(max(minimum,np.ceil(width/step-1e-10)))
+        # A small FFT-size margin preserves the rounded-down spacing instead
+        # of making e.g. 31.74 nm coarser than 30 nm just to keep N=2048.
+        if n>_fast_grid_size(cap*1.1):
+            step=_nice_grid_step(width/cap,"up")
+            n=_fast_grid_size(max(minimum,np.ceil(width/step-1e-10)))
+    return int(n),float(step)
+
+
+def _uniform_scan_positions(bounds,target_count,requested_step,accuracy):
+    """Snap ROI outward to one uniform, readable lattice, without peak insertion."""
+    target=(bounds[1]-bounds[0])/(target_count-1)
+    step=_nice_scan_step(requested_step) if requested_step is not None else _nice_scan_step(
+        target,"down" if accuracy=="refined" else "up")
+    start=max(0,int(np.floor(bounds[0]/step+1e-10)))
+    stop=int(np.ceil(bounds[1]/step-1e-10))
+    if requested_step is None:
+        while stop-start+1<5:
+            step=_nice_scan_step(step*.9,"down")
+            start=max(0,int(np.floor(bounds[0]/step+1e-10)))
+            stop=int(np.ceil(bounds[1]/step-1e-10))
+    count=stop-start+1
+    if count<2:
+        raise ValueError("The axial grid must contain at least two planes.")
+    if count>10001:
+        raise ValueError(f"The requested z spacing needs {count} planes; increase it to use at most 10001.")
+    return (start+np.arange(count,dtype=float))*step
 
 
 def _edge_power_fractions(image,xp):
@@ -3081,11 +3203,11 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None):
         required_x=_fast_grid_size(max(256,width_x/target_x))
         if cfg.accuracy=="refined":
             required_x=max(_fast_grid_size(1.25*min(required_x,quick_cap)),_fast_grid_size(width_x/phase_target))
-        nx=cfg.grid_points or min(required_x,cap)
+        nx,dx=_focus_axis_sampling(width_x,required_x,cfg.grid_points,cfg.grid_step_x_m,cap,256)
         if cfg.grid_points is None and nx<required_x:
             messages.append("grid_cap: Automatic x sampling reached its memory cap; refine the grid to check spot size.")
         if cfg.grid_dimension==1:
-            grid=Grid1D(width_x/nx,nx,backend=backend)
+            grid=Grid1D(dx,nx,backend=backend)
         else:
             if cfg.geometry=="two-dimensional":
                 target_y=target_x
@@ -3098,10 +3220,10 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None):
                 required_y=_fast_grid_size(1.25*min(required_y,quick_cap))
                 if cfg.geometry=="two-dimensional":
                     required_y=max(required_y,_fast_grid_size(width_y/phase_target))
-            ny=cfg.grid_points_y or min(required_y,cap)
+            ny,dy=_focus_axis_sampling(width_y,required_y,cfg.grid_points_y,cfg.grid_step_y_m,cap,128)
             if cfg.grid_points_y is None and ny<required_y:
                 messages.append("grid_cap_y: Automatic y sampling reached its memory cap; refine the grid.")
-            grid=Grid2D(width_x/nx,width_y/ny,nx,ny,backend=backend)
+            grid=Grid2D(dx,dy,nx,ny,backend=backend)
         xp=grid.xp
         position=0.0 if grid.dimension==1 else (0.0,0.0)
         incident=(xp.ones(grid.shape,dtype=xp.complex128) if cfg.source_type=="plane" else
@@ -3235,7 +3357,7 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     coherent=None
     detector=session.detector_grid
     messages.extend(session.diagnostics)
-    positions=np.unique(np.r_[np.linspace(*bounds,cfg.scan_points),numerical.z_m])
+    positions=_uniform_scan_positions(bounds,cfg.scan_points,cfg.scan_step_m,cfg.accuracy)
     metrics=[]
     lines=[]
     transverse_x=xp.zeros(detector.nx,dtype=xp.float64)
@@ -3261,9 +3383,9 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     y_slice=None if grid.dimension==1 else _display_slice(y_full,_to_numpy(transverse_y),cfg.transverse_roi_level)
     session.slices=(x_slice,) if grid.dimension==1 else (y_slice,x_slice)
     best=session.plane(numerical.z_m)
-    best_index=int(np.flatnonzero(positions==numerical.z_m)[0])
+    best_index=int(np.argmin(abs(positions-numerical.z_m)))
     widths=np.asarray([np.nan if m.fwhm is None else m.fwhm for m in metrics],dtype=float)
-    best_widths=np.atleast_1d(widths[best_index])
+    best_widths=np.asarray([np.nan if v is None else v for v in np.atleast_1d(best.metrics.fwhm)],dtype=float)
     steps=np.array([detector.dx] if grid.dimension==1 else [detector.dx,detector.dy])
     if np.any(~np.isfinite(best_widths)):
         messages.append("fwhm_missing: Half-maximum crossings are outside the calculation window.")
@@ -3298,6 +3420,6 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         best.x_m,best.y_m,best.intensity,np.stack(lines)[:,x_slice].copy(),
         session.transmission,float(crl.delta),float(crl.beta),grid.dx,grid.shape,
         None if grid.dimension==1 else grid.dy,detector.shape,detector.dx,
-        None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session)
+        None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics)
     reporter.finish()
     return result
