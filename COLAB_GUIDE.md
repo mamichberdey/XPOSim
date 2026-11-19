@@ -1,6 +1,6 @@
 # CRL focus explorer in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/4ab31ab0c873c07419d4dd0d3658d4178751922d/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/45935454d2d6ceffb4183ad9124b3320fae315b7/notebooks/CRL_Focus_Colab.ipynb).
 
 Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. The parameter fields are always shown in their own output and are never automatically collapsed or hidden by a calculation. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results remain in memory; no export or save/restore mechanism is included.
 
@@ -110,19 +110,21 @@ A successful CUDA probe selects CuPy. Field arithmetic, FFTs, Fourier zoom and G
 
 ## Numerical effective aperture
 
-The effective aperture is defined here as the **intensity FWHM at the exit of the complete CRL**. For x, find the nearest half-maximum crossings around the exit intensity peak:
+The **effective aperture** is the size of a transparent opening that passes the same integrated intensity under uniform illumination. Let `D` be the full geometric aperture, and let `T = P_out / P_in` be the fraction of the power incident inside that opening which passes through the stack. XPOSim includes absorption in the central bridges and propagation between the lens elements. [Kohn (2017), equations (13), (19) and (20)](https://journals.iucr.org/s/issues/2017/03/00/mo5159/)
 
-$$D_{\mathrm{eff},x}=x_{\mathrm{right}}-x_{\mathrm{left}},\qquad I_{\mathrm{exit}}(x_{\mathrm{left/right}},y_{\mathrm{peak}})=\tfrac12 I_{\mathrm{exit,max}}.$$
+| Geometry | Effective aperture |
+| --- | --- |
+| One-axis focusing on a 1D grid | Width `D × T` |
+| One-axis focusing on a 2D grid | Width `D × T` at fixed structure depth. The integral covers both axes. |
+| Circular two-axis focusing on a 2D grid | Diameter `D × √T`. The effective area is the geometrical area times `T`. |
 
-For two-axis focusing the y width is measured analogously on a 2D grid. For one-axis focusing on a 2D grid, the y diffraction intensity is still propagated, but its profile is hidden and no y FWHM is computed or displayed. Crossings are linearly interpolated on the full propagation grid, before detector zoom or display cropping. This definition includes illumination, absorption, and propagation inside the stack. It is the full width, not HWHM, and is not clamped to the nominal geometric aperture. If crossings are missing from the numerical window, the affected width is unresolved.
+The exit power is summed on the full propagation grid, before detector zoom or display cropping. The power across the full transverse plane is conserved under free propagation, so changing detector z leaves the effective aperture fixed. Incoherent point sampling integrates the weighted exit powers of all modes during the existing source batches. The convolution model uses the central point's power under its shift-invariant approximation.
 
-For incoherent point sampling, the exit intensity is the weighted sum $I_{\mathrm{exit}}=\sum_j w_j |E_{j,\mathrm{exit}}|^2$, rather than an average of individual widths. The sum is accumulated during the existing source-mode batches, with no additional CRL pass. The convolution model applies its source blur at z=0 on the native grid; its shift-invariance approximation still applies.
-
-Use `result.effective_aperture_m` for the full-source result: a scalar in 1D or an `(x, y)` tuple in 2D. For one-axis focusing on a 2D grid the tuple is `(width_x, None)`; this is intentional, rather than an unresolved width. `result.fwhm_axes` lists the measured focusing axes. It also appears in `result.summary()` with convention `exit_intensity_FWHM`. For a low-level coherent `CRL` object, `crl.effective_aperture()` measures the FWHM of its exit field. For a finite-depth, one-axis CRL, both `crl.effective_aperture()` and `crl.focus_scan()` skip y width. Generic `beam_metrics()` still measures both axes by default. This is a numerical result available after propagation, separate from the inexpensive analytical preview.
+As of XPOSim 0.19, `result.effective_aperture_m` returns one scalar in metres for every geometry. `result.summary()` records the convention as `integrated_transmission`. The low-level `crl.effective_aperture()` applies the entrance pupil to the supplied coherent field and returns the same scalar, or `None` when no power enters the pupil. Use `beam_metrics(crl.E(), crl.grid).fwhm` when you need the exit beam's half-maximum widths.
 
 ## Results and slider
 
-The selected **On-image measures** layout groups the results with visible borders and high-contrast headings. The top **CRL · whole calculation** summary reports numerical peak-intensity distance, transmission and effective-aperture values for the focusing axes, with units immediately after each value (for example, **34.7153 mm**). Analytical focal/image distances and image-plane magnification remain beside the parameter form.
+The selected **On-image measures** layout groups the results with visible borders and high-contrast headings. The top **CRL · whole calculation** summary reports numerical peak-intensity distance, transmission and the effective-aperture width or diameter, with units immediately after each value (for example, **34.7153 mm**). Analytical focal/image distances and image-plane magnification remain beside the parameter form.
 
 The right **Selected transverse plane** panel shows the peak intensity in a.u. inside the upper-right corner of each 2D intensity map. There is no separate peak or magnification box below the plots. For two-axis focusing, mathematical $\mathrm{FWHM}_x$ and $\mathrm{FWHM}_y$ labels and measurement bars appear on the map. A bar is hidden when its width is less than **5% of the corresponding displayed axis span**. If either bar is hidden or a width is unresolved, both FWHM values appear in one shared block **below the map**, above the profile legend. Both bars are hidden whenever the values are below the map; layout reserves space for the shared values. This also handles a narrow x/broad y beam and the reverse case without overlapping corner and rotated labels. The measurements and interpolated crossings are unchanged.
 
@@ -189,7 +191,7 @@ result = xpos.estimate_crl_focus(config)
 search = result.numerical_peak  # Central-point reference for a Gaussian source.
 plane = result.plane_at(search.z_m * 1.01)
 print(result.analytical_image_distance_m, result.magnification_at_peak)
-print(result.effective_aperture_m)  # Exit-intensity FWHM on the propagation grid.
+print(result.effective_aperture_m)  # Flux-equivalent width or circular diameter.
 ```
 
 For Gaussian illumination, `result.numerical_peak.intensity` is the central coherent-point intensity; `result.peak_intensity` and `result.fwhm_m` describe the full source. `peak_z_m` and `fwhm_at_peak_m` refer to the numerical reference plane. `result.sampled_peak_z_m` gives the full-source maximum among displayed samples. Summary metadata records `peak_search_basis`, `peak_search_initial_z_m` and `axial_roi_basis`.
