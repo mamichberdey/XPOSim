@@ -24,8 +24,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, replace
 from numbers import Integral
+import os
 from pathlib import Path
 import re
+from shutil import disk_usage
+from tempfile import TemporaryFile, gettempdir
+from threading import Lock
 from time import perf_counter
 from typing import Any, Callable, Iterable, Iterator, Sequence
 import warnings
@@ -41,7 +45,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.19.0"
+__version__ = "0.20.0"
 
 
 __all__ = [
@@ -2740,9 +2744,29 @@ class CRLPlaneResult:
     magnification: tuple[float | None, ...]
 
 
+def _source_host_cache_budget() -> int:
+    """Leave host memory for propagation, plotting and other live results."""
+    try:
+        available = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        if available <= 0:
+            raise ValueError("Host memory availability is unknown.")
+    except (AttributeError, OSError, ValueError):
+        available = 1024**3
+    for root, limit_name, usage_name in (
+        ("/sys/fs/cgroup", "memory.max", "memory.current"),
+        ("/sys/fs/cgroup/memory", "memory.limit_in_bytes", "memory.usage_in_bytes"),
+    ):
+        try:
+            directory = Path(root)
+            remaining = int((directory / limit_name).read_text()) - int((directory / usage_name).read_text())
+        except (OSError, ValueError):
+            continue
+        available = min(available, remaining)
+    return max(0, min(4 * 1024**3, available // 2))
+
+
 class _CRLFocusSession:
-    """Reusable GPU/CPU propagation state; no files or full detector stacks."""
-    _mode_cache_budget_bytes = 512*1024**2
+    """Reusable propagation state with bounded detector and source batches."""
 
     def __init__(self, cfg, grid, crl, incident, coherent_state=None, progress=None):
         self.cfg,self.grid,self.crl,self.incident=cfg,grid,crl,incident
@@ -2757,7 +2781,8 @@ class _CRLFocusSession:
         self.detector_grid=grid
         self._zoom_plan=None
         self.diagnostics=[]
-        self._modes=None
+        self._mode_batches=[]
+        self._mode_file=None
         sigma_factor=1/(2*np.sqrt(2*np.log(2)))
         self.source_sigma=(cfg.source_fwhm_x_m*sigma_factor,cfg.source_fwhm_y_m*sigma_factor)
         self._point_model=cfg.source_type=="gaussian" and cfg.source_method=="points"
@@ -2777,19 +2802,8 @@ class _CRLFocusSession:
                 self.positions=np.column_stack((xx.ravel(),yy.ravel()))
                 self.weights=(wy[:,None]*wx[None,:]).ravel()
             self.mode_batch=grid._batch_size(len(self.weights),self.spectrum.dtype,cfg.batch_size)
-            cache_budget=self._mode_cache_budget_bytes
-            if grid.backend=="cupy":
-                free,_=cp.cuda.runtime.memGetInfo()
-                cache_budget=min(1024*1024**2,int(free*.25))
-            needed=len(self.weights)*int(np.prod(grid.shape))*self.spectrum.dtype.itemsize
-            self._source_transmission_ready=False
-            if needed<=cache_budget:
-                if progress is not None:
-                    progress.start("source_modes",len(self.weights),
-                        f"{grid.backend} · source modes in batches of {self.mode_batch}")
-                self._modes=list(self._generate_modes(progress))
-            else:
-                self.diagnostics.append("source_streaming: Source spectra exceed the RAM/VRAM cache budget; modes are recomputed in bounded batches.")
+            self._mode_weights=self.xp.asarray(self.weights)
+            self._prepare_mode_cache(progress)
         elif cfg.source_type=="gaussian":
             self.diagnostics.append("convolution_model: Gaussian intensity convolution assumes a shift-invariant pupil response; use point sampling to include source-dependent clipping and absorption.")
 
@@ -2847,6 +2861,59 @@ class _CRLFocusSession:
         self._peak_cache.clear()
         self.slices=(slice(None),)*detector.dimension
 
+    def _prepare_mode_cache(self, progress):
+        """Store each exit spectrum once for the scan and later detector planes."""
+        self._mode_bytes=self.spectrum.nbytes
+        required=len(self.weights)*self._mode_bytes
+        gpu_budget=0
+        if self.grid.backend=="cupy":
+            free,_=cp.cuda.runtime.memGetInfo()
+            gpu_budget=min(1024**3,free//4)
+
+        cache_location="GPU" if required<=gpu_budget else "RAM"
+        scratch=None
+        if cache_location=="RAM" and required>_source_host_cache_budget():
+            cache_location="temporary storage"
+            directory=gettempdir()
+            if required>disk_usage(directory).free:
+                raise MemoryError(
+                    f"Source spectra need {required/1024**3:.2f} GiB, exceeding the RAM cache "
+                    "and available temporary storage. Reduce the grid or source node count."
+                )
+            scratch=TemporaryFile(dir=directory)
+
+        try:
+            if progress is not None:
+                progress.start("source_modes",len(self.weights),
+                    f"Preparing source modes in batches of {self.mode_batch} · spectra cached in {cache_location}")
+            for spectrum in self._generate_modes(progress):
+                if cache_location=="GPU":
+                    self._mode_batches.append(spectrum)
+                else:
+                    host_spectrum=_to_numpy(spectrum)
+                    if scratch is None:
+                        self._mode_batches.append(host_spectrum)
+                    else:
+                        block=memoryview(np.ascontiguousarray(host_spectrum)).cast("B")
+                        if scratch.write(block)!=block.nbytes:
+                            raise OSError("Could not write the temporary source spectrum cache.")
+                        del block
+                    del host_spectrum
+                del spectrum
+            if scratch is not None:
+                scratch.flush()
+                self._mode_io_lock=Lock()
+                self._mode_file=scratch
+        finally:
+            if scratch is not None and self._mode_file is None:
+                scratch.close()
+
+        if cache_location=="temporary storage" or (cache_location=="RAM" and self.grid.backend=="cupy"):
+            self.diagnostics.append(
+                f"source_spectrum_cache: Source spectra are cached in {cache_location} "
+                "and reused for all detector planes."
+            )
+
     def _generate_modes(self,progress=None):
         total_power=0.0
         xp=self.xp
@@ -2859,20 +2926,34 @@ class _CRLFocusSession:
                 phase=phase+points[:,1][(slice(None),*extra)]*self.grid.y
             fields=self.incident[None,...]*xp.exp(-1j*self.crl.k/self.cfg.source_distance_m*phase)
             fields=self.crl.apply_to_fields(fields)
-            weights=xp.asarray(self.weights[start:stop])
-            if not self._source_transmission_ready:
-                values=abs(fields)**2
-                axes=tuple(range(1,fields.ndim))
-                total_power+=_to_python_float(xp.sum(weights*xp.sum(values,axis=axes)))
-                del values
+            values=abs(fields)**2
+            axes=tuple(range(1,fields.ndim))
+            total_power+=_to_python_float(xp.sum(self._mode_weights[start:stop]*xp.sum(values,axis=axes)))
+            del values
             spectrum=self.grid._transform_batch(fields)
             del fields,phase
-            yield spectrum,weights
+            yield spectrum
+            del spectrum
             if progress is not None:
                 progress.advance(stop)
-        if not self._source_transmission_ready:
-            self.transmission=total_power/self.input_power
-            self._source_transmission_ready=True
+        self.transmission=total_power/self.input_power
+
+    def _iter_cached_modes(self):
+        """Load only the current batch from RAM or temporary storage."""
+        for index,start in enumerate(range(0,len(self.weights),self.mode_batch)):
+            stop=min(start+self.mode_batch,len(self.weights))
+            if self._mode_file is None:
+                spectra=self._mode_batches[index]
+            else:
+                spectra=np.empty((stop-start,*self.grid.shape),dtype=self.spectrum.dtype)
+                block=memoryview(spectra).cast("B")
+                with self._mode_io_lock:
+                    self._mode_file.seek(start*self._mode_bytes)
+                    if self._mode_file.readinto(block)!=block.nbytes:
+                        raise OSError("Could not read the temporary source spectrum cache.")
+                del block
+            yield self.xp.asarray(spectra), self._mode_weights[start:stop]
+            del spectra
 
     def magnification(self,z):
         if self.cfg.source_type=="plane":
@@ -2891,13 +2972,12 @@ class _CRLFocusSession:
             return self._last_image
         if self._point_model:
             image=self.xp.zeros(self.detector_grid.shape,dtype=self.xp.float64)
-            modes=self._modes if self._modes is not None else self._generate_modes()
             extra=(None,)*self.grid.dimension
-            for spectra,weights in modes:
+            for spectra,weights in self._iter_cached_modes():
                 fields=(self.grid._propagate_mode_spectra(spectra,z,self.crl.k) if self._zoom_plan is None else
                         self._zoom_plan.propagate(spectra,z,self.crl.k))
                 image+=self.xp.sum(abs(fields)**2*weights[(slice(None),*extra)],axis=0)
-                del fields
+                del fields,spectra
         else:
             field=(self._zoom_plan.propagate(self.spectrum,z,self.crl.k) if self._zoom_plan is not None else
                    (self.exit_field if z==0 else self.grid._propagate_spectrum(self.spectrum,np.asarray([z]),self.crl.k)[0]))
@@ -3342,7 +3422,8 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     The analytical image distance seeds the search. Gaussian illumination uses
     only its central coherent point for peak search and automatic axial ROI;
     all Gaussian modes/convolution are applied afterwards for displayed planes.
-    No calculations are saved to files. The retained session evaluates slider z.
+    The retained session evaluates any detector z from cached source spectra.
+    Oversized spectra may use a temporary cache for the session lifetime.
     progress receives synchronous stage updates without threads or timers.
     Unknown adaptive lengths have no percentage or ETA. Sampling ETA uses
     completed batches, preserving GPU batching and bounding progress overhead.
