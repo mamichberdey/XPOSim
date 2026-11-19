@@ -41,7 +41,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 
 
 __all__ = [
@@ -1427,6 +1427,13 @@ class ArrayObject(OpticalElement):
 # ---------------------------------------------------------------------------
 
 
+def _effective_aperture_from_transmission(
+    aperture: float, transmission: float, *, circular: bool
+) -> float:
+    """Size of a transparent pupil passing the same integrated intensity."""
+    return aperture * (transmission**0.5 if circular else transmission)
+
+
 class CRL(OpticalElement):
     """Compound refractive element for 1D and 2D paraxial wave-optics schemes.
 
@@ -1656,10 +1663,22 @@ class CRL(OpticalElement):
             return self.grid.x, None
 
         theta = self.rotation
+        if theta == 0.0:
+            return self.grid.x, self.grid.y
         c, s = np.cos(theta), np.sin(theta)
         x_local = c * self.grid.x + s * self.grid.y
         y_local = -s * self.grid.x + c * self.grid.y
         return x_local, y_local
+
+    def _entrance_pupil(self) -> Any:
+        """Sample the nominal entrance aperture on the propagation grid."""
+        half_aperture = self.aperture / 2
+        if self.grid.dimension == 1:
+            return abs(self.grid.x) <= half_aperture
+        if self.transverse_length is None:
+            return self.grid.x**2 + self.grid.y**2 <= half_aperture**2
+        x_local, y_local = self._local_coordinates()
+        return (abs(x_local) <= half_aperture) & (abs(y_local) < self.transverse_length / 2)
 
     def _warn_surface_error_extent(self) -> None:
         """Warn when the supplied defect coordinate extent differs from the CRL aperture."""
@@ -1937,20 +1956,27 @@ class CRL(OpticalElement):
         _validate_count("n_elements", count)
         return count <= self.max_element_count()
 
-    def effective_aperture(self) -> float | tuple[float | None, float | None] | None:
-        """Numerical intensity FWHM at the CRL exit, in metres.
+    def effective_aperture(self) -> float | None:
+        """Return the flux-equivalent width or circular diameter in metres.
 
-        Uses the full propagation grid and the current coherent incident field,
-        including absorption and propagation through every element. On a 2D
-        grid, returns (x, y) slice widths through the intensity maximum. The y
-        width is None for a finite-depth, one-axis CRL; it is not measured.
-        Missing half-maximum crossings give None, just as in beam_metrics.
-        CRLFocusResult.effective_aperture_m additionally handles incoherent
-        Gaussian sources, using their weighted exit intensity.
+        Propagate the portion of the coherent incident field inside the
+        entrance pupil and integrate the intensity across the full exit grid.
+        The output/input power ratio scales the geometric width for one-axis
+        focusing (at fixed structure depth in 2D) or the area for circular
+        focusing. Return None if no power enters the pupil.
         """
-        return _beam_metrics_batch(self.E()[None,...],self.grid,
-            (slice(None),)*self.grid.dimension,
-            measure_y_fwhm=self.transverse_length is None)[0].fwhm
+        xp = self.grid.xp
+        field = self._require_input_field()
+        incident = xp.where(self._entrance_pupil(), field, 0)
+        input_sum = _to_python_float(xp.sum(abs(incident)**2))
+        if input_sum == 0.0:
+            return None
+        exit_field = self.apply_to_fields(incident[None, ...])[0]
+        transmission = _to_python_float(xp.sum(abs(exit_field)**2)) / input_sum
+        return _effective_aperture_from_transmission(
+            self.aperture, transmission,
+            circular=self.grid.dimension == 2 and self.transverse_length is None,
+        )
 
     def focus_scan(
         self,
@@ -2730,7 +2756,6 @@ class _CRLFocusSession:
         self.slices=(slice(None),)*grid.dimension
         self.detector_grid=grid
         self._zoom_plan=None
-        self._exit_metrics=None
         self.diagnostics=[]
         self._modes=None
         sigma_factor=1/(2*np.sqrt(2*np.log(2)))
@@ -2767,11 +2792,6 @@ class _CRLFocusSession:
                 self.diagnostics.append("source_streaming: Source spectra exceed the RAM/VRAM cache budget; modes are recomputed in bounded batches.")
         elif cfg.source_type=="gaussian":
             self.diagnostics.append("convolution_model: Gaussian intensity convolution assumes a shift-invariant pupil response; use point sampling to include source-dependent clipping and absorption.")
-        if not self._point_model:
-            exit_intensity=self._blur(abs(self.exit_field)**2,0.0,grid=self.grid)
-            self._exit_metrics=_intensity_metrics_batch(exit_intensity[None,...],self.grid,
-                (slice(None),)*self.grid.dimension,
-                measure_y_fwhm=self.cfg.geometry=="two-dimensional")[0]
 
     def configure_refined_detector(self,analytic):
         """Resolve the detector peak without globally oversampling the lens plane."""
@@ -2831,8 +2851,6 @@ class _CRLFocusSession:
         total_power=0.0
         xp=self.xp
         extra=(None,)*self.grid.dimension
-        exit_intensity=(xp.zeros(self.grid.shape,dtype=xp.float64)
-                        if self._exit_metrics is None else None)
         for start in range(0,len(self.weights),self.mode_batch):
             stop=min(start+self.mode_batch,len(self.weights))
             points=xp.asarray(self.positions[start:stop])
@@ -2846,8 +2864,6 @@ class _CRLFocusSession:
                 values=abs(fields)**2
                 axes=tuple(range(1,fields.ndim))
                 total_power+=_to_python_float(xp.sum(weights*xp.sum(values,axis=axes)))
-                if exit_intensity is not None:
-                    exit_intensity+=xp.sum(values*weights[(slice(None),*extra)],axis=0)
                 del values
             spectrum=self.grid._transform_batch(fields)
             del fields,phase
@@ -2857,10 +2873,6 @@ class _CRLFocusSession:
         if not self._source_transmission_ready:
             self.transmission=total_power/self.input_power
             self._source_transmission_ready=True
-        if exit_intensity is not None:
-            self._exit_metrics=_intensity_metrics_batch(exit_intensity[None,...],self.grid,
-                (slice(None),)*self.grid.dimension,
-                measure_y_fwhm=self.cfg.geometry=="two-dimensional")[0]
 
     def magnification(self,z):
         if self.cfg.source_type=="plane":
@@ -2894,14 +2906,14 @@ class _CRLFocusSession:
         self._last_z,self._last_image=z,image
         return image
 
-    def _blur(self,image,z,*,grid=None):
+    def _blur(self,image,z):
         if self.cfg.source_type!="gaussian":
             return image
         if self.grid.backend=="cupy":
             from cupyx.scipy.ndimage import gaussian_filter
         else:
             from scipy.ndimage import gaussian_filter
-        grid=self.detector_grid if grid is None else grid
+        grid=self.detector_grid
         magnification=self.magnification(z)
         sigma_x=abs(magnification[0])*self.source_sigma[0]/grid.dx
         sigmas=sigma_x if self.grid.dimension==1 else (
@@ -3049,17 +3061,18 @@ class CRLFocusResult:
         return max(float(np.max(self.peak_intensity)),float(reference))
 
     @property
-    def effective_aperture_m(self):
-        """Full-source exit-intensity FWHM on the native propagation grid.
+    def effective_aperture_m(self) -> float:
+        """Flux-equivalent width or circular diameter in metres.
 
-        A scalar for a 1D grid, or (x, y) peak-crossing slice widths for 2D.
-        The unfocused y width is None for one-axis focusing on a 2D grid.
-        Gaussian point modes are summed incoherently at the exit, before any
-        detector zoom/crop. The convolution model applies its native-grid blur
-        at z=0. No extra source propagations or detector scans are required.
-        This numerical definition is not an absorption-only aperture estimate.
+        Uses the transmitted fraction of power incident within the entrance
+        pupil, independent of detector position or sampling. Gaussian point
+        sampling uses the weighted exit power of all modes; convolution uses
+        central-point transmission under the shift-invariant approximation.
         """
-        return self._session._exit_metrics.fwhm
+        return _effective_aperture_from_transmission(
+            self.configuration.aperture_m, self.transmission,
+            circular=self.configuration.geometry == "two-dimensional",
+        )
 
     @property
     def magnification_at_peak(self):
@@ -3091,7 +3104,7 @@ class CRLFocusResult:
                 "magnification_at_peak":self.magnification_at_peak,
                 "transmission":self.transmission,"grid_shape":self.grid_shape,
                 "effective_aperture_m":self.effective_aperture_m,
-                "effective_aperture_convention":"exit_intensity_FWHM",
+                "effective_aperture_convention":"integrated_transmission",
                 "grid_step_m":self.grid_step_m,"grid_step_y_m":self.grid_step_y_m,
                 "detector_shape":self.detector_shape,"detector_step_m":self.detector_step_m,
                 "detector_step_y_m":self.detector_step_y_m,
@@ -3279,17 +3292,13 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None):
         incident=(xp.ones(grid.shape,dtype=xp.complex128) if cfg.source_type=="plane" else
                   PointSource(grid=grid,position=position,energy_kev=cfg.energy_kev).E(cfg.source_distance_m))
         lens_parameters=dict(parameters)
-        if grid.dimension==1:
-            pupil=abs(grid.x)<=cfg.aperture_m/2
-        elif cfg.geometry=="one-dimensional":
-            pupil=(abs(grid.x)<=cfg.aperture_m/2)&(abs(grid.y)<cfg.structure_depth_m/2)
+        if grid.dimension==2 and cfg.geometry=="one-dimensional":
             lens_parameters["transverse_length"]=cfg.structure_depth_m
-        else:
-            pupil=grid.x**2+grid.y**2<=(cfg.aperture_m/2)**2
-        incident*=pupil
+        crl=CRL(grid=grid,**lens_parameters)
+        incident*=crl._entrance_pupil()
         if _to_python_float(xp.sum(abs(incident)**2))<=0:
             raise ValueError("The entrance aperture is not resolved by the grid.")
-        crl=CRL(incident,grid,**lens_parameters)
+        crl.input_field=incident
         probe_cfg=replace(cfg,source_method="convolution") if cfg.source_type=="gaussian" else cfg
         probe=_CRLFocusSession(probe_cfg,grid,crl,incident)
         if not cfg.adaptive_window:
