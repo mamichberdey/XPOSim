@@ -1,8 +1,8 @@
 # CRL focus explorer in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/45935454d2d6ceffb4183ad9124b3320fae315b7/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/42e3c2d82939d2e62ecb31925c542e226676a4e8/notebooks/CRL_Focus_Colab.ipynb).
 
-Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. The parameter fields are always shown in their own output and are never automatically collapsed or hidden by a calculation. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results remain in memory; no export or save/restore mechanism is included.
+Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. The parameter fields are always shown in their own output and are never automatically collapsed or hidden by a calculation. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results stay in the active session.
 
 ## Start
 
@@ -105,7 +105,8 @@ A successful CUDA probe selects CuPy. Field arithmetic, FFTs, Fourier zoom and G
 
 - Point-source, plane-wave and Gaussian-convolution display scans process independent z planes in batches, sharing the exit spectrum. Both Fast and Accurate detector propagation support this.
 - Direct incoherent point sampling batches the independent source modes through the CRL and to each detector plane, then sums weighted intensities. Its z planes are currently visited sequentially; mode batches provide the parallel work at each z.
-- Automatic GPU batches use the available VRAM and are capped at 16. **Batch size** in advanced controls overrides the heuristic; CPU automatic batches default to one. Cached source spectra have a separate memory budget and larger mode sets stream bounded batches.
+- Automatic GPU batches use available VRAM and are capped at 16. **Batch size** in advanced controls overrides the heuristic. CPU automatic batches default to one.
+- Point sampling prepares the exit spectra once and reuses them for the scan and slider. The cache uses VRAM, then host RAM, then private temporary storage as needed. Each detector plane reads the cached spectra in bounded batches. Temporary spectra are released with the calculation session.
 - Consecutive CRL elements depend on the preceding field, and adaptive peak/ROI steps depend on previous evaluations, so these are sequential. Each field evaluation can still use GPU-parallel array operations and source-mode batches. Plot rendering and scalar optimization orchestration stay on the CPU.
 
 ## Numerical effective aperture
