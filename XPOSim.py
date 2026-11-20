@@ -22,7 +22,7 @@ in ``xray_material_data/`` next to this module.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from numbers import Integral
 import os
 from pathlib import Path
@@ -45,7 +45,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.22.0"
+__version__ = "0.23.0"
 
 
 __all__ = [
@@ -2695,6 +2695,28 @@ class CRLFocusConfig:
 
 
 @dataclass(frozen=True)
+class _GaussianCoherence:
+    """Exit coefficients of exp(-a*x²/2 + b*x*x_source + c*x_source²/2)."""
+
+    a: complex
+    b: complex
+    c: complex
+    k: float
+    source_sigmas_m: tuple[float, ...]
+
+    def at(self,z):
+        drift=1j*z/self.k
+        denominator=1+drift*self.a
+        c=self.c+drift*self.b**2/denominator
+        b=self.b/denominator
+        return tuple(
+            float(np.sqrt(2*np.log(2)*(1+max(0.,-2*c.real)*sigma**2))/(abs(b)*sigma))
+            if sigma and b else np.inf
+            for sigma in self.source_sigmas_m
+        )
+
+
+@dataclass(frozen=True)
 class CRLAnalyticalResult:
     """Preflight optics/geometry, calculated without propagation or GPU use.
 
@@ -2715,6 +2737,47 @@ class CRLAnalyticalResult:
     element_length_m: float | None = None
     web_transmission: float | None = None
     rocking_fwhm_rad: float | None = None
+    _gaussian_coherence: _GaussianCoherence | None = field(default=None,repr=False)
+
+    def transverse_coherence_length_m(self,z_m: float) -> tuple[float, ...] | None:
+        """Kohn's centred slit-pair coherence length on the focusing axes.
+
+        This is the slit separation at half visibility, in metres, for a
+        spatially incoherent Gaussian source with broad angular emission and
+        an equivalent Gaussian aperture. A zero source width gives infinity.
+        Point and plane-wave modes return None. z is measured from the exit.
+        """
+        _validate_finite("z_m",z_m)
+        if z_m<0:
+            raise ValueError("z_m must be non-negative.")
+        return None if self._gaussian_coherence is None else self._gaussian_coherence.at(z_m)
+
+
+def _gaussian_coherence_exit(reference,cfg):
+    """Transfer the Gaussian mutual-intensity model through the CRL stack."""
+    if cfg.source_type!="gaussian":
+        return None
+    k,delta,beta=reference._require_optical_constants()
+    circular=cfg.geometry=="two-dimensional"
+    aperture=cfg.aperture_m*(np.sqrt(np.pi)/2 if circular else 1.)
+    a=b=-1j*k/cfg.source_distance_m
+    c=-a
+    half_drift=.5j*reference.element_period/k
+    lens=2*k*(beta+1j*delta)/cfg.radius_m
+    # The equivalent Gaussian pupil is applied at the first element centre.
+    for i in range(cfg.n_elements):
+        drift=half_drift if i==0 else 2*half_drift
+        denominator=1+drift*a
+        c+=drift*b**2/denominator
+        a,b=a/denominator,b/denominator
+        a+=lens
+        if i==0:
+            a+=np.pi/aperture**2
+    denominator=1+half_drift*a
+    c+=half_drift*b**2/denominator
+    fwhms=(cfg.source_fwhm_x_m,cfg.source_fwhm_y_m) if circular else (cfg.source_fwhm_x_m,)
+    sigmas=tuple(width/(2*np.sqrt(2*np.log(2))) for width in fwhms)
+    return _GaussianCoherence(a/denominator,b/denominator,c,k,sigmas)
 
 
 def _gaussian_rocking_fwhm(reference, count, *, circular):
@@ -2785,7 +2848,7 @@ def analyze_crl(configuration: CRLFocusConfig) -> CRLAnalyticalResult:
                                       circular=cfg.geometry=="two-dimensional")
     return CRLAnalyticalResult(float(delta),float(beta),focal,image,maximum,
         float(reference.element_period*cfg.n_elements),bool(external),bool(real),magnification,
-        reference.element_period,web_transmission,rocking_fwhm)
+        reference.element_period,web_transmission,rocking_fwhm,_gaussian_coherence_exit(reference,cfg))
 
 
 @dataclass
