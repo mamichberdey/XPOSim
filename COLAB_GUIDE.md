@@ -1,6 +1,6 @@
 # CRL focus explorer in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/10b8a11a063de02cc634ed4eb620e4ae71cf0714/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/48ec574564cede035a6712df7649de434a5943fd/notebooks/CRL_Focus_Colab.ipynb).
 
 Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. The parameter fields are always shown in their own output and are never automatically collapsed or hidden by a calculation. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results stay in the active session.
 
@@ -24,7 +24,7 @@ The library accepts `CRLFocusConfig(material_delta=..., material_beta=...)`. In 
 
 ## Optical layout and analytical preview
 
-The optical layout updates with source and CRL inputs. The 1D grid shows an x–z projection. A 2D grid uses an isometric view with a focal line for one-axis focusing and an image point for circular focusing. The single-element drawing labels the aperture, vertex radius and bridge thickness. The layout also shows the applicable source dimensions and structure depth.
+The optical layout updates with source and CRL inputs. The 1D grid shows an x–z projection. A 2D grid uses an isometric view with a focal line for one-axis focusing and an image point for circular focusing. The one-axis stack appears as a plate with parabolic cavities and finite depth along y. The circular stack shows the rims and curved surfaces of its elements. The enlarged section labels the full aperture, vertex radius and bridge thickness. The layout also shows the applicable source dimensions and structure depth.
 
 Committing an input edit automatically refreshes the preview without propagating the wavefield or probing a GPU. Geometry shows **Analytical focal distance**, **Analytical image distance**, **Image-plane magnification**, **Maximum CRL elements** and **Full CRL length**. Material shows δ and β in separate readouts. The same preview works for all three material modes.
 
