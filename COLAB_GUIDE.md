@@ -1,6 +1,6 @@
 # CRL focus explorer in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/42e3c2d82939d2e62ecb31925c542e226676a4e8/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/3eba7b8121022a93c5fca3a9f61ceaad021be690/notebooks/CRL_Focus_Colab.ipynb).
 
 Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. The parameter fields are always shown in their own output and are never automatically collapsed or hidden by a calculation. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results stay in the active session.
 
@@ -22,7 +22,9 @@ The form is ordered **Source → CRL — General → CRL element — Geometry / 
 
 The library accepts `CRLFocusConfig(material_delta=..., material_beta=...)`. In this mode `material_formula` and `density_g_cm3` are normalized to `None`; database tables are bypassed.
 
-## Analytical preview before Compute
+## Optical layout and analytical preview
+
+The optical layout updates with source and CRL inputs. The 1D grid shows an x–z projection. A 2D grid uses an isometric view with a focal line for one-axis focusing and an image point for circular focusing. The single-element drawing labels the aperture, vertex radius and bridge thickness. The layout also shows the applicable source dimensions and structure depth.
 
 Committing an input edit automatically refreshes the preview without propagating the wavefield or probing a GPU. Geometry shows **Analytical focal distance**, **Analytical image distance**, **Image-plane magnification**, **Maximum CRL elements** and **Full CRL length**. Material shows δ and β in separate readouts. The same preview works for all three material modes.
 
@@ -69,7 +71,7 @@ Accurate detector spacings are quantized separately, rounding down when possible
 
 With **Adapt propagation window**, edge-power probes can enlarge automatic axes independently while preserving the resolution target. Explicit point-count overrides retain user control. Window expansion and detector sizes have memory limits. Check boundary warnings and compare finer grids, larger windows and more source nodes when quantitative accuracy matters. Automatic settings do not certify convergence.
 
-## Peak-intensity distance and display ROI
+## Peak-intensity distance and detector region
 
 `find_peak_intensity_distance` accepts a callable giving the transverse peak intensity at distance z. It expands a three-point bracket with variable steps and refines a local maximum with bounded scalar optimization. It consumes no precomputed z array and returns a `PeakIntensitySearchResult`.
 
@@ -81,13 +83,15 @@ For a Gaussian source, the CRL workflow uses **only its central coherent source 
 
 The output label adds **central point** for Gaussian illumination. This is a reference plane: the full Gaussian source can attain its maximum at a different distance. All displayed intensity maps, profiles, peak-intensity curves, FWHM values and transmission calculations still use the complete selected source model. **Model, mesh and diagnostics** also reports the highest full-source intensity among the displayed z samples; that sampled value is not a second iterative optimization.
 
-After the central-point search:
+**Detector region → Auto** uses the beam to select the sampled region.
 
 1. The axial display ROI follows the central-point peak intensity down to **Axial ROI intensity fraction**, default 0.2 of the numerical peak.
-2. The interval is sampled for visualization, with the numerical maximum inserted explicitly. **Displayed z samples** changes the visualization grid, independently of the preceding optimization.
+2. The interval is sampled on a uniform lattice anchored at the numerical maximum. **Target z sample count** controls this lattice independently of the preceding search.
 3. Significant transverse intensity across that interval defines a padded x/y ROI, with default threshold 0.01 of its maximum.
 
-Manual z bounds also bound the search. The analytical initial guess is clamped to them. **Peak search tolerance** controls the optimizer's axial tolerance.
+**Detector region → Manual** takes z bounds in mm from the CRL exit, and x/y bounds in µm from the optical axis. A 1D grid uses x alone. The automatic peak search is limited to the selected z interval, with its initial guess clamped to that interval. The uniform z lattice stays within the requested bounds. Fast selects native samples. Accurate evaluates the field on a local detector grid that can be shifted off axis. Metrics and plots use the selected transverse region. Transmission and effective aperture use the full exit field. In 2D the longitudinal map samples the middle y row of the region.
+
+In Python, set `scan_range_m=(zmin, zmax)` and `detector_roi_m=(xmin, xmax)` in 1D, or `detector_roi_m=((xmin, xmax), (ymin, ymax))` in 2D. API coordinates are in metres. **Peak search tolerance** controls the optimizer's axial tolerance.
 
 ## Calculation progress and time estimates
 
@@ -163,9 +167,9 @@ Use **Theme → Auto / Dark / Light** beside Compute. The complete form, tables,
 
 ### Setting physical grid steps
 
-Open **Sampling, ROI and search**. **Transverse grid control** offers Auto, Set spacing or Set point counts. Spacing targets are entered in nm; inactive counts/spacings keep their values but are ignored. Targets and fixed-count windows use the same readable-spacing policy; actual propagation counts and steps are reported beside the backend. Explicit spacing control has a 4096-point per-axis limit in 2D or 65536 in 1D; larger requests fail clearly rather than overriding the target silently. Existing explicit point-count overrides remain available.
+Open **Sampling and peak search**. **Transverse grid control** offers Auto, Set spacing or Set point counts. Spacing targets are entered in nm; inactive counts/spacings keep their values but are ignored. Targets and fixed-count windows use the same readable-spacing policy; actual propagation counts and steps are reported beside the backend. Explicit spacing control has a 4096-point per-axis limit in 2D or 65536 in 1D; larger requests fail clearly rather than overriding the target silently. Existing explicit point-count overrides remain available.
 
-**Axial grid control → Set spacing** enables Target Δz in mm. Auto uses the target sample count; Fast rounds the target spacing upward and Accurate downward to the preferred sequence **1, 2.5, 5 × a power of ten**. A manual target uses the nearest preferred spacing, e.g. 0.04 mm → 0.05 mm. The origin is the **full-precision numerical peak-intensity distance**, so $z_k=z_{\mathrm{peak}}+k\Delta z$. Only Δz is rounded; z values retain the computed offset. With a reference of **30.93 mm** and a step of **0.05 mm**, the grid includes **30.83, 30.88, 30.93, 30.98, 31.03 mm**. The code uses the unrounded reference, even when its displayed label has fewer decimals. ROI bounds expand outward on this anchored lattice, with nonnegative z. The maximum is 10001 displayed planes; the exact reference is a regular sample, not an extra point inserted between samples. Thus Δz is the real common spacing of every adjacent overview plane. Actual Δz and the number of planes appear beside the backend, with propagation and separate Accurate detector grids.
+**Axial grid control → Set spacing** enables Target Δz in mm. Auto uses the target sample count; Fast rounds the target spacing upward and Accurate downward to the preferred sequence **1, 2.5, 5 × a power of ten**. A manual target uses the nearest preferred spacing, e.g. 0.04 mm → 0.05 mm. The origin is the **full-precision numerical peak-intensity distance**, so $z_k=z_{\mathrm{peak}}+k\Delta z$. Only Δz is rounded; z values retain the computed offset. With a reference of **30.93 mm** and a step of **0.05 mm**, the grid includes **30.83, 30.88, 30.93, 30.98, 31.03 mm**. The code uses the unrounded reference, even when its displayed label has fewer decimals. Automatic bounds expand outward on this lattice with nonnegative z. Manual samples stay within the interval. The maximum is 10001 displayed planes; the exact reference is a regular sample, not an extra point inserted between samples. Thus Δz is the real common spacing of every adjacent overview plane. Actual Δz and the number of planes appear beside the backend, with propagation and separate Accurate detector grids.
 
 In the API use `grid_step_x_m`, `grid_step_y_m` and `scan_step_m`; a transverse step and point count for the same axis are mutually exclusive. `scan_points` is a target count rather than an exact count after rounding. `result.scan_step_m` and summary metadata `scan_grid_uniform` and `scan_anchor_m` describe the actual lattice. `peak_index` indexes the **exact numerical reference** in that lattice. `reference_metrics`, `best_intensity` and `fwhm_at_peak_m` refer to the exact optimized distance, evaluated independently of the lattice. Search history and exact-reference metrics therefore do not depend on the chosen display step.
 
