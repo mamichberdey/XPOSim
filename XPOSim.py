@@ -45,7 +45,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.23.0"
+__version__ = "0.24.0"
 
 
 __all__ = [
@@ -2738,6 +2738,7 @@ class CRLAnalyticalResult:
     web_transmission: float | None = None
     rocking_fwhm_rad: float | None = None
     _gaussian_coherence: _GaussianCoherence | None = field(default=None,repr=False)
+    kohn_effective_aperture_m: float | None = None
 
     def transverse_coherence_length_m(self,z_m: float) -> tuple[float, ...] | None:
         """Kohn's centred slit-pair coherence length on the focusing axes.
@@ -2807,7 +2808,34 @@ def _gaussian_rocking_fwhm(reference, count, *, circular):
     return float(2*np.sqrt(np.log(2)/attenuation)) if attenuation>0 else None
 
 
-def analyze_crl(configuration: CRLFocusConfig) -> CRLAnalyticalResult:
+def _kohn_effective_aperture(reference,cfg,gaussian_pupil):
+    """Integrate the point-source Gaussian model before web absorption."""
+    k,delta,beta=reference._require_optical_constants()
+    if beta==0 and not gaussian_pupil:
+        return float("inf")
+    inverse_distance=0. if cfg.source_distance_m is None else 1/cfg.source_distance_m
+    a=-1j*k*inverse_distance
+    amplitude=1.
+    circular=cfg.geometry=="two-dimensional"
+    disk_factor=np.sqrt(np.pi)/2 if circular else 1.
+    pupil=np.pi/(cfg.aperture_m*disk_factor)**2 if gaussian_pupil else 0.
+    lens=2*k*(beta+1j*delta)/cfg.radius_m
+    half_drift=.5j*reference.element_period/k
+    for i in range(cfg.n_elements):
+        drift=half_drift if i==0 else 2*half_drift
+        denominator=1+drift*a
+        amplitude/=abs(denominator)
+        a=a/denominator+lens
+        if i==0:
+            a+=pupil
+    denominator=1+half_drift*a
+    amplitude/=abs(denominator)
+    a/=denominator
+    free_space=(1+cfg.n_elements*reference.element_period*inverse_distance)
+    return float(free_space*amplitude*np.sqrt(np.pi/a.real)/disk_factor)
+
+
+def analyze_crl(configuration: CRLFocusConfig, *, kohn_gaussian_pupil: bool=False) -> CRLAnalyticalResult:
     """Return cheap analytical material/lens parameters for any material mode.
 
     Focal and image distances use the CRL exit reference. Counts and geometry
@@ -2815,6 +2843,11 @@ def analyze_crl(configuration: CRLFocusConfig) -> CRLAnalyticalResult:
     For N above the external-focus limit, distances are None while material
     constants, maximum N and total length remain available. A finite source
     can produce a negative (virtual) or infinite image distance.
+
+    kohn_effective_aperture_m uses a central point source (or its collimated
+    limit), broad angular emission and excludes web absorption. By default
+    it follows the calculator's g=0 convention. Set kohn_gaussian_pupil for
+    g=1. Circular lenses use the area-equivalent linear-to-diameter conversion.
     """
     if not isinstance(configuration,CRLFocusConfig):
         raise TypeError("Pass a CRLFocusConfig instance.")
@@ -2848,7 +2881,8 @@ def analyze_crl(configuration: CRLFocusConfig) -> CRLAnalyticalResult:
                                       circular=cfg.geometry=="two-dimensional")
     return CRLAnalyticalResult(float(delta),float(beta),focal,image,maximum,
         float(reference.element_period*cfg.n_elements),bool(external),bool(real),magnification,
-        reference.element_period,web_transmission,rocking_fwhm,_gaussian_coherence_exit(reference,cfg))
+        reference.element_period,web_transmission,rocking_fwhm,_gaussian_coherence_exit(reference,cfg),
+        _kohn_effective_aperture(reference,cfg,kohn_gaussian_pupil))
 
 
 @dataclass
@@ -3290,6 +3324,7 @@ class CRLFocusResult:
     _session: _CRLFocusSession
     reference_metrics: BeamMetrics | None = None
     reference_point_metrics: BeamMetrics | None = None
+    display_signal_bounds_m: tuple[tuple[float,float],tuple[float,float]] | None = None
 
     @property
     def peak_z_m(self):
@@ -3763,10 +3798,22 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         lines.append(_to_numpy(line).copy())
     reporter.start("finalizing",detail="Finalizing transverse ROI and beam metrics")
     x_slice=slice(None)
+    display_signal_bounds=None
     if not manual_detector:
         x_full,y_full=session.detector_coordinates(session.measurement_slices)
-        x_slice=_display_slice(_to_numpy(x_full),_to_numpy(transverse_x),cfg.transverse_roi_level)
-        y_slice=None if y_full is None else _display_slice(_to_numpy(y_full),_to_numpy(transverse_y),cfg.transverse_roi_level)
+        x_full,profile_x=_to_numpy(x_full),_to_numpy(transverse_x)
+        x_slice=_display_slice(x_full,profile_x,cfg.transverse_roi_level)
+        y_slice=None
+        if y_full is not None:
+            y_full,profile_y=_to_numpy(y_full),_to_numpy(transverse_y)
+            y_slice=_display_slice(y_full,profile_y,cfg.transverse_roi_level)
+            if cfg.geometry=="one-dimensional":
+                def signal_bounds(axis,profile,step):
+                    crop=_display_slice(axis,profile,cfg.transverse_roi_level,margin=.04)
+                    values=axis[crop]
+                    return float(values[0]-step/2),float(values[-1]+step/2)
+                display_signal_bounds=(signal_bounds(x_full,profile_x,detector.dx),
+                                       signal_bounds(y_full,profile_y,detector.dy))
         session.slices=(x_slice,) if grid.dimension==1 else (y_slice,x_slice)
     best=session.plane(numerical.z_m)
     point_metrics=(session.metrics(session.coherent_intensity(numerical.z_m))
@@ -3814,6 +3861,7 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         best.x_m,best.y_m,best.intensity,np.stack(lines)[:,x_slice].copy(),
         session.transmission,float(crl.delta),float(crl.beta),grid.dx,grid.shape,
         None if grid.dimension==1 else grid.dy,image.shape,detector.dx,
-        None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics,point_metrics)
+        None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics,point_metrics,
+        display_signal_bounds)
     reporter.finish()
     return result
