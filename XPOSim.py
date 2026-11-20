@@ -45,7 +45,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.20.0"
+__version__ = "0.21.0"
 
 
 __all__ = [
@@ -598,17 +598,20 @@ class _InverseFourierAxis:
 
 class _DetectorFourierPlan:
     """Evaluate the propagated complex Fourier field on a dense local grid."""
-    def __init__(self,grid,detector):
+    def __init__(self,grid,detector,offsets=(0.0,0.0)):
         self.grid=grid
         self.detector=detector
         xp=grid.xp
         x=detector.x if grid.dimension==1 else detector.x_axis
         qx=grid.qx if grid.dimension==1 else grid.qx_axis
-        self.x=_InverseFourierAxis(grid.nx,_to_python_float(qx[0]),grid.dqx,x,xp)
+        self.output_x=x if offsets[0]==0 else x+offsets[0]
+        self.x=_InverseFourierAxis(grid.nx,_to_python_float(qx[0]),grid.dqx,self.output_x,xp)
         self.y=None
+        self.output_y=None
         if grid.dimension==2:
+            self.output_y=detector.y_axis if offsets[1]==0 else detector.y_axis+offsets[1]
             self.y=_InverseFourierAxis(grid.ny,_to_python_float(grid.qy_axis[0]),
-                                      grid.dqy,detector.y_axis,xp)
+                                      grid.dqy,self.output_y,xp)
 
     def _inverse(self,work):
         work=self.x.apply(work,axis=-1)
@@ -2157,14 +2160,15 @@ def full_width_half_max(intensity_array: Any, coordinate: Any) -> float | None:
     return _optional_float(_to_python_float(_widths_batch(arr[None, :], coord)[0]))
 
 
-def _roi_slices(grid: BaseGrid, roi: Any) -> tuple[slice, ...]:
+def _roi_slices(grid: BaseGrid, roi: Any, *, coordinates=None) -> tuple[slice, ...]:
     """Resolve physical bounds once using only 1D coordinate axes."""
     if roi is None:
         return (slice(None),) * grid.dimension
     if not isinstance(roi, Sequence) or len(roi) != 2:
         raise ValueError("ROI must be (xmin, xmax) or ((xmin, xmax), (ymin, ymax)).")
     bounds = [roi] if grid.dimension == 1 else [roi[1], roi[0]]
-    axes = [grid.x] if grid.dimension == 1 else [grid.y_axis, grid.x_axis]
+    x, y = _coordinates_for_slices(grid, (slice(None),)*grid.dimension) if coordinates is None else coordinates
+    axes = [x] if grid.dimension == 1 else [y, x]
     result = []
     for axis, limits in zip(axes, bounds):
         limits = np.asarray(limits, dtype=float)
@@ -2204,7 +2208,8 @@ def _beam_metrics_batch(fields: Any, grid: BaseGrid, slices: tuple[slice, ...],
 
 
 def _intensity_metrics_batch(values: Any, grid: BaseGrid, slices: tuple[slice, ...],
-                             divergence_value: Any = None, *, measure_y_fwhm: bool = True) -> list[BeamMetrics]:
+                             divergence_value: Any = None, *, measure_y_fwhm: bool = True,
+                             coordinates=None) -> list[BeamMetrics]:
     """Measure already-incoherent intensities without creating artificial fields."""
     xp = grid.xp
     batch = values.shape[0]
@@ -2213,7 +2218,7 @@ def _intensity_metrics_batch(values: Any, grid: BaseGrid, slices: tuple[slice, .
     peaks = xp.argmax(flat, axis=1)
     maxima = flat[rows, peaks]
     finite = xp.any(xp.isfinite(values).reshape(batch, -1), axis=1)
-    x_axis, y_axis = _coordinates_for_slices(grid, slices)
+    x_axis, y_axis = _coordinates_for_slices(grid, slices) if coordinates is None else coordinates
     if grid.dimension == 1:
         widths = _widths_batch(values, x_axis)
         table = _to_numpy(xp.stack((maxima, x_axis[peaks], widths, finite), axis=1))
@@ -2541,6 +2546,9 @@ class CRLFocusConfig:
     scan_points is a target count. The z ROI expands outward to that uniform
     lattice anchored at the full-precision numerical peak distance. Peak
     optimization remains independent of the display spacing.
+    detector_roi_m sets transverse detector bounds, (xmin, xmax) in 1D or
+    ((xmin, xmax), (ymin, ymax)) in 2D. With a manual detector ROI and
+    scan_range_m, every sampled z stays inside the requested interval.
     """
     energy_kev: float = 12.0
     material_formula: str | None = "Be"
@@ -2576,6 +2584,7 @@ class CRLFocusConfig:
     grid_step_x_m: float | None = None
     grid_step_y_m: float | None = None
     scan_step_m: float | None = None
+    detector_roi_m: tuple[float,float] | tuple[tuple[float,float],tuple[float,float]] | None = None
 
     def __post_init__(self):
         aliases = {"cylindrical": "one-dimensional", "axisymmetric": "two-dimensional"}
@@ -2660,6 +2669,17 @@ class CRLFocusConfig:
             bounds=_validated_distances(self.scan_range_m,nonnegative=True)
             if bounds.size!=2 or bounds[1]<=bounds[0]: raise ValueError("Invalid z ROI.")
             object.__setattr__(self,"scan_range_m",tuple(map(float,bounds)))
+        if self.detector_roi_m is not None:
+            expected=(2,) if dimension==1 else (2,2)
+            try:
+                limits=np.asarray(self.detector_roi_m,dtype=float)
+            except (TypeError,ValueError):
+                raise ValueError("Detector ROI needs a finite minimum and maximum for each transverse axis.") from None
+            if (limits.shape!=expected or not np.all(np.isfinite(limits)) or
+                    np.any(~np.isfinite(np.diff(limits))) or np.any(np.diff(limits)<=0)):
+                raise ValueError("Detector ROI needs a finite minimum below the maximum for each transverse axis.")
+            bounds=tuple(map(float,limits)) if dimension==1 else tuple(tuple(map(float,pair)) for pair in limits)
+            object.__setattr__(self,"detector_roi_m",bounds)
         if self.material_delta is None:
             self.create_material().composition()
 
@@ -2778,6 +2798,7 @@ class _CRLFocusSession:
         self._last_z,self._last_image=None,None
         self._peak_cache={}
         self.slices=(slice(None),)*grid.dimension
+        self.measurement_slices=self.slices
         self.detector_grid=grid
         self._zoom_plan=None
         self.diagnostics=[]
@@ -2860,6 +2881,55 @@ class _CRLFocusSession:
         self._last_z,self._last_image=None,None
         self._peak_cache.clear()
         self.slices=(slice(None),)*detector.dimension
+        self.measurement_slices=self.slices
+
+    def configure_manual_detector(self,analytic,z_bounds):
+        """Resolve manual detector bounds on native or local Fourier samples."""
+        cfg=self.cfg
+        if cfg.accuracy=="refined":
+            limits=(cfg.detector_roi_m,) if self.grid.dimension==1 else cfg.detector_roi_m
+            wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
+            factor=.886 if cfg.geometry=="one-dimensional" else 1.028
+            target=factor*wavelength*analytic/(24*cfg.aperture_m)
+            targets=[target]*self.grid.dimension
+            if self.grid.dimension==2 and cfg.geometry=="one-dimensional":
+                targets[1]=min(cfg.structure_depth_m/192,np.sqrt(wavelength*analytic)/24)
+            padding=np.zeros(self.grid.dimension)
+            if cfg.source_type=="gaussian" and cfg.source_method=="convolution":
+                max_scale=np.max(np.abs([self.magnification(z) for z in z_bounds]),axis=0)
+                padding=5*max_scale*np.asarray(self.source_sigma[:self.grid.dimension])
+            native_half_widths=[(self.grid.nx-1)*self.grid.dx/2]
+            if self.grid.dimension==2:
+                native_half_widths.append((self.grid.ny-1)*self.grid.dy/2)
+            offsets,steps,counts=[],[],[]
+            for (lo,hi),target,pad,native_half in zip(limits,targets,padding,native_half_widths):
+                left=max(lo-pad,-native_half)
+                right=min(hi+pad,native_half)
+                span=right-left
+                step=_nice_grid_step(min(target,(hi-lo)/8),"down")
+                if span/step>2048:
+                    step=_nice_grid_step(span/2048,"up")
+                    self.diagnostics.append("detector_cap: Manual detector sampling reached its cap. A narrower ROI can improve sampling.")
+                offsets.append(left+span/2)
+                steps.append(step)
+                counts.append(min(2049,int(np.floor(span/step+1e-10))+1))
+            self.detector_grid=(Grid1D(steps[0],counts[0],backend=self.grid.backend)
+                if self.grid.dimension==1 else
+                Grid2D(*steps,*counts,backend=self.grid.backend))
+            self._zoom_plan=_DetectorFourierPlan(self.grid,self.detector_grid,offsets)
+            self._last_z,self._last_image=None,None
+        full=(slice(None),)*self.grid.dimension
+        self.measurement_slices=_roi_slices(
+            self.detector_grid,cfg.detector_roi_m,coordinates=self.detector_coordinates(full))
+        if any(region.stop-region.start<3 for region in self.measurement_slices):
+            raise ValueError("Manual detector ROI needs at least three samples along each axis. Widen it or refine the grid.")
+        self.slices=self.measurement_slices
+
+    def detector_coordinates(self,slices):
+        if self._zoom_plan is None:
+            return _coordinates_for_slices(self.detector_grid,slices)
+        y=None if self.grid.dimension==1 else self._zoom_plan.output_y[slices[0]]
+        return self._zoom_plan.output_x[slices[-1]],y
 
     def _prepare_mode_cache(self, progress):
         """Store each exit spectrum once for the scan and later detector planes."""
@@ -3037,18 +3107,18 @@ class _CRLFocusSession:
         return self._peak_cache[z]
 
     def metrics(self,image):
-        return _intensity_metrics_batch(image[None,...],self.detector_grid,
-                       (slice(None),)*self.grid.dimension,
-                       measure_y_fwhm=self.cfg.geometry=="two-dimensional")[0]
+        region=self.measurement_slices
+        return _intensity_metrics_batch(image[region][None,...],self.detector_grid,region,
+                       measure_y_fwhm=self.cfg.geometry=="two-dimensional",
+                       coordinates=self.detector_coordinates(region))[0]
 
     def plane(self,z):
         image=self.intensity(z)
         metrics=self.metrics(image)
-        x=self.detector_grid.x if self.grid.dimension==1 else self.detector_grid.x_axis
-        y=None if self.grid.dimension==1 else self.detector_grid.y_axis
+        x,y=self.detector_coordinates(self.slices)
         return CRLPlaneResult(float(z),_to_numpy(image[self.slices]).copy(),
-            _to_numpy(x[self.slices[-1]]).copy(),
-            None if y is None else _to_numpy(y[self.slices[0]]).copy(),
+            _to_numpy(x).copy(),
+            None if y is None else _to_numpy(y).copy(),
             metrics,self.magnification(z))
 
 
@@ -3174,6 +3244,7 @@ class CRLFocusResult:
                 "peak_z_m":self.peak_z_m,"fwhm_at_peak_m":self.fwhm_at_peak_m,
                 "peak_search_basis":self.peak_search_basis,
                 "axial_roi_basis":"manual" if self.configuration.scan_range_m is not None else self.peak_search_basis,
+                "transverse_roi_basis":"manual" if self.configuration.detector_roi_m is not None else "auto",
                 "peak_search_initial_z_m":self.numerical_peak.history[0][0],
                 "sampled_peak_z_m":self.sampled_peak_z_m,
                 "scan_step_m":self.scan_step_m,"scan_grid_uniform":True,
@@ -3272,8 +3343,8 @@ def _focus_axis_sampling(width,required,count,requested_step,cap,minimum):
     return int(n),float(step)
 
 
-def _uniform_scan_positions(bounds,target_count,requested_step,accuracy,anchor_m):
-    """Expand the ROI on z=anchor+k*step, retaining the exact optimizer result.
+def _uniform_scan_positions(bounds,target_count,requested_step,accuracy,anchor_m,*,within_bounds=False):
+    """Sample z=anchor+k*step, retaining the exact optimizer result.
 
     Only the spacing is rounded. Absolute coordinates inherit the full
     precision of anchor_m; the numerical reference is a regular lattice point,
@@ -3285,6 +3356,9 @@ def _uniform_scan_positions(bounds,target_count,requested_step,accuracy,anchor_m
     step=_nice_scan_step(requested_step) if requested_step is not None else _nice_scan_step(
         target,"down" if accuracy=="refined" else "up")
     def indices(spacing):
+        if within_bounds:
+            return (int(np.ceil((bounds[0]-anchor_m)/spacing)),
+                    int(np.floor((bounds[1]-anchor_m)/spacing)))
         start=max(int(np.ceil(-anchor_m/spacing)),
                   int(np.floor((bounds[0]-anchor_m)/spacing+1e-10)))
         stop=int(np.ceil((bounds[1]-anchor_m)/spacing-1e-10))
@@ -3300,6 +3374,10 @@ def _uniform_scan_positions(bounds,target_count,requested_step,accuracy,anchor_m
     if count>10001:
         raise ValueError(f"The requested z spacing needs {count} planes; increase it to use at most 10001.")
     positions=anchor_m+(start+np.arange(count,dtype=float))*step
+    if within_bounds:
+        positions=positions[(positions>=bounds[0])&(positions<=bounds[1])]
+        if positions.size<2:
+            raise ValueError("Manual z bounds contain fewer than two planes. Reduce the z spacing or widen the interval.")
     # Cancelled floating-point roundoff at z=0 must not reach the propagator
     # as a tiny negative distance. This does not round the lattice origin.
     if positions[0]<0 and abs(positions[0])<=8*np.spacing(max(anchor_m,step)):
@@ -3337,6 +3415,11 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None):
     width_x=cfg.window_factor*cfg.aperture_m
     depth=cfg.aperture_m if cfg.geometry=="two-dimensional" else cfg.structure_depth_m
     width_y=None if cfg.grid_dimension==1 else cfg.window_factor*depth
+    if cfg.detector_roi_m is not None:
+        limits=(cfg.detector_roi_m,) if cfg.grid_dimension==1 else cfg.detector_roi_m
+        width_x=max(width_x,2.1*max(map(abs,limits[0])))
+        if cfg.grid_dimension==2:
+            width_y=max(width_y,2.1*max(map(abs,limits[1])))
     enlarged=[]
     probe=None
     for attempt in range(4):
@@ -3488,40 +3571,44 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         search_session=None  # Release the central detector before source-mode caching.
         reporter.start("source_preparation",detail="Preparing the full Gaussian source after central-point search")
         session=_CRLFocusSession(cfg,grid,crl,coherent.incident,coherent_state=coherent,progress=reporter)
-        if cfg.accuracy=="refined":
+        if cfg.accuracy=="refined" and cfg.detector_roi_m is None:
             reporter.start("detector",detail="Preparing the full Gaussian-source detector")
             session.configure_refined_detector(analytic)
         messages.append("central_source_reference: Peak search and automatic z ROI use the central point; displayed intensities and widths include the full Gaussian source. Its maximum can occur at a different z.")
     else:
         session=search_session
     coherent=None
+    manual_detector=cfg.detector_roi_m is not None
+    if manual_detector:
+        reporter.start("detector",detail="Preparing the manual detector region")
+        session.configure_manual_detector(analytic,bounds)
     detector=session.detector_grid
     messages.extend(session.diagnostics)
-    positions=_uniform_scan_positions(bounds,cfg.scan_points,cfg.scan_step_m,cfg.accuracy,numerical.z_m)
+    positions=_uniform_scan_positions(bounds,cfg.scan_points,cfg.scan_step_m,cfg.accuracy,numerical.z_m,
+                                     within_bounds=manual_detector and cfg.scan_range_m is not None)
     metrics=[]
     lines=[]
     transverse_x=xp.zeros(detector.nx,dtype=xp.float64)
     transverse_y=None if grid.dimension==1 else xp.zeros(detector.ny,dtype=xp.float64)
     reporter.start("sampling",len(positions),"Calculating detector planes and beam metrics")
     for z,image in session.iter_intensities(positions,reporter):
-        metric=session.metrics(image)
-        metrics.append(metric)
-        if grid.dimension==1:
-            line=image
-            transverse_x=xp.maximum(transverse_x,image)
-        else:
-            flat=xp.argmax(image)
-            j,i=flat//detector.nx,flat%detector.nx
-            line=image[detector.ny//2,:]
-            transverse_x=xp.maximum(transverse_x,xp.max(image,axis=0))
-            transverse_y=xp.maximum(transverse_y,xp.max(image,axis=1))
+        metrics.append(session.metrics(image))
+        region=image[session.measurement_slices]
+        line=region if grid.dimension==1 else region[region.shape[0]//2,:]
+        if not manual_detector:
+            if grid.dimension==1:
+                transverse_x=xp.maximum(transverse_x,image)
+            else:
+                transverse_x=xp.maximum(transverse_x,xp.max(image,axis=0))
+                transverse_y=xp.maximum(transverse_y,xp.max(image,axis=1))
         lines.append(_to_numpy(line).copy())
     reporter.start("finalizing",detail="Finalizing transverse ROI and beam metrics")
-    x_full=_to_numpy(detector.x if grid.dimension==1 else detector.x_axis)
-    x_slice=_display_slice(x_full,_to_numpy(transverse_x),cfg.transverse_roi_level)
-    y_full=None if grid.dimension==1 else _to_numpy(detector.y_axis)
-    y_slice=None if grid.dimension==1 else _display_slice(y_full,_to_numpy(transverse_y),cfg.transverse_roi_level)
-    session.slices=(x_slice,) if grid.dimension==1 else (y_slice,x_slice)
+    x_slice=slice(None)
+    if not manual_detector:
+        x_full,y_full=session.detector_coordinates(session.measurement_slices)
+        x_slice=_display_slice(_to_numpy(x_full),_to_numpy(transverse_x),cfg.transverse_roi_level)
+        y_slice=None if y_full is None else _display_slice(_to_numpy(y_full),_to_numpy(transverse_y),cfg.transverse_roi_level)
+        session.slices=(x_slice,) if grid.dimension==1 else (y_slice,x_slice)
     best=session.plane(numerical.z_m)
     best_index=int(np.argmin(abs(positions-numerical.z_m)))
     widths=np.asarray([np.nan if m.fwhm is None else m.fwhm for m in metrics],dtype=float)
@@ -3537,17 +3624,22 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         slope+=crl.k*cfg.aperture_m/(2*cfg.source_distance_m)*grid.dx
     if slope>np.pi/2:
         messages.append("phase_sampling: Phase changes too rapidly between x samples; refine the grid.")
-    image=session.intensity(numerical.z_m)
-    rim_x=max(1,detector.nx//20)
+    image=session.intensity(numerical.z_m)[session.measurement_slices]
+    rim_x=max(1,image.shape[-1]//20)
     if grid.dimension==1:
         edge=xp.sum(image[:rim_x])+xp.sum(image[-rim_x:])
     else:
-        rim_y=max(1,detector.ny//20)
+        rim_y=max(1,image.shape[0]//20)
         edge=(xp.sum(image[:rim_y])+xp.sum(image[-rim_y:])+
               xp.sum(image[rim_y:-rim_y,:rim_x])+xp.sum(image[rim_y:-rim_y,-rim_x:]))
     total=_to_python_float(xp.sum(image))
     if total>0 and _to_python_float(edge)/total>1e-3:
-        messages.append(("detector_boundary: Significant power reaches the refined detector ROI edge." if cfg.accuracy=="refined" else "window_boundary: Significant power reaches the numerical window edge; enlarge the window at fixed step."))
+        if manual_detector:
+            messages.append("detector_boundary: Significant intensity reaches the edge of the manual detector ROI.")
+        elif cfg.accuracy=="refined":
+            messages.append("detector_boundary: Significant power reaches the refined detector ROI edge.")
+        else:
+            messages.append("window_boundary: Significant power reaches the numerical window edge; enlarge the window at fixed step.")
     if session.transmission<1e-12:
         messages.append("low_transmission: The transmitted intensity is very small.")
     if cfg.source_type=="gaussian" and cfg.source_method=="points":
@@ -3560,7 +3652,7 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         positions,np.asarray([m.max_intensity for m in metrics]),widths,best_index,
         best.x_m,best.y_m,best.intensity,np.stack(lines)[:,x_slice].copy(),
         session.transmission,float(crl.delta),float(crl.beta),grid.dx,grid.shape,
-        None if grid.dimension==1 else grid.dy,detector.shape,detector.dx,
+        None if grid.dimension==1 else grid.dy,image.shape,detector.dx,
         None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics)
     reporter.finish()
     return result
