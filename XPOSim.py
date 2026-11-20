@@ -45,7 +45,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 
 __all__ = [
@@ -2712,6 +2712,36 @@ class CRLAnalyticalResult:
     external_focus: bool
     real_image: bool
     magnification_at_image: tuple[float | None, ...] = ()
+    element_length_m: float | None = None
+    web_transmission: float | None = None
+    rocking_fwhm_rad: float | None = None
+
+
+def _gaussian_rocking_fwhm(reference, count, *, circular):
+    """Angular transmission FWHM for a tilted plane wave with Gaussian pupil.
+
+    Propagate the complex quadratic coefficient a and the tilt coefficient b
+    of exp(-a*x²/2 + b*theta*x) between element centres. Free propagation
+    conserves power. Each quadratic absorber contributes a nonnegative term
+    to K in T(theta)/T(0) = exp(-K*theta²).
+    """
+    k, delta, beta=reference._require_optical_constants()
+    if beta==0:
+        return None
+    aperture=reference.aperture*(np.sqrt(np.pi)/2 if circular else 1.0)
+    a=complex(np.pi/aperture**2)
+    b=1j*k
+    focusing=2*k*(beta+1j*delta)/reference.radius
+    drift=1j*reference.element_period/k
+    denominator=1+.5*drift*a
+    a,b=a/denominator,b/denominator
+    attenuation=0.0
+    for _ in range(count):
+        attenuation+=(focusing.real/(a.real+focusing.real))*b.real**2/a.real
+        a+=focusing
+        denominator=1+drift*a
+        a,b=a/denominator,b/denominator
+    return float(2*np.sqrt(np.log(2)/attenuation)) if attenuation>0 else None
 
 
 def analyze_crl(configuration: CRLFocusConfig) -> CRLAnalyticalResult:
@@ -2750,8 +2780,12 @@ def analyze_crl(configuration: CRLFocusConfig) -> CRLAnalyticalResult:
             values.append(lens.source_magnification(image,cfg.source_distance_m,
                 focusing=cfg.geometry=="two-dimensional"))
         magnification=tuple(values)
+    web_transmission=float(np.exp(-2*reference.k*beta*cfg.n_elements*cfg.bridge_thickness_m))
+    rocking_fwhm=_gaussian_rocking_fwhm(reference,cfg.n_elements,
+                                      circular=cfg.geometry=="two-dimensional")
     return CRLAnalyticalResult(float(delta),float(beta),focal,image,maximum,
-        float(reference.element_period*cfg.n_elements),bool(external),bool(real),magnification)
+        float(reference.element_period*cfg.n_elements),bool(external),bool(real),magnification,
+        reference.element_period,web_transmission,rocking_fwhm)
 
 
 @dataclass
@@ -3049,12 +3083,19 @@ class _CRLFocusSession:
                 image+=self.xp.sum(abs(fields)**2*weights[(slice(None),*extra)],axis=0)
                 del fields,spectra
         else:
-            field=(self._zoom_plan.propagate(self.spectrum,z,self.crl.k) if self._zoom_plan is not None else
-                   (self.exit_field if z==0 else self.grid._propagate_spectrum(self.spectrum,np.asarray([z]),self.crl.k)[0]))
-            image=abs(field)**2
-            image=self._blur(image,z)
+            image=self._blur(self.coherent_intensity(z),z)
         self._last_z,self._last_image=z,image
         return image
+
+    def coherent_intensity(self,z):
+        """Evaluate the central coherent field on the current detector."""
+        if self._zoom_plan is not None:
+            field=self._zoom_plan.propagate(self.spectrum,z,self.crl.k)
+        elif z==0:
+            field=self.exit_field
+        else:
+            field=self.grid._propagate_spectrum(self.spectrum,np.asarray([z]),self.crl.k)[0]
+        return abs(field)**2
 
     def _blur(self,image,z):
         if self.cfg.source_type!="gaussian":
@@ -3122,6 +3163,29 @@ class _CRLFocusSession:
             metrics,self.magnification(z))
 
 
+def _depth_of_focus_bounds(positions, widths):
+    """Interpolate the two crossings around the sampled FWHM minimum."""
+    valid=np.isfinite(widths)&(widths>0)
+    if not valid.any():
+        return None
+    minimum=int(np.argmin(np.where(valid,widths,np.inf)))
+    level=np.sqrt(2)*widths[minimum]
+    crossings=[]
+    for direction in (-1,1):
+        inside=minimum
+        outside=inside+direction
+        while 0<=outside<len(widths) and valid[outside]:
+            if widths[outside]>=level:
+                crossing=np.interp(level,widths[[inside,outside]],positions[[inside,outside]])
+                crossings.append(float(crossing))
+                break
+            inside=outside
+            outside+=direction
+        else:
+            return None
+    return tuple(crossings)
+
+
 @dataclass
 class CRLFocusResult:
     """Display data and a live session for arbitrary z planes.
@@ -3162,6 +3226,7 @@ class CRLFocusResult:
     diagnostics: tuple[str,...]
     _session: _CRLFocusSession
     reference_metrics: BeamMetrics | None = None
+    reference_point_metrics: BeamMetrics | None = None
 
     @property
     def peak_z_m(self):
@@ -3198,6 +3263,33 @@ class CRLFocusResult:
                           else self.fwhm_m[self.peak_index])
         widths=tuple(None if v is None else _optional_float(v) for v in value)
         return widths[0] if self.configuration.grid_dimension==1 else widths
+
+    @property
+    def depth_of_focus_bounds_m(self):
+        """Intervals where the width is at most sqrt(2) times its sampled minimum."""
+        widths=np.reshape(self.fwhm_m,(len(self.z_m),-1))
+        return tuple(_depth_of_focus_bounds(self.z_m,widths[:,i]) for i in range(len(self.fwhm_axes)))
+
+    @property
+    def depth_of_focus_m(self):
+        """One axial interval length in metres per focusing axis, or None if clipped."""
+        return tuple(None if bounds is None else bounds[1]-bounds[0] for bounds in self.depth_of_focus_bounds_m)
+
+    @property
+    def point_source_fwhm_at_peak_m(self):
+        """Central-point widths at the same detector plane as fwhm_at_peak_m."""
+        if self.reference_point_metrics is None:
+            return None
+        return tuple(np.atleast_1d(self.reference_point_metrics.fwhm)[:len(self.fwhm_axes)])
+
+    @property
+    def source_broadening_factor(self):
+        """Full-source FWHM divided by central-point FWHM on each focusing axis."""
+        point=self.point_source_fwhm_at_peak_m
+        if point is None:
+            return None
+        return tuple(None if w is None or p is None or p<=0 else float(w/p)
+                     for w,p in zip(np.atleast_1d(self.fwhm_at_peak_m),point))
 
     @property
     def scan_step_m(self):
@@ -3242,6 +3334,10 @@ class CRLFocusResult:
                 "backend":self.backend,"analytical_image_distance_m":self.analytical_image_distance_m,
                 "collimated_focus_m":self.collimated_focus_m,
                 "peak_z_m":self.peak_z_m,"fwhm_at_peak_m":self.fwhm_at_peak_m,
+                "depth_of_focus_m":self.depth_of_focus_m,
+                "depth_of_focus_bounds_m":self.depth_of_focus_bounds_m,
+                "point_source_fwhm_at_peak_m":self.point_source_fwhm_at_peak_m,
+                "source_broadening_factor":self.source_broadening_factor,
                 "peak_search_basis":self.peak_search_basis,
                 "axial_roi_basis":"manual" if self.configuration.scan_range_m is not None else self.peak_search_basis,
                 "transverse_roi_basis":"manual" if self.configuration.detector_roi_m is not None else "auto",
@@ -3610,6 +3706,8 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         y_slice=None if y_full is None else _display_slice(_to_numpy(y_full),_to_numpy(transverse_y),cfg.transverse_roi_level)
         session.slices=(x_slice,) if grid.dimension==1 else (y_slice,x_slice)
     best=session.plane(numerical.z_m)
+    point_metrics=(session.metrics(session.coherent_intensity(numerical.z_m))
+                   if cfg.source_type=="gaussian" else None)
     best_index=int(np.argmin(abs(positions-numerical.z_m)))
     widths=np.asarray([np.nan if m.fwhm is None else m.fwhm for m in metrics],dtype=float)
     active_count=len(("x","y") if cfg.geometry=="two-dimensional" else ("x",))
@@ -3653,6 +3751,6 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         best.x_m,best.y_m,best.intensity,np.stack(lines)[:,x_slice].copy(),
         session.transmission,float(crl.delta),float(crl.beta),grid.dx,grid.shape,
         None if grid.dimension==1 else grid.dy,image.shape,detector.dx,
-        None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics)
+        None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics,point_metrics)
     reporter.finish()
     return result
