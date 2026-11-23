@@ -6,6 +6,7 @@ import unittest
 import numpy as np
 
 from XPOSim import CRL, CRLFocusConfig, CRLStackConfig, Grid2D, analyze_crossed_crl, estimate_crl_focus
+from XPOSim import _find_equal_fwhm_plane
 
 
 class CrossedCRLTests(unittest.TestCase):
@@ -80,6 +81,40 @@ class CrossedCRLTests(unittest.TestCase):
         summary = result.summary()
         self.assertEqual(summary["distance_reference"], "y CRL exit")
         self.assertTrue(summary["crossed_alignment"]["aligned"])
+
+    def test_equal_fwhm_refines_the_crossing_nearest_the_intensity_peak(self):
+        z = np.linspace(0.01, 0.05, 6)
+
+        def measure(distance):
+            return 1e-6 * (1 + 4000 * (distance - .021) * (distance - .038)), 1e-6
+
+        widths = np.array([measure(distance) for distance in z])
+        for reference, expected in ((.020, .021), (.043, .038)):
+            with self.subTest(reference=reference):
+                plane = _find_equal_fwhm_plane(z, widths, reference, measure)
+                self.assertAlmostEqual(plane.z_m, expected, places=9)
+                self.assertAlmostEqual(plane.fwhm_x_m, plane.fwhm_y_m, places=12)
+
+    def test_equal_fwhm_handles_tangency_and_rejects_unresolved_widths(self):
+        z = np.linspace(.01, .05, 5)
+
+        def tangent(distance):
+            return 1e-6 * (1 + 5000 * (distance - .025)**2), 1e-6
+
+        widths = np.array([tangent(distance) for distance in z])
+        plane = _find_equal_fwhm_plane(z, widths, .031, tangent)
+        self.assertAlmostEqual(plane.z_m, .025, places=8)
+        widths[2] = np.nan
+        self.assertIsNone(_find_equal_fwhm_plane(z, widths, .031, tangent))
+
+    def test_equal_fwhm_rejects_a_lobe_switch_without_an_actual_match(self):
+        z = np.linspace(.01, .05, 5)
+
+        def discontinuity(distance):
+            return (1.2e-6 if distance < .035 else .8e-6), 1e-6
+
+        widths = np.array([discontinuity(distance) for distance in z])
+        self.assertIsNone(_find_equal_fwhm_plane(z, widths, .03, discontinuity))
 
 
 if __name__ == "__main__":

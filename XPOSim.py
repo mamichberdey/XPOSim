@@ -45,7 +45,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.25.0"
+__version__ = "0.26.0"
 
 
 __all__ = [
@@ -79,6 +79,7 @@ __all__ = [
     "CRLStackConfig",
     "CRLAnalyticalResult",
     "CrossedCRLAnalysis",
+    "EqualFWHMPlane",
     "analyze_crl",
     "analyze_crossed_crl",
     "CRLFocusResult",
@@ -3471,11 +3472,12 @@ class _CRLFocusSession:
                        measure_y_fwhm=len(self.cfg.focusing_axes)==2,
                        coordinates=self.detector_coordinates(region))[0]
 
-    def plane(self,z):
+    def plane(self,z,*,full=False):
         image=self.intensity(z)
         metrics=self.metrics(image)
-        x,y=self.detector_coordinates(self.slices)
-        return CRLPlaneResult(float(z),_to_numpy(image[self.slices]).copy(),
+        region=self.measurement_slices if full else self.slices
+        x,y=self.detector_coordinates(region)
+        return CRLPlaneResult(float(z),_to_numpy(image[region]).copy(),
             _to_numpy(x).copy(),
             None if y is None else _to_numpy(y).copy(),
             metrics,self.magnification(z))
@@ -3502,6 +3504,92 @@ def _depth_of_focus_bounds(positions, widths):
         else:
             return None
     return tuple(crossings)
+
+
+@dataclass(frozen=True)
+class EqualFWHMPlane:
+    """A numerical width match, with z measured from the second CRL exit."""
+
+    z_m: float
+    fwhm_x_m: float
+    fwhm_y_m: float
+
+    @property
+    def mean_fwhm_m(self) -> float:
+        return (self.fwhm_x_m + self.fwhm_y_m) / 2
+
+
+def _find_equal_fwhm_plane(z_values, widths, reference_z, measure, *, max_evaluations=48):
+    """Refine sampled crossings and tangencies using the full-source intensity."""
+    from scipy.optimize import brentq, minimize_scalar
+
+    tolerance = 1e-3  # Fraction of the larger FWHM at the verified match.
+    valid = np.all(np.isfinite(widths) & (widths > 0), axis=1)
+    errors = np.full(len(z_values), np.nan)
+    errors[valid] = (widths[valid, 0] - widths[valid, 1]) / widths[valid].max(axis=1)
+    sampled = {float(z): tuple(row) for z, row in zip(z_values[valid], widths[valid])}
+    evaluated = {}
+
+    class UnresolvedWidth(Exception):
+        pass
+
+    class BudgetReached(Exception):
+        pass
+
+    def widths_at(z):
+        if z in sampled:
+            return sampled[z]
+        if z not in evaluated:
+            if len(evaluated) >= max_evaluations:
+                raise BudgetReached
+            values = measure(z)
+            evaluated[z] = (tuple(map(float, values)) if values is not None and
+                            all(w is not None and np.isfinite(w) and w > 0 for w in values) else None)
+        if evaluated[z] is None:
+            raise UnresolvedWidth
+        return evaluated[z]
+
+    def residual(z):
+        x, y = widths_at(float(z))
+        return (x-y) / max(x, y)
+
+    def distance(bounds):
+        left, right = bounds
+        return max(left-reference_z, reference_z-right, 0.)
+
+    # Exact sampled matches include plateaus. Avoid propagating for these.
+    matches = z_values[errors == 0.]
+    best = None if not matches.size else float(min(matches, key=lambda z: abs(z-reference_z)))
+    crossing = np.flatnonzero(errors[:-1] * errors[1:] < 0.)
+    magnitude = abs(errors)
+    # A tangent contact has a local minimum of the mismatch with no sign change.
+    interior = magnitude[1:-1]
+    minima = 1 + np.flatnonzero((interior <= magnitude[:-2]) & (interior <= magnitude[2:]) &
+                                ((interior < magnitude[:-2]) | (interior < magnitude[2:])) &
+                                (errors[:-2] * errors[1:-1] > 0.) & (errors[1:-1] * errors[2:] > 0.))
+    brackets = [(z_values[i], z_values[i+1]) for i in crossing]
+    tangent_regions = [(z_values[i-1], z_values[i+1]) for i in minima]
+    try:
+        for candidates, tangent in ((brackets, False), (tangent_regions, True)):
+            for left, right in sorted(candidates, key=distance):
+                if best is not None and distance((left, right)) >= abs(best-reference_z):
+                    break
+                try:
+                    if tangent:
+                        fit = minimize_scalar(lambda z: abs(residual(z)), bounds=(left, right), method="bounded",
+                                              options={"xatol": 1e-10, "maxiter": 24})
+                        z = float(fit.x)
+                    else:
+                        z, fit = brentq(residual, left, right, xtol=1e-10, maxiter=32,
+                                        full_output=True, disp=False)
+                    accepted = (fit.success if tangent else fit.converged) and abs(residual(z)) <= tolerance
+                    if accepted and (best is None or abs(z-reference_z) < abs(best-reference_z)):
+                        best = float(z)
+                except UnresolvedWidth:
+                    continue
+    except BudgetReached:
+        pass
+    return None if best is None else EqualFWHMPlane(best, *widths_at(best))
 
 
 @dataclass
@@ -3547,6 +3635,7 @@ class CRLFocusResult:
     reference_point_metrics: BeamMetrics | None = None
     display_signal_bounds_m: tuple[tuple[float,float],tuple[float,float]] | None = None
     crossed_alignment: CrossedCRLAnalysis | None = None
+    equal_fwhm_plane: EqualFWHMPlane | None = None
 
     @property
     def peak_z_m(self):
@@ -3656,9 +3745,9 @@ class CRLFocusResult:
         """Legacy alias for source-position scaling at peak intensity."""
         return self.magnification_at_peak
 
-    def plane_at(self,z_m: float) -> CRLPlaneResult:
-        """Evaluate any detector z, reusing lens/source state on CPU or GPU."""
-        return self._session.plane(z_m)
+    def plane_at(self,z_m: float,*,full: bool=False) -> CRLPlaneResult:
+        """Evaluate z with cached lens state; full=True returns the entire measurement ROI."""
+        return self._session.plane(z_m,full=full)
 
     def summary(self):
         return {"xposim_version":__version__,"configuration":asdict(self.configuration),
@@ -3687,7 +3776,8 @@ class CRLFocusResult:
                         name: getattr(self.crossed_alignment, name) for name in
                         ("gap_m", "recommended_gap_m", "image_x_m", "image_y_m",
                          "image_separation_m", "common_image_m", "aligned", "message")},
-                    "equivalent_aperture_area_m2":self.equivalent_aperture_area_m2}
+                    "equivalent_aperture_area_m2":self.equivalent_aperture_area_m2,
+                    "equal_fwhm_plane":None if self.equal_fwhm_plane is None else asdict(self.equal_fwhm_plane)}
                    if self.crossed_alignment is not None else {}),
                 "grid_step_m":self.grid_step_m,"grid_step_y_m":self.grid_step_y_m,
                 "detector_shape":self.detector_shape,"detector_step_m":self.detector_step_m,
@@ -4102,7 +4192,8 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     point_metrics=(session.metrics(session.coherent_intensity(numerical.z_m))
                    if cfg.source_type=="gaussian" else None)
     best_index=int(np.argmin(abs(positions-numerical.z_m)))
-    widths=np.asarray([np.nan if m.fwhm is None else m.fwhm for m in metrics],dtype=float)
+    missing_widths=np.nan if grid.dimension==1 else (np.nan,np.nan)
+    widths=np.asarray([missing_widths if m.fwhm is None else m.fwhm for m in metrics],dtype=float)
     active_count=len(cfg.focusing_axes)
     best_widths=np.asarray([np.nan if v is None else v for v in np.atleast_1d(best.metrics.fwhm)[:active_count]],dtype=float)
     steps=np.array([detector.dx] if active_count==1 else [detector.dx,detector.dy])
@@ -4145,12 +4236,23 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         point_widths=_focus_width_estimates(cfg,wavelength,analytic,alignment)
         if np.max(shift/point_widths)*np.pi/np.sqrt(2*cfg.source_points)>.5:
             messages.append("source_quadrature: Gaussian source nodes may be too sparse; compare with a higher point count.")
+    equal_fwhm_plane=None
+    if alignment is not None:
+        reporter.start("equal_fwhm",detail="Refining equal-width positions near the numerical peak")
+        evaluations=0
+        def measure_widths(z):
+            nonlocal evaluations
+            widths_at_z=session.metrics(session.intensity(z)).fwhm
+            evaluations+=1
+            reporter.advance(evaluations)
+            return widths_at_z
+        equal_fwhm_plane=_find_equal_fwhm_plane(positions,widths,numerical.z_m,measure_widths)
     result=CRLFocusResult(cfg,backend,analytical_image,collimated_focus,numerical,
         positions,np.asarray([m.max_intensity for m in metrics]),widths,best_index,
         best.x_m,best.y_m,best.intensity,np.stack(lines)[:,x_slice].copy(),
         session.transmission,float(delta),float(beta),grid.dx,grid.shape,
         None if grid.dimension==1 else grid.dy,image.shape,detector.dx,
         None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics,point_metrics,
-        display_signal_bounds,alignment)
+        display_signal_bounds,alignment,equal_fwhm_plane)
     reporter.finish()
     return result
