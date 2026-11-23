@@ -45,7 +45,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.26.0"
+__version__ = "0.27.0"
 
 
 __all__ = [
@@ -2578,6 +2578,8 @@ class CRLFocusConfig:
     second_crl describes the y-focusing stack. gap_m measures the empty space
     between the stacks; None solves for the smallest nonnegative matching gap.
     Observation z is measured from the exit of the second stack.
+    source_points_y optionally sets the y quadrature count on a 2D grid.
+    A value of None uses source_points on both axes.
     """
     energy_kev: float = 12.0
     material_formula: str | None = "Be"
@@ -2617,6 +2619,7 @@ class CRLFocusConfig:
     second_crl: CRLStackConfig | None = None
     gap_m: float | None = None
     alignment_tolerance_m: float = 1e-6
+    source_points_y: int | None = None
 
     def __post_init__(self):
         aliases = {"cylindrical": "one-dimensional", "axisymmetric": "two-dimensional"}
@@ -2662,6 +2665,11 @@ class CRLFocusConfig:
         for name, minimum in (("n_elements",1),("scan_points",5),("source_points",3)):
             _validate_count(name, getattr(self,name), minimum)
             object.__setattr__(self,name,int(getattr(self,name)))
+        if self.source_points_y is not None:
+            _validate_count("source_points_y",self.source_points_y,3)
+            if dimension != 2:
+                raise ValueError("source_points_y requires a 2D grid.")
+            object.__setattr__(self,"source_points_y",int(self.source_points_y))
         for name in ("grid_points", "grid_points_y", "batch_size"):
             value=getattr(self,name)
             if value is not None:
@@ -3134,6 +3142,29 @@ def _source_host_cache_budget() -> int:
     return max(0, min(4 * 1024**3, available // 2))
 
 
+def _gaussian_source_quadrature(sigma, count, *, equal_probability=False):
+    """Sample an intensity-normalized Gaussian using centred point modes."""
+    if sigma == 0:
+        return np.array([0.]), np.array([1.])
+    if equal_probability:
+        from scipy.special import ndtri
+
+        # Each cell contains the same probability. Its Gaussian centroid gives
+        # much finer spacing in the bright core than low-order Hermite nodes.
+        edges=ndtri(np.linspace(0.,1.,count+1))
+        density=np.exp(-.5*edges**2)/np.sqrt(2*np.pi)
+        nodes=count*(density[:-1]-density[1:])
+        nodes=.5*(nodes-nodes[::-1])
+        # A representative per cell suppresses within-cell variance. Restore
+        # the specified source variance before propagating the point modes.
+        nodes*=sigma/np.sqrt(np.mean(nodes**2))
+        return nodes, np.full(count,1./count)
+    from scipy.special import roots_hermitenorm
+
+    nodes,weights=roots_hermitenorm(count)
+    return nodes*sigma,weights/np.sum(weights)
+
+
 class _CRLFocusSession:
     """Reusable propagation state with bounded detector and source batches."""
 
@@ -3156,18 +3187,18 @@ class _CRLFocusSession:
         sigma_factor=1/(2*np.sqrt(2*np.log(2)))
         self.source_sigma=(cfg.source_fwhm_x_m*sigma_factor,cfg.source_fwhm_y_m*sigma_factor)
         self._point_model=cfg.source_type=="gaussian" and cfg.source_method=="points"
+        self.source_nodes=None
         if self._point_model:
-            from scipy.special import roots_hermitenorm
-            def quadrature(sigma):
-                if sigma==0: return np.array([0.0]),np.array([1.0])
-                nodes,weights=roots_hermitenorm(cfg.source_points)
-                return nodes*sigma,weights/np.sum(weights)
-            sx,wx=quadrature(self.source_sigma[0])
+            crossed=cfg.geometry=="crossed"
+            sx,wx=_gaussian_source_quadrature(self.source_sigma[0],cfg.source_points,equal_probability=crossed)
+            self.source_nodes=(sx,)
             if grid.dimension==1:
                 self.positions=np.column_stack((sx,np.zeros_like(sx)))
                 self.weights=wx
             else:
-                sy,wy=quadrature(self.source_sigma[1])
+                sy,wy=_gaussian_source_quadrature(self.source_sigma[1],cfg.source_points_y or cfg.source_points,
+                                                 equal_probability=crossed)
+                self.source_nodes=(sx,sy)
                 xx,yy=np.meshgrid(sx,sy)
                 self.positions=np.column_stack((xx.ravel(),yy.ravel()))
                 self.weights=(wy[:,None]*wx[None,:]).ravel()
@@ -3177,14 +3208,15 @@ class _CRLFocusSession:
         elif cfg.source_type=="gaussian":
             self.diagnostics.append("convolution_model: Gaussian intensity convolution assumes a shift-invariant pupil response; use point sampling to include source-dependent clipping and absorption.")
 
-    def configure_refined_detector(self,analytic):
+    def configure_refined_detector(self,analytic,*,z_bounds=None):
         """Resolve the detector peak without globally oversampling the lens plane."""
         cfg=self.cfg
         wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
         focal_widths=_focus_width_estimates(cfg,wavelength,analytic,getattr(self.crl,"alignment",None))
         projected=np.zeros(self.grid.dimension)
         if cfg.source_type=="gaussian":
-            projected=np.abs(self.magnification(analytic))*np.array(self.source_sigma[:self.grid.dimension])*2*np.sqrt(2*np.log(2))
+            positions=(analytic,) if z_bounds is None else z_bounds
+            projected=np.max([self.projected_source_fwhm(z) for z in positions],axis=0)
         widths=[24*max(width,projected[i]) for i,width in enumerate(focal_widths)]
         targets=[width/24 for width in focal_widths]
         if cfg.geometry=="crossed":
@@ -3386,6 +3418,29 @@ class _CRLFocusSession:
             values.append(self.crl.source_magnification(z,self.cfg.source_distance_m,
                           focusing=self.cfg.geometry=="two-dimensional"))
         return tuple(values)
+
+    def projected_source_fwhm(self,z):
+        scales=np.abs(self.magnification(z))
+        return tuple(float(width) for width in
+                     scales*np.asarray((self.cfg.source_fwhm_x_m,self.cfg.source_fwhm_y_m)[:self.grid.dimension]))
+
+    def source_sampling_diagnostics(self,z,point_metrics):
+        """Compare point-image spacing in the Gaussian core with the coherent FWHM."""
+        result=[]
+        widths=(None,None) if point_metrics.fwhm is None else point_metrics.fwhm
+        for i,(nodes,width,scale) in enumerate(zip(self.source_nodes,widths,self.magnification(z))):
+            if len(nodes)<2:
+                continue
+            axis="xy"[i]
+            if width is None or not np.isfinite(width) or width<=0:
+                result.append(f"source_quadrature_{axis}: The coherent {axis} FWHM is unresolved; source sampling along {axis} could not be checked.")
+                continue
+            half_fwhm=self.source_sigma[i]*np.sqrt(2*np.log(2))
+            core=(nodes[:-1]<half_fwhm)&(nodes[1:]>-half_fwhm)
+            spacing=abs(scale)*float(np.max(np.diff(nodes)[core]))
+            if spacing>width/2:
+                result.append(f"source_quadrature_{axis}: The projected {axis} point spacing ({spacing*1e9:.0f} nm) exceeds half the coherent {axis} FWHM ({width*5e8:.0f} nm). Increase source points along {axis} and compare widths.")
+        return result
 
     def intensity(self,z):
         _validate_finite("z",z)
@@ -3741,6 +3796,19 @@ class CRLFocusResult:
         return self._session.magnification(self.peak_z_m)
 
     @property
+    def projected_source_fwhm_at_peak_m(self):
+        """Geometric Gaussian width projected to the numerical reference plane."""
+        if self.configuration.source_type!="gaussian":
+            return None
+        return self._session.projected_source_fwhm(self.peak_z_m)
+
+    @property
+    def source_mode_counts(self):
+        """Actual source point counts by axis; zero-width axes use one mode."""
+        nodes=self._session.source_nodes
+        return None if nodes is None else tuple(len(axis) for axis in nodes)
+
+    @property
     def magnification_at_focus(self):
         """Legacy alias for source-position scaling at peak intensity."""
         return self.magnification_at_peak
@@ -3769,6 +3837,8 @@ class CRLFocusResult:
                 "reference_scan_index":self.peak_index,
                 "intensity_reference":self.intensity_reference,
                 "magnification_at_peak":self.magnification_at_peak,
+                "projected_source_fwhm_at_peak_m":self.projected_source_fwhm_at_peak_m,
+                "source_mode_counts":self.source_mode_counts,
                 "transmission":self.transmission,"grid_shape":self.grid_shape,
                 "effective_aperture_m":self.effective_aperture_m,
                 "effective_aperture_convention":"integrated_transmission",
@@ -4140,7 +4210,7 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         session=_CRLFocusSession(cfg,grid,crl,coherent.incident,coherent_state=coherent,progress=reporter)
         if cfg.accuracy=="refined" and cfg.detector_roi_m is None:
             reporter.start("detector",detail="Preparing the full Gaussian-source detector")
-            session.configure_refined_detector(analytic)
+            session.configure_refined_detector(analytic,z_bounds=bounds if alignment is not None else None)
         messages.append("central_source_reference: Peak search and automatic z ROI use the central point; displayed intensities and widths include the full Gaussian source. Its maximum can occur at a different z.")
     else:
         session=search_session
@@ -4230,7 +4300,9 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
             messages.append("window_boundary: Significant power reaches the numerical window edge; enlarge the window at fixed step.")
     if session.transmission<1e-12:
         messages.append("low_transmission: The transmitted intensity is very small.")
-    if cfg.source_type=="gaussian" and cfg.source_method=="points":
+    if alignment is not None and session.source_nodes is not None:
+        messages.extend(session.source_sampling_diagnostics(numerical.z_m,point_metrics))
+    elif cfg.source_type=="gaussian" and cfg.source_method=="points":
         source_sigma=np.array(session.source_sigma[:grid.dimension])
         shift=np.abs(session.magnification(numerical.z_m))*source_sigma
         point_widths=_focus_width_estimates(cfg,wavelength,analytic,alignment)

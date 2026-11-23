@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 from XPOSim import CRL, CRLFocusConfig, CRLStackConfig, Grid2D, analyze_crossed_crl, estimate_crl_focus
-from XPOSim import _find_equal_fwhm_plane
+from XPOSim import _build_focus_session, _CRLFocusSession, _find_equal_fwhm_plane, _focus_lens_parameters
 
 
 class CrossedCRLTests(unittest.TestCase):
@@ -115,6 +115,31 @@ class CrossedCRLTests(unittest.TestCase):
 
         widths = np.array([discontinuity(distance) for distance in z])
         self.assertIsNone(_find_equal_fwhm_plane(z, widths, .03, discontinuity))
+
+    def test_gaussian_projection_and_point_sampling_for_a_wide_y_source(self):
+        cfg = replace(self.cfg, radius_m=6.25e-6, n_elements=6, structure_depth_m=30e-6,
+            material_delta=None, material_beta=None, material_formula="Si", density_g_cm3=2.33,
+            second_crl=CRLStackConfig(radius_m=6.25e-6, n_elements=58, structure_depth_m=30e-6),
+            source_type="gaussian", source_fwhm_x_m=0, source_fwhm_y_m=1e-3,
+            grid_points=192, grid_points_y=384, batch_size=4, source_points_y=15)
+        alignment = analyze_crossed_crl(cfg)
+        z = alignment.common_image_m
+        grid, lens, convolution, _ = _build_focus_session(
+            cfg, "numpy", _focus_lens_parameters(cfg), z, alignment=alignment)
+        magnification = lens.magnification(z, cfg.source_distance_m)
+        self.assertEqual(convolution.projected_source_fwhm(z)[0], 0.)
+        self.assertAlmostEqual(convolution.projected_source_fwhm(z)[1],
+                               abs(magnification[1]) * cfg.source_fwhm_y_m, places=15)
+
+        points = _CRLFocusSession(replace(cfg, source_method="points"), grid, lens,
+                                  convolution.incident, coherent_state=convolution)
+        self.assertEqual(tuple(map(len, points.source_nodes)), (1, 15))
+        np.testing.assert_allclose(points.source_nodes[1], -points.source_nodes[1][::-1])
+        self.assertAlmostEqual(np.sum(points.weights), 1.)
+        self.assertAlmostEqual(np.sqrt(np.sum(points.weights * points.source_nodes[1]**2)),points.source_sigma[1])
+        self.assertLess(abs(points.transmission / convolution.transmission - 1), .01)
+        for actual, projected in zip(points.plane(z).metrics.fwhm, convolution.plane(z).metrics.fwhm):
+            self.assertLess(abs(actual / projected - 1), .07)
 
 
 if __name__ == "__main__":
