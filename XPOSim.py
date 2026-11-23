@@ -45,7 +45,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.28.0"
+__version__ = "0.29.0"
 
 
 __all__ = [
@@ -3186,6 +3186,7 @@ class _CRLFocusSession:
         self._mode_file=None
         sigma_factor=1/(2*np.sqrt(2*np.log(2)))
         self.source_sigma=(cfg.source_fwhm_x_m*sigma_factor,cfg.source_fwhm_y_m*sigma_factor)
+        self._crossed_projection=None
         self._point_model=cfg.source_type=="gaussian" and cfg.source_method=="points"
         self.source_nodes=None
         if self._point_model:
@@ -3279,8 +3280,8 @@ class _CRLFocusSession:
                 targets.append(min(cfg.structure_depth_m/192,np.sqrt(wavelength*analytic)/24))
             padding=np.zeros(self.grid.dimension)
             if cfg.source_type=="gaussian" and cfg.source_method=="convolution":
-                max_scale=np.max(np.abs([self.magnification(z) for z in z_bounds]),axis=0)
-                padding=5*max_scale*np.asarray(self.source_sigma[:self.grid.dimension])
+                projected_width=np.max([self.projected_source_fwhm(z) for z in z_bounds],axis=0)
+                padding=5*projected_width/np.sqrt(8*np.log(2))
             native_half_widths=[(self.grid.nx-1)*self.grid.dx/2]
             if self.grid.dimension==2:
                 native_half_widths.append((self.grid.ny-1)*self.grid.dy/2)
@@ -3367,24 +3368,28 @@ class _CRLFocusSession:
                 "and reused for all detector planes."
             )
 
+    def _propagate_source_points(self, positions):
+        xp=self.xp
+        extra=(None,)*self.grid.dimension
+        points=xp.asarray(positions)
+        phase=points[:,0][(slice(None),*extra)]*self.grid.x
+        if self.grid.dimension==2:
+            phase=phase+points[:,1][(slice(None),*extra)]*self.grid.y
+        fields=self.incident[None,...]*xp.exp(-1j*self.crl.k/self.cfg.source_distance_m*phase)
+        return self.crl.apply_to_fields(fields)
+
     def _generate_modes(self,progress=None):
         total_power=0.0
         xp=self.xp
-        extra=(None,)*self.grid.dimension
         for start in range(0,len(self.weights),self.mode_batch):
             stop=min(start+self.mode_batch,len(self.weights))
-            points=xp.asarray(self.positions[start:stop])
-            phase=points[:,0][(slice(None),*extra)]*self.grid.x
-            if self.grid.dimension==2:
-                phase=phase+points[:,1][(slice(None),*extra)]*self.grid.y
-            fields=self.incident[None,...]*xp.exp(-1j*self.crl.k/self.cfg.source_distance_m*phase)
-            fields=self.crl.apply_to_fields(fields)
+            fields=self._propagate_source_points(self.positions[start:stop])
             values=abs(fields)**2
             axes=tuple(range(1,fields.ndim))
             total_power+=_to_python_float(xp.sum(self._mode_weights[start:stop]*xp.sum(values,axis=axes)))
             del values
             spectrum=self.grid._transform_batch(fields)
-            del fields,phase
+            del fields
             yield spectrum
             del spectrum
             if progress is not None:
@@ -3419,8 +3424,69 @@ class _CRLFocusSession:
                           focusing=self.cfg.geometry=="two-dimensional"))
         return tuple(values)
 
+    def _measure_crossed_projection(self):
+        """Measure the displacement of the transmitted beam core around each image."""
+        grid,xp=self.grid,self.xp
+        coefficients=np.zeros((2,2))
+        alignment=self.crl.alignment
+        images=(alignment.image_x_m,alignment.image_y_m)
+        valid_images=tuple(z for z in images if z is not None and np.isfinite(z) and z>0)
+        for axis,(sigma,step,q,dq,image) in enumerate(zip(
+            self.source_sigma,(grid.dx,grid.dy),(grid.qx_axis,grid.qy_axis),
+            (grid.dqx,grid.dqy),images,
+        )):
+            if sigma==0:
+                continue
+            reference=image if image in valid_images else valid_images[0]
+            near,far=.95*reference,1.05*reference
+            # Measure the central core locally to exclude periodic FFT replicas
+            # and truncated far tails on coarse propagation grids.
+            radius=len(q)*step/16
+            ray_scale=max(abs(self.magnification(near)[axis]),abs(self.magnification(far)[axis]))
+            offset=min(sigma,np.pi*self.cfg.source_distance_m/(2*self.crl.k*step),
+                       radius/(2*ray_scale) if ray_scale>0 else np.inf)
+            source=np.zeros((1,2))
+            source[0,axis]=offset
+            field=self._propagate_source_points(source)[0]
+            spectrum=grid.fft(field)
+            del field
+            coordinates=xp.linspace(-radius,radius,max(321,len(q)//8+1))
+            inverse=_InverseFourierAxis(len(q),_to_python_float(q[0]),dq,coordinates,xp)
+            phase=(-.5j/self.crl.k)*q**2
+            if axis==1:
+                phase=phase[:,None]
+            centers=[]
+            for distance in (near,far):
+                field=inverse.apply(spectrum*xp.exp(distance*phase),axis=-1-axis)
+                # Parseval allows integration over the other direction in Fourier space.
+                profile=(abs(field)**2).sum(axis=axis)
+                del field
+                power=_to_python_float(profile.sum())
+                centers.append(_to_python_float(xp.dot(coordinates,profile))/power if power>0 else np.nan)
+            slope=(centers[1]-centers[0])/((far-near)*offset)
+            response=(centers[0]/offset-near*slope,slope)
+            if not np.all(np.isfinite(response)):
+                # An unresolved probe cannot supply a transmitted-beam centroid.
+                intercept=self.magnification(0.)[axis]
+                response=(intercept,self.magnification(1.)[axis]-intercept)
+                self.diagnostics.append(
+                    f"source_projection_{'xy'[axis]}: The off-axis probe was unresolved; "
+                    "the ray-transfer scale is used for this axis."
+                )
+            coefficients[axis]=response
+        return coefficients
+
+    def _source_displacement_scale(self,z):
+        if self.cfg.geometry!="crossed" or self.cfg.source_type!="gaussian" or self._point_model:
+            return self.magnification(z)
+        if self._crossed_projection is None:
+            self._crossed_projection=self._measure_crossed_projection()
+        # Free-space centroid motion is linear. Use the local core fit at
+        # the image to estimate that motion without distant numerical tails.
+        return self._crossed_projection[:,0]+z*self._crossed_projection[:,1]
+
     def projected_source_fwhm(self,z):
-        scales=np.abs(self.magnification(z))
+        scales=np.abs(self._source_displacement_scale(z))
         return tuple(float(width) for width in
                      scales*np.asarray((self.cfg.source_fwhm_x_m,self.cfg.source_fwhm_y_m)[:self.grid.dimension]))
 
@@ -3471,7 +3537,7 @@ class _CRLFocusSession:
             field=self.grid._propagate_spectrum(self.spectrum,np.asarray([z]),self.crl.k)[0]
         return abs(field)**2
 
-    def _blur(self,image,z):
+    def _blur(self,image,z,*,displacement_scale=None):
         if self.cfg.source_type!="gaussian":
             return image
         if self.grid.backend=="cupy":
@@ -3479,7 +3545,8 @@ class _CRLFocusSession:
         else:
             from scipy.ndimage import gaussian_filter
         grid=self.detector_grid
-        magnification=self.magnification(z)
+        magnification=(self._source_displacement_scale(z) if displacement_scale is None
+                       else displacement_scale)
         sigma_x=abs(magnification[0])*self.source_sigma[0]/grid.dx
         sigmas=sigma_x if self.grid.dimension==1 else (
             abs(magnification[1])*self.source_sigma[1]/grid.dy,sigma_x)
@@ -4095,7 +4162,9 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
         if progress is not None:
             progress.start("window_checks",3,f"{backend} · propagation grid {grid.shape}")
         for index,z in enumerate((.8*analytic,analytic,1.2*analytic)):
-            edge=np.maximum(edge,_edge_power_fractions(probe.intensity(z),xp))
+            # Use the inexpensive geometrical projection for provisional grids.
+            image=probe._blur(probe.coherent_intensity(z),z,displacement_scale=probe.magnification(z))
+            edge=np.maximum(edge,_edge_power_fractions(image,xp))
             if progress is not None:
                 progress.advance(index+1)
         grow_x=edge[0]>1e-3 and cfg.grid_points is None
@@ -4126,7 +4195,9 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     Grid dimensionality and focusing dimensionality are independent. Extended
     Gaussian sources are specified by intensity FWHM and treated incoherently.
     Point sampling propagates Gaussian quadrature modes through the full stack;
-    convolution uses a shift-invariant approximation with z-dependent ABCD scale.
+    convolution uses a shift-invariant approximation with a z-dependent scale.
+    For crossed CRLs the scale comes from off-axis wave propagation through
+    both stacks, including their finite pupils and absorption.
     The analytical image distance seeds the search. Gaussian illumination uses
     only its central coherent point for peak search and automatic axial ROI;
     all Gaussian modes/convolution are applied afterwards for displayed planes.
@@ -4212,6 +4283,9 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         search_session=None  # Release the central detector before source-mode caching.
         reporter.start("source_preparation",detail="Preparing the full Gaussian source after central-point search")
         session=_CRLFocusSession(cfg,grid,crl,coherent.incident,coherent_state=coherent,progress=reporter)
+        if alignment is not None and cfg.source_method=="convolution":
+            reporter.start("source_preparation",detail="Measuring off-axis displacement through the crossed CRLs")
+            session.projected_source_fwhm(analytic)
         if cfg.accuracy=="refined" and cfg.detector_roi_m is None:
             reporter.start("detector",detail="Preparing the full Gaussian-source detector")
             session.configure_refined_detector(analytic,z_bounds=bounds if alignment is not None else None)

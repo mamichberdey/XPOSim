@@ -145,12 +145,17 @@ class CrossedCRLTests(unittest.TestCase):
             grid_points=192, grid_points_y=384, batch_size=4, source_points_y=15)
         alignment = analyze_crossed_crl(cfg)
         z = alignment.common_image_m
+        downstream = z + 1.05e-3
         grid, lens, convolution, _ = _build_focus_session(
             cfg, "numpy", _focus_lens_parameters(cfg), z, alignment=alignment)
         magnification = lens.magnification(z, cfg.source_distance_m)
         self.assertEqual(convolution.projected_source_fwhm(z)[0], 0.)
-        self.assertAlmostEqual(convolution.projected_source_fwhm(z)[1],
-                               abs(magnification[1]) * cfg.source_fwhm_y_m, places=15)
+        near_width = convolution.projected_source_fwhm(z)[1]
+        far_width = convolution.projected_source_fwhm(downstream)[1]
+        self.assertLess(abs(near_width / (abs(magnification[1]) * cfg.source_fwhm_y_m) - 1), .1)
+        self.assertGreater(far_width, .95 * near_width)
+        legacy_far_width = abs(lens.magnification(downstream, cfg.source_distance_m)[1]) * cfg.source_fwhm_y_m
+        self.assertGreater(far_width, 1.5 * legacy_far_width)
 
         points = _CRLFocusSession(replace(cfg, source_method="points"), grid, lens,
                                   convolution.incident, coherent_state=convolution)
@@ -159,8 +164,15 @@ class CrossedCRLTests(unittest.TestCase):
         self.assertAlmostEqual(np.sum(points.weights), 1.)
         self.assertAlmostEqual(np.sqrt(np.sum(points.weights * points.source_nodes[1]**2)),points.source_sigma[1])
         self.assertLess(abs(points.transmission / convolution.transmission - 1), .01)
-        for actual, projected in zip(points.plane(z).metrics.fwhm, convolution.plane(z).metrics.fwhm):
+        direct_at_image = points.plane(z).metrics
+        blur_at_image = convolution.plane(z).metrics
+        for actual, projected in zip(direct_at_image.fwhm, blur_at_image.fwhm):
             self.assertLess(abs(actual / projected - 1), .07)
+        direct_ratio = points.plane(downstream).metrics.max_intensity / direct_at_image.max_intensity
+        blur_ratio = convolution.plane(downstream).metrics.max_intensity / blur_at_image.max_intensity
+        self.assertLess(direct_ratio, 1.)
+        self.assertLess(blur_ratio, 1.)
+        self.assertAlmostEqual(direct_ratio, blur_ratio, delta=.12)
 
 
 if __name__ == "__main__":
