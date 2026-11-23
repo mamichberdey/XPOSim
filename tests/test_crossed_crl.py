@@ -103,6 +103,43 @@ class CrossedCRLTests(unittest.TestCase):
         self.assertGreater(result.y_m[0], 0.)
         self.assert_longitudinal_sections(result)
 
+    def assert_crossed_peak_matches_scan(self, result):
+        self.assertEqual(result.peak_z_m, result.z_m[result.peak_index])
+        self.assertEqual(result.peak_z_m, result.sampled_peak_z_m)
+        self.assertAlmostEqual(result.numerical_peak.intensity, result.reference_metrics.max_intensity)
+        np.testing.assert_allclose(np.diff(result.z_m), result.scan_step_m, rtol=1e-9)
+        for axis,z in enumerate(result.sampled_fwhm_minimum_z_m):
+            if z is not None:
+                index = np.searchsorted(result.z_m, z)
+                self.assertEqual(result.fwhm_m[index, axis], np.nanmin(result.fwhm_m[:, axis]))
+
+    def test_crossed_gaussian_reference_uses_the_entire_source(self):
+        cfg = replace(self.cfg, n_elements=6, structure_depth_m=30e-6,
+            material_delta=None, material_beta=None, material_formula="Si", density_g_cm3=2.33,
+            second_crl=CRLStackConfig(radius_m=6.25e-6, n_elements=58, structure_depth_m=30e-6),
+            source_type="gaussian", source_fwhm_x_m=100e-6, source_fwhm_y_m=1e-3,
+            grid_points=192, grid_points_y=384, scan_points=31)
+        result = estimate_crl_focus(cfg)
+        self.assertEqual(result.peak_search_basis, "gaussian_source")
+        self.assertGreater(abs(result.peak_z_m - result.coherent_reference.z_m), result.scan_step_m)
+        self.assert_crossed_peak_matches_scan(result)
+
+    def test_crossed_manual_roi_limits_the_numerical_peak(self):
+        cfg = replace(self.cfg, detector_roi_m=((2e-6,7e-6),(2e-6,9e-6)))
+        result = estimate_crl_focus(cfg)
+        self.assert_crossed_peak_matches_scan(result)
+        self.assertGreater(result.reference_metrics.center[0], 0.)
+        self.assertEqual(result.numerical_peak.intensity, result.plane_at(result.peak_z_m,full=True).intensity.max())
+
+    def test_crossed_direct_sampling_uses_the_strongest_lattice_plane(self):
+        cfg = replace(self.cfg, source_type="gaussian", source_method="points",
+                      source_fwhm_x_m=0, source_fwhm_y_m=100e-6,
+                      source_points_y=3, batch_size=3)
+        result = estimate_crl_focus(cfg)
+        self.assertTrue(result.numerical_peak.sampled)
+        self.assertEqual(result.numerical_peak.evaluations, len(result.z_m))
+        self.assert_crossed_peak_matches_scan(result)
+
     def test_equal_fwhm_refines_the_crossing_nearest_the_intensity_peak(self):
         z = np.linspace(0.01, 0.05, 6)
 

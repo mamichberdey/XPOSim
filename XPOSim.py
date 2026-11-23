@@ -45,7 +45,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.29.0"
+__version__ = "0.30.0"
 
 
 __all__ = [
@@ -2391,7 +2391,7 @@ class _CRLProgressReporter:
 
 @dataclass(frozen=True)
 class PeakIntensitySearchResult:
-    """Distance of a local peak-intensity maximum, independent of a display grid.
+    """Distance of a refined or sampled peak-intensity maximum.
 
     This intensity criterion need not coincide with minimum beam width or the
     geometrical image plane. It does not identify a unique physical focus.
@@ -2403,6 +2403,7 @@ class PeakIntensitySearchResult:
     evaluations: int
     message: str
     history: tuple[tuple[float, float], ...]
+    sampled: bool = False
 
 
 def find_peak_intensity_distance(peak_intensity: Callable[[float], float], initial_z_m: float,
@@ -3308,6 +3309,7 @@ class _CRLFocusSession:
         if any(region.stop-region.start<3 for region in self.measurement_slices):
             raise ValueError("Manual detector ROI needs at least three samples along each axis. Widen it or refine the grid.")
         self.slices=self.measurement_slices
+        self._peak_cache.clear()
 
     def detector_coordinates(self,slices):
         if self._zoom_plan is None:
@@ -3585,8 +3587,11 @@ class _CRLFocusSession:
     def objective(self,z):
         z=float(z)
         if z not in self._peak_cache:
-            self._peak_cache[z]=_to_python_float(self.xp.max(self.intensity(z)))
+            self._peak_cache[z]=self.peak_in_region(self.intensity(z))
         return self._peak_cache[z]
+
+    def peak_in_region(self,image):
+        return _to_python_float(self.xp.max(image[self.measurement_slices]))
 
     def metrics(self,image):
         region=self.measurement_slices
@@ -3718,11 +3723,10 @@ def _find_equal_fwhm_plane(z_values, widths, reference_z, measure, *, max_evalua
 class CRLFocusResult:
     """Display data and a live session for arbitrary z planes.
 
-    numerical_peak maximizes the central coherent source point for Gaussian
-    illumination; displayed intensities/widths still include the whole source.
-    It is a reference distance, not necessarily the Gaussian source's maximum.
-    The finite-source
-    analytical_image_distance_m and collimated_focus_m are separate ray-optical
+    The crossed-CRL numerical result uses the full source in the calculation
+    region. For a single stack with a Gaussian source, it uses its central
+    point as the reference. The analytical_image_distance_m and
+    collimated_focus_m are separate ray-optical
     distances; none is implicitly identified with minimum wave-optical FWHM.
     z_m is a uniform display grid anchored at the numerical peak distance.
     peak_index indexes that exact reference plane. best_intensity,
@@ -3762,6 +3766,7 @@ class CRLFocusResult:
     crossed_alignment: CrossedCRLAnalysis | None = None
     equal_fwhm_plane: EqualFWHMPlane | None = None
     longitudinal_intensity_y: np.ndarray | None = None
+    coherent_reference: PeakIntensitySearchResult | None = None
 
     @property
     def peak_z_m(self):
@@ -3769,12 +3774,30 @@ class CRLFocusResult:
 
     @property
     def peak_search_basis(self):
+        if self.crossed_alignment is not None and self.configuration.source_type=="gaussian":
+            return "gaussian_source"
         return "plane_wave" if self.configuration.source_type=="plane" else "central_point"
 
     @property
     def sampled_peak_z_m(self):
         """Highest full-source intensity among the displayed samples only."""
-        return float(self.z_m[int(np.argmax(self.peak_intensity))])
+        indices=np.flatnonzero(self.peak_intensity==np.max(self.peak_intensity))
+        return float(self.z_m[indices[np.argmin(abs(indices-self.peak_index))]])
+
+    @property
+    def sampled_fwhm_minimum_z_m(self):
+        """Positions of the smallest resolved width on each focusing axis."""
+        minima=[]
+        for axis in range(len(self.fwhm_axes)):
+            widths=self.fwhm_m if self.fwhm_m.ndim==1 else self.fwhm_m[:,axis]
+            valid=np.flatnonzero(np.isfinite(widths)&(widths>0))
+            if not valid.size:
+                minima.append(None)
+                continue
+            candidates=valid[widths[valid]==np.min(widths[valid])]
+            index=candidates[np.argmin(abs(candidates-self.peak_index))]
+            minima.append(float(self.z_m[index]))
+        return tuple(minima)
 
     @property
     def fwhm_axes(self):
@@ -3868,7 +3891,7 @@ class CRLFocusResult:
 
     @property
     def projected_source_fwhm_at_peak_m(self):
-        """Geometric Gaussian width projected to the numerical reference plane."""
+        """Gaussian width projected to the numerical reference plane."""
         if self.configuration.source_type!="gaussian":
             return None
         return self._session.projected_source_fwhm(self.peak_z_m)
@@ -3898,10 +3921,13 @@ class CRLFocusResult:
                 "point_source_fwhm_at_peak_m":self.point_source_fwhm_at_peak_m,
                 "source_broadening_factor":self.source_broadening_factor,
                 "peak_search_basis":self.peak_search_basis,
-                "axial_roi_basis":"manual" if self.configuration.scan_range_m is not None else self.peak_search_basis,
+                "axial_roi_basis":"manual" if self.configuration.scan_range_m is not None else
+                    ("plane_wave" if self.configuration.source_type=="plane" else "central_point"),
                 "transverse_roi_basis":"manual" if self.configuration.detector_roi_m is not None else "auto",
-                "peak_search_initial_z_m":self.numerical_peak.history[0][0],
+                "peak_search_initial_z_m":(self.coherent_reference or self.numerical_peak).history[0][0],
+                "peak_search_sampled":self.numerical_peak.sampled,
                 "sampled_peak_z_m":self.sampled_peak_z_m,
+                "sampled_fwhm_minimum_z_m":self.sampled_fwhm_minimum_z_m,
                 "scan_step_m":self.scan_step_m,"scan_grid_uniform":True,
                 "scan_anchor_m":self.peak_z_m,
                 "fwhm_axes":list(self.fwhm_axes),
@@ -4188,9 +4214,59 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
     return grid,crl,probe,messages
 
 
+def _refine_crossed_peak(session,bounds,reference_z,image_positions,reporter):
+    """Find the strongest candidate basin on the same grid as the output."""
+    from scipy.optimize import minimize_scalar
+
+    lo,hi=bounds
+    candidates=np.unique(np.r_[np.linspace(lo,hi,7),np.clip(reference_z,lo,hi),
+                               [z for z in image_positions if lo<=z<=hi]])
+    history={}
+    reporter.start("peak_search",len(candidates),"Checking the full beam across the crossed-CRL scan")
+    for index,(z,image) in enumerate(session.iter_intensities(candidates)):
+        history[z]=session.peak_in_region(image)
+        reporter.advance(index+1)
+    peak=int(np.argmax([history[z] for z in candidates]))
+    left=float(candidates[max(0,peak-1)])
+    right=float(candidates[min(len(candidates)-1,peak+1)])
+    tolerance=session.cfg.peak_search_tolerance_m or 1e-5*max(reference_z,1e-9)
+    reporter.start("peak_search",detail="Refining the strongest crossed-CRL peak")
+
+    def objective(z):
+        if z not in history:
+            history[z]=session.objective(z)
+            reporter.advance(len(history)-len(candidates))
+        return -history[z]
+
+    optimized=minimize_scalar(objective,bounds=(left,right),method="bounded",
+                              options={"xatol":tolerance,"maxiter":18})
+    objective(optimized.x)
+    z=max(history,key=lambda sample:(history[sample],-abs(sample-reference_z)))
+    at_boundary=z-lo<=tolerance or hi-z<=tolerance
+    converged=bool(optimized.success) and not at_boundary
+    message=("The strongest peak reaches the axial search boundary." if at_boundary else
+             "The strongest crossed-CRL candidate was refined." if converged else str(optimized.message))
+    return PeakIntensitySearchResult(float(z),history[z],(left,right),converged,len(history),
+                                     message,tuple(history.items()))
+
+
+def _crossed_sampled_peak(positions,intensities,reference_z):
+    """Select a measured plane without propagating an additional ensemble."""
+    candidates=np.flatnonzero(intensities==np.max(intensities))
+    best=int(candidates[np.argmin(abs(positions[candidates]-reference_z))])
+    interior=0<best<len(positions)-1
+    left=positions[max(0,best-1)]
+    right=positions[min(len(positions)-1,best+1)]
+    message=("Peak selected from the sampled crossed-CRL intensity." if interior else
+             "The largest sampled intensity reaches the edge of the axial scan.")
+    return PeakIntensitySearchResult(float(positions[best]),float(intensities[best]),
+                                     (float(left),float(right)),interior,len(positions),
+                                     message,tuple(zip(map(float,positions),map(float,intensities))),sampled=True)
+
+
 def estimate_crl_focus(configuration: CRLFocusConfig, *,
                        progress: Callable[[CRLProgressUpdate], None] | None = None) -> CRLFocusResult:
-    """Find a central-source reference distance, then sample the full source.
+    """Find an axial calculation region, then evaluate the beam and its peak.
 
     Grid dimensionality and focusing dimensionality are independent. Extended
     Gaussian sources are specified by intensity FWHM and treated incoherently.
@@ -4198,9 +4274,11 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     convolution uses a shift-invariant approximation with a z-dependent scale.
     For crossed CRLs the scale comes from off-axis wave propagation through
     both stacks, including their finite pupils and absorption.
-    The analytical image distance seeds the search. Gaussian illumination uses
-    only its central coherent point for peak search and automatic axial ROI;
-    all Gaussian modes/convolution are applied afterwards for displayed planes.
+    The analytical image distance seeds the coherent search and automatic ROI.
+    A crossed-CRL run locates the peak of the full beam in the measurement
+    region. A direct Gaussian sum uses the strongest sampled plane to avoid
+    additional ensemble evaluations. Single-stack Gaussian runs retain the
+    coherent peak as their reference.
     The retained session evaluates any detector z from cached source spectra.
     Oversized spectra may use a temporary cache for the session lifetime.
     progress receives synchronous stage updates without threads or timers.
@@ -4242,12 +4320,15 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
                 if cfg.source_type=="gaussian" else cfg)
     search_session=(_CRLFocusSession(search_cfg,grid,crl,coherent.incident,coherent_state=coherent)
                     if cfg.source_type=="gaussian" else coherent)
+    search_bounds=cfg.scan_range_m or (max(1e-9,.05*analytic),3*analytic)
+    manual_detector=cfg.detector_roi_m is not None
     reporter.start("detector",detail="Preparing the observation grid")
-    if cfg.accuracy=="refined":
+    if alignment is not None and manual_detector:
+        search_session.configure_manual_detector(analytic,search_bounds)
+    elif cfg.accuracy=="refined":
         search_session.configure_refined_detector(analytic)
     xp=grid.xp
     wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
-    search_bounds=cfg.scan_range_m or (max(1e-9,.05*analytic),3*analytic)
     basis="Plane wave" if cfg.source_type=="plane" else "Central point source"
     reporter.start("peak_search",detail=basis+" · starting at the paraxial estimate")
     evaluations=0
@@ -4259,7 +4340,7 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         return value
     numerical=find_peak_intensity_distance(search_objective,analytic,bounds_m=search_bounds,
                    tolerance_m=cfg.peak_search_tolerance_m)
-    if not numerical.converged:
+    if not numerical.converged and alignment is None:
         messages.append("peak_search: "+numerical.message)
     reporter.start("axial_roi",detail=basis+" · finding the axial display interval")
     roi_evaluations=0
@@ -4289,18 +4370,22 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         if cfg.accuracy=="refined" and cfg.detector_roi_m is None:
             reporter.start("detector",detail="Preparing the full Gaussian-source detector")
             session.configure_refined_detector(analytic,z_bounds=bounds if alignment is not None else None)
-        messages.append("central_source_reference: Peak search and automatic z ROI use the central point; displayed intensities and widths include the full Gaussian source. Its maximum can occur at a different z.")
+        if alignment is None:
+            messages.append("central_source_reference: Peak search and automatic z ROI use the central point; displayed intensities and widths include the full Gaussian source. Its maximum can occur at a different z.")
     else:
         session=search_session
     coherent=None
-    manual_detector=cfg.detector_roi_m is not None
-    if manual_detector:
+    if manual_detector and (alignment is None or cfg.source_type=="gaussian"):
         reporter.start("detector",detail="Preparing the manual detector region")
         session.configure_manual_detector(analytic,bounds)
     detector=session.detector_grid
     messages.extend(session.diagnostics)
+    coherent_reference=numerical if alignment is not None else None
+    direct_crossed=alignment is not None and cfg.source_type=="gaussian" and cfg.source_method=="points"
+    if alignment is not None and not direct_crossed:
+        numerical=_refine_crossed_peak(session,bounds,numerical.z_m,image_positions,reporter)
     positions=_uniform_scan_positions(bounds,cfg.scan_points,cfg.scan_step_m,cfg.accuracy,numerical.z_m,
-                                     within_bounds=manual_detector and cfg.scan_range_m is not None)
+                                     within_bounds=cfg.scan_range_m is not None and (manual_detector or alignment is not None))
     metrics=[]
     lines_x,lines_y=[],[]
     both_axes=len(cfg.focusing_axes)==2
@@ -4327,6 +4412,18 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
                 transverse_y=xp.maximum(transverse_y,xp.max(image,axis=1))
         lines_x.append(_to_numpy(line).copy())
     reporter.start("finalizing",detail="Finalizing transverse ROI and beam metrics")
+    intensities=np.asarray([m.max_intensity for m in metrics])
+    reference_index=int(np.argmin(abs(positions-numerical.z_m)))
+    # If the display scan resolves a stronger basin, use that lattice plane.
+    # Changing to another plane on the same lattice preserves the uniform step.
+    if alignment is not None and (direct_crossed or np.max(intensities)>intensities[reference_index]):
+        if not direct_crossed:
+            messages.append("peak_sampled: The axial scan found a stronger peak than the local search. The strongest sampled plane is reported.")
+        numerical=_crossed_sampled_peak(positions,intensities,numerical.z_m)
+    elif alignment is not None:
+        numerical=replace(numerical,intensity=float(intensities[reference_index]))
+    if alignment is not None and not numerical.converged:
+        messages.append("peak_search: "+numerical.message)
     x_slice=y_slice=slice(None)
     display_signal_bounds=None
     if not manual_detector:
@@ -4405,12 +4502,12 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
             return widths_at_z
         equal_fwhm_plane=_find_equal_fwhm_plane(positions,widths,numerical.z_m,measure_widths)
     result=CRLFocusResult(cfg,backend,analytical_image,collimated_focus,numerical,
-        positions,np.asarray([m.max_intensity for m in metrics]),widths,best_index,
+        positions,intensities,widths,best_index,
         best.x_m,best.y_m,best.intensity,np.stack(lines_x)[:,x_slice].copy(),
         session.transmission,float(delta),float(beta),grid.dx,grid.shape,
         None if grid.dimension==1 else grid.dy,image.shape,detector.dx,
         None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics,point_metrics,
         display_signal_bounds,alignment,equal_fwhm_plane,
-        np.stack(lines_y)[:,y_slice].copy() if both_axes else None)
+        np.stack(lines_y)[:,y_slice].copy() if both_axes else None,coherent_reference)
     reporter.finish()
     return result
