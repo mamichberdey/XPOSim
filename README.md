@@ -1,114 +1,91 @@
 # XPOSim
 
-**X-ray Paraxial Optical Simulation — wave optics with GPU acceleration.**
+XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating monochromatic X-ray propagation, diffraction, and focusing. It propagates complex wavefields on one- and two-dimensional transverse grids using FFTs. Calculations run on the CPU with NumPy or on an NVIDIA GPU with CuPy.
 
-[![Open CRL Focus in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/a2077873f421b7404785ab3c30a0194e160d0d83/notebooks/CRL_Focus_Colab.ipynb)
+[Installation](#installation) · [Quick start](#quick-start) · [Library guide](DOCUMENTATION.md) · [API reference](DOCUMENTATION.md#8-api-reference)
 
-**Explore a CRL focus without a local environment.** The [English Colab workspace](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/a2077873f421b7404785ab3c30a0194e160d0d83/notebooks/CRL_Focus_Colab.ipynb) provides a separate CRL/source parameter form and a separate results cell with explicit calculation, stage progress and ETA, three material-definition modes, a live analytical preview including transverse magnification, automatic CUDA/CPU detection, line- and point-focus CRLs, with plane-wave, point-source and incoherent Gaussian illumination, adaptive axial ROI search initialized at the analytical image distance, full-beam peak selection for crossed CRLs and a compact two-column results view. Source-first controls retain fixed positions; actual grid counts and steps are shown beside the backend. The bordered results panels share a z slider that accepts rapid clicks and dragging. The latest selection updates a complete plot/readout frame; failed rendering preserves the previous frame. A transverse map with equal physical scales places x vertically and reports peak intensity in its upper-right corner. For point focusing it marks x/y FWHM and shows both profiles below; rulers shorter than 5% of their axis span are omitted. If either ruler is hidden or a width is unresolved, both FWHM values share a reserved readout below the map and both rulers are hidden. The top calculation summary places units directly after the values. A line-focus CRL on a 2D grid shows only the focused x profile and its FWHM, with no width annotations on the map or unfocused y profile. On a 1D grid, peak intensity and FWHM appear directly on the profile. Magnification is calculated before propagation at the analytical image plane, in the parameter cell. Numeric extrema, mathematical subscripts and a monospace font clarify the measurements. A shared color scale is attached directly to the map axes. Auto/Dark/Light palettes cover the complete form and figures. Physical transverse steps use readable multiples of five; z uses a uniform lattice with its actual spacing/count reported beside the backend. The lattice is anchored at the full-precision numerical peak-intensity position: only Δz is rounded, so Peak navigation selects the exact reference plane. The display spacing sets the resolution when the crossed-CRL calculation uses a sampled peak. Accurate evaluates the complex field on a separately reported dense transverse evaluation grid. The form, analytical preview, run summary and z controls adapt to the notebook output width, including phone screens and narrow Colab panes. Compact plot layouts keep labels readable while preserving the calculated data and transverse aspect ratio. The default is a 12 keV silicon CRL with 26 elements. Results stay in the active session. See the [Colab guide](COLAB_GUIDE.md).
+<a id="1-about-xposim"></a>
 
-A live optical layout shows the source, the CRL geometry and the analytical image plane or back focus. The form places the element section beside the geometry fields, with the optical layout and analytical estimates below. Download the completed simulation as a one-page portrait A4 PDF. For crossed CRLs it shows transverse sections before, at and after the common paraxial image plane, with the equal-FWHM distance in the summary. Results show depth of focus, Gaussian source broadening and the centred transverse coherence length, with web transmission and an analytical rocking-curve width in the material preview. The calculation region can be selected automatically or entered in physical coordinates. The calculation summary reports the analytical effective aperture alongside the numerically integrated transmission. [Calculation region in the Colab guide](COLAB_GUIDE.md#peak-intensity-position-and-calculation-region)
+## Capabilities
 
-**Crossed CRLs** model an x-focusing stack followed by a y-focusing stack rotated by 90°. Set the two geometries and materials independently, solve for a common paraxial image plane or enter a manual gap, and propagate the wavefield through both stacks on a 2D grid. [Align two crossed CRLs](COLAB_GUIDE.md#align-two-crossed-crls)
+- Build optical systems from compound refractive lenses (CRLs), apertures, and sampled material thickness maps.
+- Model line-focus, point-focus, and crossed CRLs. Use tabulated material properties or supply the refractive index decrement and absorption index directly.
+- Change illumination between a plane wave, a point source, and an incoherent Gaussian source in the CRL workflow.
+- Calculate paraxial image distances, scan the propagated field in batches, and measure peak intensity, FWHM, and transmission. Use sampled surface errors to study departures from ideal lens geometry.
 
-[Download ZIP](https://github.com/mamichberdey/XPOSim/archive/refs/heads/main.zip) · [Installation](#2-installation) · [Tutorial](DOCUMENTATION.md#2-complete-example-point-source-crl-and-detector) · [API reference](DOCUMENTATION.md#8-api-reference) · [Repository](https://github.com/mamichberdey/XPOSim)
+<a id="2-installation"></a>
 
-**Contents**
+## Installation
 
-1. [About XPOSim](#1-about-xposim)
-2. [Installation](#2-installation)
-3. [Physical model](#3-physical-model)
-
----
-
-## 1. About XPOSim
-
-XPOSim is a Python library for modelling X-ray propagation and focusing with one or two transverse dimensions. It calculates the complex wavefield and intensity through optical systems built from compound refractive lenses (CRLs), apertures, and sampled material-thickness maps.
-
-Use it to:
-
-- Study how lens geometry and surface errors change the focal intensity distribution.
-- Scan the field along the optical axis and measure beam widths and peak intensity.
-- Compare optical configurations and generate synthetic data for X-ray optical diagnostics.
-
-### Why XPOSim?
-
-Free-space propagation is evaluated with FFTs using the convolution theorem. CuPy accelerates the main field operations on NVIDIA GPUs; NumPy provides the same grid and optical-element interfaces on the CPU. Optical schemes are built by passing complex field arrays between elements.
-
-> [!TIP]
-> **Use GPU acceleration for large 2D grids and repeated simulations.** CPU execution is also supported with NumPy and SciPy; CUDA is optional. Performance depends on the grid, hardware, and calculation.
-
-Start with the [complete point source → CRL → detector example](DOCUMENTATION.md#2-complete-example-point-source-crl-and-detector) after installation. Continue with focus scans, extended-source modelling, surface errors, and parameter descriptions in the [documentation](DOCUMENTATION.md).
-
----
-
-## 2. Installation
-
-The installation guide uses **Miniconda** and the supplied `environment.yml` for the recommended GPU setup. The commands below are for Linux or the Linux terminal in WSL 2. Install [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install) first if it is not already available. Git is optional; the project can also be downloaded as a ZIP archive.
-
-For CPU-only use, the required dependencies are listed in [Section 2.3](#23-cpu-only-dependencies). Set up that environment yourself; the GPU environment file is not required.
-
-### 2.1 Download the project
-
-**Option A — download an archive.**
-
-[Download and extract the project](https://github.com/mamichberdey/XPOSim/archive/refs/heads/main.zip). Git is not required.
-
-**Option B — clone the repository.**
-
-If [Git](https://git-scm.com/downloads) is installed, download the repository with:
+Clone the repository or extract the source archive. Keep `xray_material_data/` alongside `XPOSim.py` when using formula-based materials. [Download ZIP](https://github.com/mamichberdey/XPOSim/archive/refs/heads/main.zip)
 
 ```bash
 git clone https://github.com/mamichberdey/XPOSim.git
-```
-
-Enter the project folder. For a Git clone:
-
-```bash
 cd XPOSim
 ```
 
-For a ZIP archive, use the extracted folder name, normally `XPOSim-main`, instead. The current directory should contain `XPOSim.py` and `environment.yml`.
+### CPU with NumPy
 
-### 2.2 GPU installation with Miniconda (recommended)
+Create a virtual environment from the repository root. The activation command below is for Linux, macOS, and WSL.
 
-This GPU option requires an NVIDIA GPU and a compatible driver. The supplied environment targets **Linux x86_64 / WSL 2 x86_64** and specifies **CUDA 13.4**. Under WSL 2, GPU access is provided by the Windows NVIDIA driver; see [NVIDIA's setup guide](https://docs.nvidia.com/cuda/wsl-user-guide/).
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install numpy scipy
+```
 
-**Step 1 — create the environment.**
+Select `backend="numpy"` for CPU calculations. Install Matplotlib if you want to run the plotting examples.
 
-Use the supplied dependency file to create `xposim_gpu_env`:
+### NVIDIA GPU with CuPy
+
+The supplied Conda environment targets Linux x86-64 and WSL 2 with CUDA 13.4. It requires a compatible NVIDIA driver. [Install Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install) · [CUDA on WSL](https://docs.nvidia.com/cuda/wsl-user-guide/)
 
 ```bash
 conda env create -f environment.yml
+conda activate cu_env
 ```
 
-**Step 2 — activate the environment.**
+Select `backend="cupy"` to require GPU execution. In the high-level CRL workflow, `backend="auto"` tries a small GPU calculation and falls back to NumPy if CUDA is unavailable.
 
-Run this before working with XPOSim:
+## Quick start
 
-```bash
-conda activate xposim_gpu_env
+Run this one-dimensional example from the repository root. It models a point source 15 m upstream of a silicon CRL and measures the focal profile. Lengths passed to the API are in metres and photon energies are in keV.
+
+```python
+import XPOSim as xpos
+
+config = xpos.CRLFocusConfig(
+    backend="numpy",
+    grid_dimension=1,
+    energy_kev=12.0,
+    material_formula="Si",
+    density_g_cm3=2.33,
+    radius_m=6.25e-6,
+    aperture_m=50e-6,
+    bridge_thickness_m=2e-6,
+    n_elements=26,
+    source_distance_m=15.0,
+)
+analysis = xpos.analyze_crl(config)
+result = xpos.estimate_crl_focus(config)
+plane = result.plane_at(result.peak_z_m)
+
+print(f"Analytical image distance: {analysis.image_distance_m * 1e3:.2f} mm")
+print(f"Numerical peak-intensity position: {result.peak_z_m * 1e3:.2f} mm")
+print(f"FWHM at peak: {plane.metrics.fwhm * 1e9:.2f} nm")
 ```
 
-The environment includes CuPy and CUDA runtime dependencies. The NVIDIA driver must be installed separately. Select `backend="cupy"` when creating a calculation grid. Repeat the activation command when opening a new terminal session.
+The distances are measured from the CRL exit. Use `plane.x_m` and `plane.intensity` to plot the transverse profile, or `result.z_m` and `result.peak_intensity` for the axial scan.
 
-### 2.3 CPU-only dependencies
+## Examples and reference
 
-CPU calculations require **NumPy** and **SciPy**. Installing SciPy normally installs a compatible NumPy version automatically, if needed; see the [official SciPy installation guide](https://scipy.org/install/). Prepare this environment yourself rather than using the GPU `environment.yml`.
+- Build an optical system from grids, a source, and individual elements. [Worked Python example](DOCUMENTATION.md#2-complete-example-point-source-crl-and-detector)
+- Configure a CRL scan, choose the illumination model, and compare focus metrics. [High-level CRL workflow](DOCUMENTATION.md#high-level-crl-workflow)
+- Explore a CRL focus interactively and export a simulation report. [Colab notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/a2077873f421b7404785ab3c30a0194e160d0d83/notebooks/CRL_Focus_Colab.ipynb) · [Notebook guide](COLAB_GUIDE.md)
 
-Select `backend="numpy"` when creating grids and use NumPy arrays. CuPy, CUDA, and an NVIDIA driver are not required. **Matplotlib** is optional and needed only for plotting examples.
+<a id="3-physical-model"></a>
 
-### 2.4 Run your first calculation
-
-Run scripts from the project root so that `XPOSim.py` can be imported. In a notebook or IDE, select the environment in which you installed the dependencies.
-
-> [!NOTE]
-> Keep the included `xray_material_data/` directory next to `XPOSim.py`. Its tables are needed for formula-based materials on both CPU and GPU. Materials specified directly by `delta` and `beta` do not need these tables.
-
-**Next:** run the [complete worked example](DOCUMENTATION.md#2-complete-example-point-source-crl-and-detector), or the [CPU-only example](DOCUMENTATION.md#7-one-dimensional-and-cpu-calculations).
-
----
-
-## 3. Physical model
+## Physical model
 
 The formulation below follows the wave-propagation framework described by **V. G. Kohn**. [Kohn (2022)][kohn2022], Section 2, presents the paraxial equation, Fresnel propagation, FFT evaluation, and the compressed-lens approximation. The analytical theory of continuously refractive parabolic lenses is developed in [Kohn (2003)][kohn2003]; diffraction and imaging with CRLs are discussed by [Kohn, Snigireva & Snigirev (2003)][kohn-imaging2003].
 

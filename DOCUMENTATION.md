@@ -2,7 +2,7 @@
 
 User guide and API reference for [XPOSim](https://github.com/mamichberdey/XPOSim). Installation is described in [README.md](README.md).
 
-This document describes the single-file implementation in the project repository, checked against commit `a68d920239bf4e5cc0ed5dcd4e3ff68315da44b7`. Examples and reference entries distinguish implemented behavior from intended general optical conventions. All code uses `import XPOSim as xpos`.
+This guide covers the grid and optical-element API and the high-level CRL workflow. Examples import the library with `import XPOSim as xpos`.
 
 ## Contents
 
@@ -30,7 +30,7 @@ An optical scheme is built by passing **complex field arrays** between objects. 
 
 Some elements can be constructed without `input_field` to inspect geometry, but their field calculation still requires an incident field. `Material` and grids are supporting objects, rather than field-transforming elements.
 
-Distances are **relative to the current object's output reference plane**, not absolute laboratory coordinates. For a CRL, this is the stack exit plane. A second element must receive the field propagated to its own entrance plane. The library does not assemble a global beamline or infer gaps automatically.
+In the optical-element API, distances are relative to the current object's output reference plane. For a CRL, this is the stack exit plane. When chaining elements, propagate the field from the first exit to the second entrance. The [crossed-CRL workflow](#high-level-crl-workflow) can compute the gap for a common paraxial image.
 
 The examples below are sequential: run the setup once and then continue with the subsequent sections. Optional schemes reuse the named objects from that setup.
 
@@ -50,7 +50,7 @@ The examples below are sequential: run the setup once and then continue with the
 | 1D ROI | `(xmin, xmax)` |
 | 2D ROI | `((xmin, xmax), (ymin, ymax))` |
 
-A grid describes the same transverse window in every propagated plane; XPOSim does not automatically change sampling with distance. Specify exactly one of `energy_kev` and `wavelength_m` for wave calculations. Material-backed objects need energy to calculate tabulated optical constants: if specifying only wavelength, either resolve the energy first or provide direct `delta` and `beta`.
+Ordinary propagation uses the same transverse grid in every plane. Use `grid.propagate_to_grid(field, z, k, detector)` to evaluate the field on a different transverse grid with the same backend. Specify either `energy_kev` or `wavelength_m` for wave calculations. When given a wavelength, material-backed elements derive photon energy before looking up tabulated optical constants.
 
 NumPy arrays reside on the CPU, CuPy arrays on the GPU. A grid validates the backend and shape of incident arrays. It does not automatically infer the grid, resample fields, or transfer them to another backend.
 
@@ -178,8 +178,25 @@ Keep the source-to-element entrance distance separate from each subsequent gap. 
 
 ## 4. Scanning and analysing the focus
 
+### High-level CRL workflow
 
-### 1. Choose detector positions and an observation region
+Use `CRLFocusConfig` to set the source, CRL geometry, material and grid. The [README quick start](README.md#quick-start) provides a self-contained CPU example.
+
+| API | Purpose |
+| --- | --- |
+| `analyze_crl(config)` | Compute optical constants and paraxial predictions for a single stack without propagating a field. |
+| `analyze_crossed_crl(config)` | Compute the two image positions for orthogonal stacks and determine a matching gap when possible. Set `geometry="crossed"` and give the second stack as `second_crl=CRLStackConfig(...)`. A numerical `gap_m` fixes the distance between the stacks. |
+| `estimate_crl_focus(config)` | Propagate the chosen source, evaluate an axial scan and return a `CRLFocusResult` with intensity, FWHM, transmission and grid information. `accuracy="refined"` can evaluate the field on a finer transverse grid. |
+| `result.plane_at(z_m)` | Evaluate an observation plane using the saved propagation state. Its coordinates are in metres. For crossed stacks, z is measured from the exit of the second stack. |
+| `select_backend("auto")` | Try CUDA with a small calculation and otherwise select NumPy. The high-level workflow also accepts an explicit `backend="numpy"` or `backend="cupy"`. |
+
+Set `source_type` to `"point"`, `"plane"` or `"gaussian"`. Gaussian source sizes are intensity FWHMs in metres. `source_method="convolution"` approximates finite-source broadening by shifting the central-point response. `source_method="points"` propagates independent source modes and sums their intensities.
+
+The analytical image distance, numerical peak-intensity position and sampled FWHM minima are distinct measurements. For a single stack with Gaussian illumination, the central-point maximum sets the reference and `result.sampled_peak_z_m` reports the strongest full-source sample. Crossed-CRL peak selection uses the full source. With direct Gaussian point sampling it selects the strongest computed plane. See `result.numerical_peak.sampled` for whether the reported position came from the axial lattice.
+
+### Scan an existing CRL
+
+#### 1. Choose detector positions and an observation region
 
 ```python
 Z_ARR = np.arange(15, 56, 1) * 1e-3  # 15 through 55 mm, inclusive
@@ -209,7 +226,7 @@ The stack shape is **`(number_of_planes, number_of_y_pixels, number_of_x_pixels)
 
 The original full-grid complex128 stack for 41 planes would require about 2.56 GiB, excluding working arrays. A small ROI substantially reduces stored data. Use `return_fields=False` if only beam metrics are required; then `scan_result.E` is `None`.
 
-### 2. Inspect the sampled best-focus plane
+#### 2. Inspect the sampled best-focus plane
 
 ```python
 best_index = scan_result.peak_index
@@ -245,7 +262,7 @@ print("Finite-distance source image estimate (m):", crl_ideal.effective_focus(Z0
 These estimates describe the ideal paraxial CRL model and do not replace inspecting the simulated field.
 
 
-### Measuring a saved field
+#### Measuring a saved field
 
 ```python
 metrics = xpos.beam_metrics(E_detector, grid, roi=ROI)
@@ -432,7 +449,8 @@ Inherited field methods are documented once under [OpticalObject and OpticalElem
 
 | Area | Entries |
 | --- | --- |
-| Configuration | `__version__`, `CUPY_AVAILABLE` |
+| Configuration | `__version__`, `CUPY_AVAILABLE`, `select_backend` |
+| CRL workflow | [`CRLFocusConfig`, `CRLStackConfig`, `analyze_crl`, `analyze_crossed_crl`, `estimate_crl_focus`](#high-level-crl-workflow) |
 | Grids | `Grid1D`, `Grid2D`, transforms and propagation |
 | Material | `Material`, `wavelength_energy` |
 | Optical objects | `OpticalObject`, `OpticalElement`, `PointSource`, `Hole`, `Blade`, `ArrayObject`, `CRL` |
@@ -442,7 +460,7 @@ Inherited field methods are documented once under [OpticalObject and OpticalElem
 
 ### Module constants
 
-`__version__`: string, `"0.5.0"` in this file. `CUPY_AVAILABLE`: bool indicating whether the CuPy import succeeded. It does not confirm a usable device or compatible driver.
+`__version__` is the version of the imported XPOSim module. `CUPY_AVAILABLE` records whether CuPy imported successfully. Use `select_backend("auto")` to check whether CUDA can execute.
 
 <a id="api-wavelength_energy"></a>
 
@@ -567,7 +585,7 @@ Material.optical_constants(self, energy_kev: float) -> tuple[float, float]
 
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
-| `energy_kev` | float or None | `required` | Positive photon energy in keV. Mutually exclusive with wavelength_m. Needed for material-table evaluation. |
+| `energy_kev` | float | `required` | Positive photon energy in keV. |
 
 **Returns**
 
@@ -575,7 +593,7 @@ tuple[float, float]: (delta, beta).
 
 **Raises / Warns**
 
-ValueError for nonpositive energy in table mode or energy outside any required f1/f2 range; FileNotFoundError for missing tables. Malformed/incomplete tables may also raise parsing errors.
+A nonpositive energy raises `ValueError` in either mode. In table mode, energies outside the required f1/f2 ranges raise `ValueError` and missing tables raise `FileNotFoundError`. Malformed tables may raise parsing errors.
 
 **Notes**
 
@@ -707,9 +725,9 @@ OpticalObject(grid: BaseGrid, *, wavelength_m: float | None = None, energy_kev: 
 
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
-| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `wavelength_m` | float or None | `None` | Positive wavelength in metres. Mutually exclusive with energy_kev. Both may be None for geometry-only construction. |
-| `energy_kev` | float or None | `None` | Positive photon energy in keV. Mutually exclusive with wavelength_m. Needed for material-table evaluation. |
+| `energy_kev` | float or None | `None` | Positive photon energy in keV. A wavelength may be supplied instead. |
 
 **Returns**
 
@@ -740,9 +758,9 @@ OpticalElement(input_field: Any | None = None, grid: BaseGrid | None = None, *, 
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `input_field` | Array or None | `None` | Incident complex amplitude at the element entrance. Must match grid backend and shape. None allows some geometry-only operations; E() requires a field. |
-| `grid` | Grid1D or Grid2D | `None` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `None` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `wavelength_m` | float or None | `None` | Positive wavelength in metres. Mutually exclusive with energy_kev. Both may be None for geometry-only construction. |
-| `energy_kev` | float or None | `None` | Positive photon energy in keV. Mutually exclusive with wavelength_m. Needed for material-table evaluation. |
+| `energy_kev` | float or None | `None` | Positive photon energy in keV. A wavelength may be supplied instead. |
 
 **Returns**
 
@@ -979,10 +997,10 @@ PointSource(grid: BaseGrid, position: float | tuple[float, float] = 0.0, *, wave
 
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
-| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `position` | float or tuple | `0.0` | Transverse source position, metres: scalar in 1D, (x0, y0) in 2D. For 2D pass a tuple explicitly; the scalar default is not accepted. |
 | `wavelength_m` | float or None | `None` | Positive wavelength in metres. Mutually exclusive with energy_kev. Both may be None for geometry-only construction. |
-| `energy_kev` | float or None | `None` | Positive photon energy in keV. Mutually exclusive with wavelength_m. Needed for material-table evaluation. |
+| `energy_kev` | float or None | `None` | Positive photon energy in keV. A wavelength may be supplied instead. |
 
 **Returns**
 
@@ -1049,11 +1067,11 @@ Hole(input_field: Any | None = None, grid: BaseGrid | None = None, center_offset
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `input_field` | Array or None | `None` | Incident complex amplitude at the element entrance. Must match grid backend and shape. None allows some geometry-only operations; E() requires a field. |
-| `grid` | Grid1D or Grid2D | `None` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `None` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `center_offset` | float or tuple or None | `None` | Required symmetric opening offset, metres: scalar x0 in 1D or (x0, y0) in 2D. Openings lie at opposite positions. Zero offset makes a single opening. |
 | `radius` | float | `None` | Positive opening radius, metres. |
 | `wavelength_m` | float or None | `None` | Positive wavelength in metres. Mutually exclusive with energy_kev. Both may be None for geometry-only construction. |
-| `energy_kev` | float or None | `None` | Positive photon energy in keV. Mutually exclusive with wavelength_m. Needed for material-table evaluation. |
+| `energy_kev` | float or None | `None` | Positive photon energy in keV. A wavelength may be supplied instead. |
 
 **Returns**
 
@@ -1110,9 +1128,9 @@ Blade(input_field: Any | None = None, grid: BaseGrid | None = None, *, wavelengt
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `input_field` | Array or None | `None` | Incident complex amplitude at the element entrance. Must match grid backend and shape. None allows some geometry-only operations; E() requires a field. |
-| `grid` | Grid1D or Grid2D | `None` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `None` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `wavelength_m` | float or None | `None` | Positive wavelength in metres. Mutually exclusive with energy_kev. Both may be None for geometry-only construction. |
-| `energy_kev` | float or None | `None` | Positive photon energy in keV. Mutually exclusive with wavelength_m. Needed for material-table evaluation. |
+| `energy_kev` | float or None | `None` | Positive photon energy in keV. A wavelength may be supplied instead. |
 
 **Returns**
 
@@ -1169,11 +1187,11 @@ ArrayObject(input_field: Any | None = None, grid: BaseGrid | None = None, thickn
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `input_field` | Array or None | `None` | Incident complex amplitude at the element entrance. Must match grid backend and shape. None allows some geometry-only operations; E() requires a field. |
-| `grid` | Grid1D or Grid2D | `None` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `None` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `thickness` | Array or sequence | `None` | A total thickness array for defect.apply; for ArrayObject construction, [values, x] or [values, x, y] in metres. ArrayObject forbids negative samples. |
 | `material` | Material | `None` | Required material supplying delta and beta. |
 | `wavelength_m` | float or None | `None` | Positive wavelength in metres. Mutually exclusive with energy_kev. Both may be None for geometry-only construction. |
-| `energy_kev` | float or None | `None` | Positive photon energy in keV. Mutually exclusive with wavelength_m. Needed for material-table evaluation. |
+| `energy_kev` | float or None | `None` | Positive photon energy in keV. A wavelength may be supplied instead. |
 
 **Returns**
 
@@ -1185,7 +1203,7 @@ TypeError for missing grid/thickness/material; ValueError for negative thickness
 
 **Notes**
 
-Input map follows SurfaceError data layout. Field calculation multiplies by a positive-thickness mask: zero thickness and out-of-map regions are opaque. Constructor with wavelength only does not derive energy for material lookup.
+The input map follows the SurfaceError data layout. Field calculation applies a positive-thickness mask that blocks zero-thickness and out-of-map regions. A supplied wavelength is converted to photon energy for material lookup.
 
 **See also:** [`ArrayObject.thickness_map`](#api-arrayobject-thickness_map); [`ArrayObject.transmission`](#api-arrayobject-transmission); Chapter 6.
 
@@ -1256,18 +1274,18 @@ CRL(input_field: Any | None = None, grid: BaseGrid | None = None, *, radius: flo
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `input_field` | Array or None | `None` | Incident complex amplitude at the element entrance. Must match grid backend and shape. None allows some geometry-only operations; E() requires a field. |
-| `grid` | Grid1D or Grid2D | `None` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `None` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `radius` | float | `required` | Positive radius of each parabolic surface, metres. |
 | `aperture` | float | `required` | Positive full optical aperture, metres; not a radius. |
 | `bridge_thickness` | float | `required` | Positive minimum material thickness between opposing parabolic surfaces, metres. |
-| `n_elements` | int | `required` | Positive number of CRL elements. In analytical methods None uses the stack count. Supply integer counts; constructor converts its argument with int(). |
+| `n_elements` | int | `required` | Positive integer number of CRL elements. |
 | `material` | Material | `required` | Required material supplying delta and beta. |
 | `transverse_length` | float or None | `None` | Positive full local nonfocusing width, metres. In 2D selects a cylindrical CRL; None selects rotational symmetry. Supplying it on Grid1D raises ValueError. |
 | `rotation` | float | `0.0` | In-plane angle, radians. For cylindrical CRLs: local focusing coordinate is cos(rotation)*x + sin(rotation)*y. |
 | `surface_error` | sequence or None | `None` | [height_error, x] in 1D or [height_error, x, y] in 2D. Heights are metres and are doubled in total thickness. See SurfaceError for array constraints. |
 | `reuse_element_geometry` | bool | `True` | Reuse a calculated element thickness/transmission map across the stack. This constructor has no per-element defect-sequence parameter. |
 | `wavelength_m` | float or None | `None` | Positive wavelength in metres. Mutually exclusive with energy_kev. Both may be None for geometry-only construction. |
-| `energy_kev` | float or None | `None` | Positive photon energy in keV. Mutually exclusive with wavelength_m. Needed for material-table evaluation. |
+| `energy_kev` | float or None | `None` | Positive photon energy in keV. A wavelength may be supplied instead. |
 
 **Returns**
 
@@ -1383,7 +1401,7 @@ CRL.theoretical_focus(self, *, n_elements: int | None = None) -> float
 
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
-| `n_elements` | int | `None` | Positive number of CRL elements. In analytical methods None uses the stack count. Supply integer counts; constructor converts its argument with int(). |
+| `n_elements` | int or None | `None` | Positive integer element count. Omit to use the stack count. |
 
 **Returns**
 
@@ -1414,7 +1432,7 @@ CRL.effective_focus(self, source_distance: float, *, n_elements: int | None = No
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `source_distance` | float | `required` | Positive source-to-CRL entrance distance, metres. |
-| `n_elements` | int | `None` | Positive number of CRL elements. In analytical methods None uses the stack count. Supply integer counts; constructor converts its argument with int(). |
+| `n_elements` | int or None | `None` | Positive integer element count. Omit to use the stack count. |
 
 **Returns**
 
@@ -1446,7 +1464,7 @@ CRL.magnification(self, source_distance: float, image_distance: float, *, n_elem
 | --- | --- | --- | --- |
 | `source_distance` | float | `required` | Positive source-to-CRL entrance distance, metres. |
 | `image_distance` | float | `required` | Positive CRL-exit-to-observation-plane distance, metres. |
-| `n_elements` | int | `None` | Positive number of CRL elements. In analytical methods None uses the stack count. Supply integer counts; constructor converts its argument with int(). |
+| `n_elements` | int or None | `None` | Positive integer element count. Omit to use the stack count. |
 
 **Returns**
 
@@ -1477,7 +1495,7 @@ CRL.image_scale(self, source_distance: float, *, n_elements: int | None = None) 
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `source_distance` | float | `required` | Positive source-to-CRL entrance distance, metres. |
-| `n_elements` | int | `None` | Positive number of CRL elements. In analytical methods None uses the stack count. Supply integer counts; constructor converts its argument with int(). |
+| `n_elements` | int or None | `None` | Positive integer element count. Omit to use the stack count. |
 
 **Returns**
 
@@ -1559,7 +1577,7 @@ CRL.is_focus_outside_crl(self, *, n_elements: int | None = None) -> bool
 
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
-| `n_elements` | int | `None` | Positive number of CRL elements. In analytical methods None uses the stack count. Supply integer counts; constructor converts its argument with int(). |
+| `n_elements` | int or None | `None` | Positive integer element count. Omit to use the stack count. |
 
 **Returns**
 
@@ -1663,7 +1681,7 @@ SurfaceError.on_grid(self, grid: BaseGrid) -> Any
 
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
-| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required at construction. |
 
 **Returns**
 
@@ -1720,7 +1738,7 @@ ThicknessDefect.apply(self, thickness: Any, grid: BaseGrid, element_index: int) 
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `thickness` | Array or sequence | `required` | A total thickness array for defect.apply; for ArrayObject construction, [values, x] or [values, x, y] in metres. ArrayObject forbids negative samples. |
-| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `element_index` | int | `required` | Zero-based element index. CRL map methods require 0 <= element_index < n_elements. Defect adapters pass it to the user callback or ignore it. |
 
 **Returns**
@@ -1782,7 +1800,7 @@ FunctionThicknessDefect.apply(self, thickness: Any, grid: BaseGrid, element_inde
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `thickness` | Array or sequence | `required` | A total thickness array for defect.apply; for ArrayObject construction, [values, x] or [values, x, y] in metres. ArrayObject forbids negative samples. |
-| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `element_index` | int | `required` | Zero-based element index. CRL map methods require 0 <= element_index < n_elements. Defect adapters pass it to the user callback or ignore it. |
 
 **Returns**
@@ -1846,7 +1864,7 @@ InterpolatedThicknessDefect.apply(self, thickness: Any, grid: BaseGrid, element_
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `thickness` | Array or sequence | `required` | A total thickness array for defect.apply; for ArrayObject construction, [values, x] or [values, x, y] in metres. ArrayObject forbids negative samples. |
-| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `element_index` | int | `required` | Zero-based element index. CRL map methods require 0 <= element_index < n_elements. Defect adapters pass it to the user callback or ignore it. |
 
 **Returns**
@@ -2046,7 +2064,7 @@ beam_metrics(field: Any, grid: BaseGrid, *, roi: Any = None, calculate_divergenc
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `field` | Array | `required` | Field or numeric array on the indicated grid/backend. Propagation and beam analysis expect complex amplitudes; filters may take real intensities. |
-| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `roi` | sequence or None | `None` | Inclusive physical-coordinate limits: (xmin, xmax) in 1D, ((xmin, xmax), (ymin, ymax)) in 2D. None selects the full window. At least one grid sample must lie in each selected axis. |
 | `calculate_divergence` | bool | `False` | Also estimate angular FWHM from the full field, not the cropped ROI. |
 | `k` | float or None | `None` | Wavenumber 2*pi/wavelength, radians per metre. Supply a positive value; required for divergence calculation. |
@@ -2080,7 +2098,7 @@ divergence(field: Any, grid: BaseGrid, k: float) -> float | tuple[float, float] 
 | Name | Type | Default | Description |
 | --- | --- | --- | --- |
 | `field` | Array | `required` | Field or numeric array on the indicated grid/backend. Propagation and beam analysis expect complex amplitudes; filters may take real intensities. |
-| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required for field calculations. |
+| `grid` | Grid1D or Grid2D | `required` | Grid defining coordinates, array shape, and backend. Required at construction. |
 | `k` | float or None | `required` | Wavenumber 2*pi/wavelength, radians per metre. Supply a positive value; required for divergence calculation. |
 
 **Returns**
@@ -2230,7 +2248,7 @@ The calculation is scalar, monochromatic, forward, and paraxial. It does not sol
 - CRL surface errors are doubled in full material thickness, and maps are interpolated in laboratory coordinates without automatic rotation.
 - `ArrayObject.E()` blocks zero-thickness regions even though `ArrayObject.transmission()` is one there.
 - Thickness-defect adapters are exported helpers, but the current CRL constructor accepts only `surface_error`, not arbitrary defect objects or per-element defect lists.
-- Formula-material lookup is not automatically triggered from wavelength alone. Resolve and pass photon energy or supply direct constants.
+- Formula-material lookup uses photon energy resolved from either input energy or input wavelength.
 - Beam centre is the peak coordinate; 2D FWHM uses peak-crossing slices; `peak_z` selects maximum peak intensity among sampled planes.
 - Low-level grid propagation accepts signed distances; optical-object propagation rejects negative distances.
 
@@ -2238,6 +2256,6 @@ These are documented implementation details, not changes to the library source. 
 
 ### Verification of these examples
 
-All 25 Python example blocks were syntax-checked and executed on reduced NumPy grids using the repository code and its actual material tables for the silicon examples. A separate CPU-only aperture example also runs without material data. Checks cover finite outputs, field and scan shapes, transform round trips, and normalized Gaussian blurring. The checked source matches commit `a68d920239bf4e5cc0ed5dcd4e3ff68315da44b7`. These checks do not verify the exported environment installation, actual GPU execution, or convergence of the production-size optical calculation. Run the complete example in the intended environment and verify numerical convergence for your geometry.
+The Python examples have been run with NumPy on reduced grids and with the included silicon material tables. The README quick start runs directly on the CPU. GPU execution and Conda environment installation require validation on the target system.
 
-*Additional physical-model references will be added by the author.*
+[Physical model and references](README.md#physical-model)
