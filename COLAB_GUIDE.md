@@ -1,6 +1,6 @@
 # X-ray focusing with compound refractive lenses in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/62def3e6c906835650039d587376af99a25dc426/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/6d587d6bb5d052ba519c45ccefaa18143b58bcc7/notebooks/CRL_Focus_Colab.ipynb).
 
 Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. Cell 2 keeps the inputs in their own form while calculations update cell 3. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results stay in the active session.
 
@@ -67,7 +67,7 @@ Choose **Crossed CRLs (2D)** and set the geometry and material of the x and y st
 
 The wave calculation propagates through the rectangular pupil of each stack and the free space between them. The numerical peak intensity and the minima of the x and y FWHM curves are wave-optical quantities. The **Equivalent aperture area** multiplies the x stack's rectangular entrance area by the simulated transmission of the pair. The material preview shows single-stack analytical quantities for each CRL.
 
-For an extended source, the plane of maximum intensity depends on both the point-source diffraction pattern and the projected source widths at that z. With the default crossed pair and Gaussian convolution, the projected y width decreases downstream of the paraxial image. The total intensity can reach a higher peak there even as the central point's spot broadens. The **Peak** navigation button refers to the central-point reference. The blue peak-intensity curve includes the entire selected source.
+For an extended source, the plane of maximum intensity depends on both the point-source diffraction pattern and how the different source points overlap at that z. For the default crossed pair with the Gaussian source, the common paraxial image is near 13.92 mm from the y stack exit. The peak-intensity curve is broad around that position. The **Peak** navigation button refers to the central-point reference. The blue peak-intensity curve includes the entire selected source.
 
 The simulation summary shows the **Equal-FWHM position** from the y stack exit. The search refines crossings and near-contact points of the full-source x and y FWHM curves inside the scanned interval. It reports the closest resolved match to the numerical peak, with a relative difference of at most 0.1%. The result is available as `result.equal_fwhm_plane` with fields `z_m`, `fwhm_x_m` and `fwhm_y_m`. An unresolved match is returned as `None`.
 
@@ -94,10 +94,10 @@ A point source has a finite source-to-CRL distance and spherical phase. A Gaussi
 
 Two methods are available:
 
-- **Intensity convolution** projects each Gaussian source width onto the observation plane with the ray-transfer magnification for that axis and z. For crossed CRLs the transfer includes both stacks and the gap. The central-point intensity is convolved with that projected Gaussian. This is a shift-invariant approximation. Source-dependent clipping and absorption, including at the second stack, can change the direct result. In Accurate mode, the crossed-CRL evaluation window accounts for the projected source widths across the scan interval.
+- **Intensity convolution** convolves the central-point intensity with the projected Gaussian at each z. For crossed CRLs, the kernel uses the beam-core displacement measured on each source axis by propagating an off-axis wave through both stacks, including their finite pupils and absorption. The measured displacement is interpolated linearly in z and used to scale the source FWHM. Single-stack calculations use the ray-transfer scale. Convolution approximates each off-axis response by a shifted central response. Direct sampling also accounts for changes in shape and transmitted intensity. The Accurate evaluation window accounts for the projected source widths across the scan interval.
 - **Incoherent point sampling** propagates each source point through the pupils and adds its weighted intensity. Crossed CRLs sample equal-probability Gaussian cells, with points centered in the cells and scaled to preserve the Gaussian variance. The independent default counts are 7 along x and 21 along y. Each extra point along one axis increases the total number of modes by the other axis count. A zero-width axis uses one point.
 
-For crossed CRLs, a sampling warning identifies axes where central source-point spacing projected onto the numerical reference plane exceeds half the computed coherent FWHM. Increase the count on that axis and compare FWHMs and profiles on the same propagation grid. **Model, mesh and diagnostics** lists the projected Gaussian widths and the actual point counts. In Python, `source_points` sets the x count and the optional `source_points_y` sets the y count. `result.source_mode_counts` and `result.projected_source_fwhm_at_peak_m` report the values used in the comparison.
+For crossed CRLs, a sampling warning identifies axes where the geometrical central source-point spacing projected onto the numerical reference plane exceeds half the computed coherent FWHM. Increase the count on that axis and compare FWHMs and profiles on the same propagation grid. **Model, mesh and diagnostics** lists the Gaussian kernel widths for convolution or the geometrical projection and the actual point counts for point sampling. In Python, `source_points` sets the x count and the optional `source_points_y` sets the y count. `result.source_mode_counts` and `result.projected_source_fwhm_at_peak_m` report these values.
 
 ## Geometry-based adaptive grid
 
