@@ -1,6 +1,6 @@
 # X-ray focusing with compound refractive lenses in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/4be2578cc34486de4b6ae771d3cfc4d98f8a63a6/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/72370ea1f57eaefb6f26f464c95582b6b5048095/notebooks/CRL_Focus_Colab.ipynb).
 
 Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. Cell 2 keeps the inputs in their own form while calculations update cell 3. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results stay in the active session.
 
@@ -51,10 +51,36 @@ Focusing dimensionality describes the parabolic lens surfaces; it is independent
 | Line focus (1D) | 1D | Parabolic profile focusing along x |
 | Line focus (1D) | 2D | The same x-focusing profile with finite structure depth along y |
 | Point focus (2D) | 2D | Axisymmetric parabolic surfaces focusing along x and y |
+| Crossed CRLs (2D) | 2D | An x-focusing CRL followed by a separate y-focusing CRL rotated by 90° |
 
-The structure-depth input is enabled for line focusing on a 2D grid. Point focusing selects a 2D grid automatically.
+The structure-depth input is enabled for line focusing on a 2D grid and for each crossed stack. Both two-axis modes select a 2D grid automatically.
 
 CRL dimensions are entered in µm, photon energy in keV, density in g/cm³, and source distance in metres. Source distance is measured to the CRL entrance. The axial coordinate z is measured from the CRL exit. Displayed units adapt to the range.
+
+### Align two crossed CRLs
+
+Choose **Crossed CRLs (2D)** and set the geometry and material of the x and y stacks separately. Both receive the same photon energy. **Source-to-CRL distance** runs to the x stack entrance. **Inter-stack gap** measures the free space from the x stack exit to the y stack entrance. A gap of zero places the stacks in contact.
+
+**Auto-align** finds the smallest nonnegative gap for which both paraxial images lie at the same downstream z. The calculation uses the ray-transfer matrix of each stack, including its axial length. Along y, the source-to-stack distance includes the length of the x stack and the gap. Along x, propagation continues through the gap and the length of the y stack. The form and the report use the y stack exit as z = 0 for both image positions.
+
+**Manual** evaluates the gap you enter. The isometric layout indicates a common image plane or separate line images and shows a suggested gap when available. **Axial alignment tolerance** sets the permitted separation of the predicted images. With no physical auto-alignment solution, adjust the lens parameters or enter a manual gap to simulate an astigmatic configuration with a downstream image.
+
+The wave calculation propagates through the rectangular pupil of each stack and the free space between them. The numerical peak intensity and the minima of the x and y FWHM curves are wave-optical quantities. The **Equivalent aperture area** multiplies the x stack's rectangular entrance area by the simulated transmission of the pair. The material preview shows single-stack analytical quantities for each CRL.
+
+```python
+from XPOSim import CRLFocusConfig, CRLStackConfig, analyze_crossed_crl, estimate_crl_focus
+
+config = CRLFocusConfig(
+    geometry="crossed", material_formula="Si", density_g_cm3=2.33,
+    radius_m=6.25e-6, aperture_m=50e-6, bridge_thickness_m=2e-6,
+    n_elements=26, structure_depth_m=30e-6, source_distance_m=15.0,
+    second_crl=CRLStackConfig(radius_m=4.5e-6, structure_depth_m=30e-6),
+    gap_m=None,
+)
+alignment = analyze_crossed_crl(config)
+print(alignment.gap_m, alignment.image_x_m, alignment.image_y_m)
+result = estimate_crl_focus(config)
+```
 
 ## Plane-wave, point and Gaussian illumination
 
