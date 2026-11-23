@@ -1,6 +1,6 @@
 # X-ray focusing with compound refractive lenses in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/72370ea1f57eaefb6f26f464c95582b6b5048095/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/46d3a51f197e63e14a25465fa410034f5244b184/notebooks/CRL_Focus_Colab.ipynb).
 
 Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. Cell 2 keeps the inputs in their own form while calculations update cell 3. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results stay in the active session.
 
@@ -59,7 +59,7 @@ CRL dimensions are entered in µm, photon energy in keV, density in g/cm³, and 
 
 ### Align two crossed CRLs
 
-Choose **Crossed CRLs (2D)** and set the geometry and material of the x and y stacks separately. Both receive the same photon energy. **Source-to-CRL distance** runs to the x stack entrance. **Inter-stack gap** measures the free space from the x stack exit to the y stack entrance. A gap of zero places the stacks in contact.
+Choose **Crossed CRLs (2D)** and set the geometry and material of the x and y stacks separately. The notebook starts with 6 elements in the x stack and 58 in the y stack. Both use the same default geometry and silicon. The isometric layout shows the element count above each stack, and the y element preview is rotated about the optical axis. **Source-to-CRL distance** runs to the x stack entrance. **Inter-stack gap** measures the free space from the x stack exit to the y stack entrance. A gap of zero places the stacks in contact.
 
 **Auto-align** finds the smallest nonnegative gap for which both paraxial images lie at the same downstream z. The calculation uses the ray-transfer matrix of each stack, including its axial length. Along y, the source-to-stack distance includes the length of the x stack and the gap. Along x, propagation continues through the gap and the length of the y stack. The form and the report use the y stack exit as z = 0 for both image positions.
 
@@ -73,8 +73,8 @@ from XPOSim import CRLFocusConfig, CRLStackConfig, analyze_crossed_crl, estimate
 config = CRLFocusConfig(
     geometry="crossed", material_formula="Si", density_g_cm3=2.33,
     radius_m=6.25e-6, aperture_m=50e-6, bridge_thickness_m=2e-6,
-    n_elements=26, structure_depth_m=30e-6, source_distance_m=15.0,
-    second_crl=CRLStackConfig(radius_m=4.5e-6, structure_depth_m=30e-6),
+    n_elements=6, structure_depth_m=30e-6, source_distance_m=15.0,
+    second_crl=CRLStackConfig(radius_m=6.25e-6, n_elements=58, structure_depth_m=30e-6),
     gap_m=None,
 )
 alignment = analyze_crossed_crl(config)
@@ -86,7 +86,7 @@ result = estimate_crl_focus(config)
 
 **Plane wave** supplies a coherent field with uniform unit amplitude and constant phase inside the entrance pupil. Source distance and FWHM inputs are disabled. The preview shows the back focal distance. In the Python API, use `source_type="plane"`. The API sets `source_distance_m` and each magnification component to `None`.
 
-A point source has a finite source-to-CRL distance and spherical phase. A Gaussian source is spatially incoherent, centered, and specified by its intensity **FWHM**: x on a 1D grid, x and y on a 2D grid. Internally, sigma = FWHM / (2 sqrt(2 ln 2)). Zero width represents a point-like source along that axis.
+A point source has a finite source-to-CRL distance and spherical phase. A Gaussian source is spatially incoherent, centered, and specified by its intensity **FWHM**. The form defaults to 100 µm along x and 1000 µm along y. A 1D grid uses the x width. Zero width represents a point-like source along that axis.
 
 Two methods are available:
 
@@ -157,7 +157,7 @@ A successful CUDA probe selects CuPy. Field arithmetic, FFTs, Fourier zoom and G
 
 The exit power is summed on the full propagation grid before field resampling and display cropping. Free propagation conserves power over the full transverse plane, so the equivalent aperture from transmission is independent of z. Incoherent point sampling integrates the weighted exit powers of all modes during the existing source batches. The convolution model uses the central point's power under its shift-invariant approximation.
 
-As of XPOSim 0.19, `result.effective_aperture_m` returns one scalar in metres for every geometry. `result.summary()` records the convention as `integrated_transmission`. The low-level `crl.effective_aperture()` applies the entrance pupil to the supplied coherent field and returns the same scalar, or `None` when no power enters the pupil. Use `beam_metrics(crl.E(), crl.grid).fwhm` when you need the exit beam's half-maximum widths.
+For a single stack, `result.effective_aperture_m` returns a width or diameter in metres. For crossed CRLs, `result.equivalent_aperture_area_m2` returns an area in square metres. `result.summary()` records the convention as `integrated_transmission`. The low-level `crl.effective_aperture()` applies the entrance pupil to the supplied coherent field and returns the equivalent width or diameter, or `None` when no power enters the pupil. Use `beam_metrics(crl.E(), crl.grid).fwhm` for the exit beam's half-maximum widths.
 
 ## Results and slider
 
@@ -187,7 +187,7 @@ A **single shared linear color scale is attached directly to the map axes**: to 
 
 The common z slider sits below both result panels. An integer slider selects indices of the **uniform z lattice**; track clicks, dragging and keyboard moves use a synchronous handler without timers. The slider uses drag-snap interaction, which avoids the tap-animation lock that can ignore repeated clicks. Setup checks the required ipywidgets 8 version. Physical z entry snaps to the nearest calculated plane. Previous/Next move one regular sample; **Peak** selects the exact numerical reference, which is a regular sample of the peak-anchored lattice. Physical z entry still snaps to the nearest sample. When rendering completes, the slider, physical z, counter, transverse plane and all three longitudinal cursors refer to the same sampled z. A new request received during rendering replaces the pending request; a superseded frame is discarded. Plots/readouts are staged until the complete frame is ready, and errors preserve the preceding frame and its cursor cache. The status shows **Updating selected plane** while the previous complete frame remains visible. Closed controls from a preceding calculation cannot select a plane in the new result. `result.plane_at(z_m)` remains available for any detector distance, including the exact numerical reference.
 
-Primary labels use 14 px text and numeric readouts approximately 20–21 px. Section lines separate names from values. Units follow the numbers in the calculation summary; separate x/y labels keep the measurements distinct. Axes usually use up to two decimals without redundant zeros. Very short transverse axes use enough decimals to distinguish the two labels. The physical z input keeps enough decimals for the actual axial step. The turquoise cursor marks selected z; plot legends stay outside the data axes. Text uses a monospace stack with Consolas when installed; plots fall back to the available DejaVu Sans Mono. No font download or extra dependency is needed.
+Primary labels use 14 px text and numeric readouts approximately 20–21 px. Units follow the numbers in the calculation summary. Millimetre readouts use up to two decimal places without trailing zeros. For closely spaced axial planes, the z axis and navigation use µm or nm so adjacent coordinates remain distinct. The calculations use the full-precision distances. The turquoise cursor marks selected z; plot legends sit outside the data axes. Text uses a monospace stack with Consolas when installed; plots fall back to DejaVu Sans Mono.
 
 ### Phones and narrow notebook outputs
 
