@@ -1,6 +1,6 @@
 # X-ray focusing with compound refractive lenses in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/8aaa52d8b44bd239c5331afeca31ea6d46b239f0/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/e2fafd3f50fa9277aaecba10e99e012a7f593633/notebooks/CRL_Focus_Colab.ipynb).
 
 Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. Cell 2 keeps the inputs in their own form while calculations update cell 3. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results stay in the active session.
 
@@ -92,10 +92,10 @@ A point source has a finite source-to-CRL distance and spherical phase. A Gaussi
 
 Two methods are available:
 
-- **Intensity convolution** propagates the field from the central source point, then convolves its intensity with the Gaussian source projected onto the selected transverse plane using the ray-transfer model of the lens stack. This assumes the intensity response shifts with source position. Source-dependent clipping and absorption can limit that approximation.
-- **Incoherent point sampling:** Gaussian quadrature splits the source into weighted points. Each field passes through the CRL, and weighted intensities are added. Independent modes use batched FFTs. N nodes per nonzero-width axis give N² modes for a 2D source. Increase the node count to check convergence.
+- **Intensity convolution** projects each Gaussian source width onto the observation plane with the ray-transfer magnification for that axis and z. For crossed CRLs the transfer includes both stacks and the gap. The central-point intensity is convolved with that projected Gaussian. This is a shift-invariant approximation. Source-dependent clipping and absorption, including at the second stack, can change the direct result. In Accurate mode, the crossed-CRL evaluation window accounts for the projected source widths across the scan interval.
+- **Incoherent point sampling** propagates each source point through the pupils and adds its weighted intensity. Crossed CRLs sample equal-probability Gaussian cells, with points centered in the cells and scaled to preserve the Gaussian variance. The independent default counts are 7 along x and 21 along y. Each extra point along one axis increases the total number of modes by the other axis count. A zero-width axis uses one point.
 
-Source spectra are cached within a RAM/VRAM budget. Larger problems stream bounded batches and recompute modes rather than allocating an unbounded source stack. No cache is written to disk.
+For crossed CRLs, a sampling warning identifies axes where central source-point spacing projected onto the numerical reference plane exceeds half the computed coherent FWHM. Increase the count on that axis and compare FWHMs and profiles on the same propagation grid. **Model, mesh and diagnostics** lists the projected Gaussian widths and the actual point counts. In Python, `source_points` sets the x count and the optional `source_points_y` sets the y count. `result.source_mode_counts` and `result.projected_source_fwhm_at_peak_m` report the values used in the comparison.
 
 ## Geometry-based adaptive grid
 
