@@ -45,7 +45,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.27.0"
+__version__ = "0.28.0"
 
 
 __all__ = [
@@ -3660,6 +3660,9 @@ class CRLFocusResult:
     z_m is a uniform display grid anchored at the numerical peak distance.
     peak_index indexes that exact reference plane. best_intensity,
     reference_metrics and fwhm_at_peak_m refer to the exact numerical distance.
+    longitudinal_intensity stores the x–z section. When both axes focus,
+    longitudinal_intensity_y stores the y–z section. Each section uses the
+    available sample nearest the optical axis in its perpendicular direction.
     """
     configuration: CRLFocusConfig
     backend: str
@@ -3691,6 +3694,7 @@ class CRLFocusResult:
     display_signal_bounds_m: tuple[tuple[float,float],tuple[float,float]] | None = None
     crossed_alignment: CrossedCRLAnalysis | None = None
     equal_fwhm_plane: EqualFWHMPlane | None = None
+    longitudinal_intensity_y: np.ndarray | None = None
 
     @property
     def peak_z_m(self):
@@ -4224,29 +4228,36 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     positions=_uniform_scan_positions(bounds,cfg.scan_points,cfg.scan_step_m,cfg.accuracy,numerical.z_m,
                                      within_bounds=manual_detector and cfg.scan_range_m is not None)
     metrics=[]
-    lines=[]
+    lines_x,lines_y=[],[]
+    both_axes=len(cfg.focusing_axes)==2
+    x_full,y_full=session.detector_coordinates(session.measurement_slices)
+    if both_axes:
+        center_x=int(xp.argmin(abs(x_full)).item())
+        center_y=int(xp.argmin(abs(y_full)).item())
     transverse_x=xp.zeros(detector.nx,dtype=xp.float64)
     transverse_y=None if grid.dimension==1 else xp.zeros(detector.ny,dtype=xp.float64)
     reporter.start("sampling",len(positions),"Calculating detector planes and beam metrics")
     for z,image in session.iter_intensities(positions,reporter):
         metrics.append(session.metrics(image))
         region=image[session.measurement_slices]
-        line=region if grid.dimension==1 else region[region.shape[0]//2,:]
+        if both_axes:
+            line=region[center_y,:]
+            lines_y.append(_to_numpy(region[:,center_x]).copy())
+        else:
+            line=region if grid.dimension==1 else region[region.shape[0]//2,:]
         if not manual_detector:
             if grid.dimension==1:
                 transverse_x=xp.maximum(transverse_x,image)
             else:
                 transverse_x=xp.maximum(transverse_x,xp.max(image,axis=0))
                 transverse_y=xp.maximum(transverse_y,xp.max(image,axis=1))
-        lines.append(_to_numpy(line).copy())
+        lines_x.append(_to_numpy(line).copy())
     reporter.start("finalizing",detail="Finalizing transverse ROI and beam metrics")
-    x_slice=slice(None)
+    x_slice=y_slice=slice(None)
     display_signal_bounds=None
     if not manual_detector:
-        x_full,y_full=session.detector_coordinates(session.measurement_slices)
         x_full,profile_x=_to_numpy(x_full),_to_numpy(transverse_x)
         x_slice=_display_slice(x_full,profile_x,cfg.transverse_roi_level)
-        y_slice=None
         if y_full is not None:
             y_full,profile_y=_to_numpy(y_full),_to_numpy(transverse_y)
             y_slice=_display_slice(y_full,profile_y,cfg.transverse_roi_level)
@@ -4321,10 +4332,11 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         equal_fwhm_plane=_find_equal_fwhm_plane(positions,widths,numerical.z_m,measure_widths)
     result=CRLFocusResult(cfg,backend,analytical_image,collimated_focus,numerical,
         positions,np.asarray([m.max_intensity for m in metrics]),widths,best_index,
-        best.x_m,best.y_m,best.intensity,np.stack(lines)[:,x_slice].copy(),
+        best.x_m,best.y_m,best.intensity,np.stack(lines_x)[:,x_slice].copy(),
         session.transmission,float(delta),float(beta),grid.dx,grid.shape,
         None if grid.dimension==1 else grid.dy,image.shape,detector.dx,
         None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics,point_metrics,
-        display_signal_bounds,alignment,equal_fwhm_plane)
+        display_signal_bounds,alignment,equal_fwhm_plane,
+        np.stack(lines_y)[:,y_slice].copy() if both_axes else None)
     reporter.finish()
     return result

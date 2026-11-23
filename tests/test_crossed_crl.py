@@ -22,6 +22,18 @@ class CrossedCRLTests(unittest.TestCase):
             scan_points=7, adaptive_window=False,
         )
 
+    def assert_longitudinal_sections(self, result):
+        self.assertEqual(result.longitudinal_intensity.shape, (len(result.z_m), len(result.x_m)))
+        self.assertEqual(result.longitudinal_intensity_y.shape, (len(result.z_m), len(result.y_m)))
+        for index in (0, result.peak_index, len(result.z_m)-1):
+            p = result.plane_at(result.z_m[index], full=True)
+            xs = np.searchsorted(p.x_m, result.x_m)
+            ys = np.searchsorted(p.y_m, result.y_m)
+            np.testing.assert_allclose(result.longitudinal_intensity[index],
+                                       p.intensity[np.argmin(abs(p.y_m)), xs])
+            np.testing.assert_allclose(result.longitudinal_intensity_y[index],
+                                       p.intensity[ys, np.argmin(abs(p.x_m))])
+
     def test_auto_and_manual_gaps_use_both_stack_lengths(self):
         for cfg in (self.cfg, replace(self.cfg, source_type="plane"),
                     replace(self.cfg, source_distance_m=.09)):
@@ -81,6 +93,15 @@ class CrossedCRLTests(unittest.TestCase):
         summary = result.summary()
         self.assertEqual(summary["distance_reference"], "y CRL exit")
         self.assertTrue(summary["crossed_alignment"]["aligned"])
+        self.assert_longitudinal_sections(result)
+
+    def test_point_focus_sections_use_nearest_available_axis_in_manual_roi(self):
+        cfg = replace(self.cfg, geometry="two-dimensional", second_crl=None,
+                      detector_roi_m=((.5e-6,4e-6),(1e-6,5e-6)))
+        result = estimate_crl_focus(cfg)
+        self.assertGreater(result.x_m[0], 0.)
+        self.assertGreater(result.y_m[0], 0.)
+        self.assert_longitudinal_sections(result)
 
     def test_equal_fwhm_refines_the_crossing_nearest_the_intensity_peak(self):
         z = np.linspace(0.01, 0.05, 6)
