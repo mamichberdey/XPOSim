@@ -45,7 +45,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.24.0"
+__version__ = "0.25.0"
 
 
 __all__ = [
@@ -76,8 +76,11 @@ __all__ = [
     "gaussian_filter_2d",
     "select_backend",
     "CRLFocusConfig",
+    "CRLStackConfig",
     "CRLAnalyticalResult",
+    "CrossedCRLAnalysis",
     "analyze_crl",
+    "analyze_crossed_crl",
     "CRLFocusResult",
     "estimate_crl_focus",
     "CRLProgressUpdate",
@@ -1672,6 +1675,8 @@ class CRL(OpticalElement):
         theta = self.rotation
         if theta == 0.0:
             return self.grid.x, self.grid.y
+        if theta == np.pi / 2:
+            return self.grid.y, -self.grid.x
         c, s = np.cos(theta), np.sin(theta)
         x_local = c * self.grid.x + s * self.grid.y
         y_local = -s * self.grid.x + c * self.grid.y
@@ -2527,6 +2532,25 @@ def _peak_z_roi(objective: Callable[[float], float], peak: PeakIntensitySearchRe
 
 
 @dataclass(frozen=True)
+class CRLStackConfig:
+    """Geometry and material of the second, y-focusing CRL in a crossed pair."""
+
+    radius_m: float = 4.5e-6
+    aperture_m: float = 50e-6
+    bridge_thickness_m: float = 2e-6
+    n_elements: int = 26
+    structure_depth_m: float = 50e-6
+    material_formula: str | None = "Si"
+    density_g_cm3: float | None = 2.33
+    material_delta: float | None = None
+    material_beta: float | None = None
+
+    def _as_focus_config(self, energy_kev, source_distance_m):
+        return CRLFocusConfig(**asdict(self), energy_kev=energy_kev, grid_dimension=2,
+            source_distance_m=source_distance_m, source_type="plane" if source_distance_m is None else "point")
+
+
+@dataclass(frozen=True)
 class CRLFocusConfig:
     """Ideal CRL workflow. Lengths are metres; Gaussian source sizes are FWHM.
 
@@ -2549,6 +2573,10 @@ class CRLFocusConfig:
     detector_roi_m sets transverse detector bounds, (xmin, xmax) in 1D or
     ((xmin, xmax), (ymin, ymax)) in 2D. With a manual detector ROI and
     scan_range_m, every sampled z stays inside the requested interval.
+    For geometry='crossed', the main lens fields describe the x-focusing stack.
+    second_crl describes the y-focusing stack. gap_m measures the empty space
+    between the stacks; None solves for the smallest nonnegative matching gap.
+    Observation z is measured from the exit of the second stack.
     """
     energy_kev: float = 12.0
     material_formula: str | None = "Be"
@@ -2585,15 +2613,19 @@ class CRLFocusConfig:
     grid_step_y_m: float | None = None
     scan_step_m: float | None = None
     detector_roi_m: tuple[float,float] | tuple[tuple[float,float],tuple[float,float]] | None = None
+    second_crl: CRLStackConfig | None = None
+    gap_m: float | None = None
+    alignment_tolerance_m: float = 1e-6
 
     def __post_init__(self):
         aliases = {"cylindrical": "one-dimensional", "axisymmetric": "two-dimensional"}
         object.__setattr__(self, "geometry", aliases.get(self.geometry, self.geometry))
-        if self.geometry not in {"one-dimensional", "two-dimensional"}:
-            raise ValueError("Choose one-dimensional or two-dimensional focusing.")
-        dimension = self.grid_dimension if self.grid_dimension is not None else (2 if self.geometry == "two-dimensional" else 1)
+        if self.geometry not in {"one-dimensional", "two-dimensional", "crossed"}:
+            raise ValueError("Choose one-dimensional, two-dimensional or crossed CRL focusing.")
+        focus_in_both_axes = self.geometry != "one-dimensional"
+        dimension = self.grid_dimension if self.grid_dimension is not None else (2 if focus_in_both_axes else 1)
         _validate_count("grid_dimension", dimension)
-        if dimension not in (1, 2) or (self.geometry == "two-dimensional" and dimension != 2):
+        if dimension not in (1, 2) or (focus_in_both_axes and dimension != 2):
             raise ValueError("Two-dimensional focusing requires a 2D grid.")
         object.__setattr__(self, "grid_dimension", int(dimension))
         if self.source_type not in {"point", "gaussian", "plane"}:
@@ -2622,7 +2654,7 @@ class CRLFocusConfig:
             object.__setattr__(self, name, float(getattr(self, name)))
         if self.window_factor <= 1:
             raise ValueError("window_factor must exceed one.")
-        if dimension == 2 and self.geometry == "one-dimensional":
+        if dimension == 2 and self.geometry != "two-dimensional":
             if self.structure_depth_m is None:
                 raise ValueError("A 2D grid needs structure_depth_m for a one-dimensionally focusing CRL.")
             _validate_positive("structure_depth_m", self.structure_depth_m)
@@ -2682,6 +2714,22 @@ class CRLFocusConfig:
             object.__setattr__(self,"detector_roi_m",bounds)
         if self.material_delta is None:
             self.create_material().composition()
+        if self.geometry == "crossed":
+            if not isinstance(self.second_crl, CRLStackConfig):
+                raise ValueError("Crossed focusing requires a second CRLStackConfig for the y axis.")
+            self.second_crl._as_focus_config(self.energy_kev, self.source_distance_m)
+            _validate_positive("alignment_tolerance_m", self.alignment_tolerance_m)
+            if self.gap_m is not None:
+                _validate_finite("gap_m", self.gap_m)
+                if self.gap_m < 0:
+                    raise ValueError("The gap between the two CRLs must be non-negative.")
+                object.__setattr__(self, "gap_m", float(self.gap_m))
+        elif self.second_crl is not None or self.gap_m is not None:
+            raise ValueError("second_crl and gap_m apply to crossed focusing only.")
+
+    @property
+    def focusing_axes(self) -> tuple[str, ...]:
+        return ("x",) if self.geometry == "one-dimensional" else ("x", "y")
 
     def create_material(self) -> Material:
         """Build the selected material; explicit coefficients bypass tables.
@@ -2692,6 +2740,12 @@ class CRLFocusConfig:
         if self.material_delta is not None:
             return Material(delta=self.material_delta,beta=self.material_beta)
         return Material(self.material_formula,self.density_g_cm3)
+
+
+def _focus_lens_parameters(cfg):
+    return dict(radius=cfg.radius_m, aperture=cfg.aperture_m,
+                bridge_thickness=cfg.bridge_thickness_m, n_elements=cfg.n_elements,
+                material=cfg.create_material(), energy_kev=cfg.energy_kev)
 
 
 @dataclass(frozen=True)
@@ -2835,7 +2889,7 @@ def _kohn_effective_aperture(reference,cfg,gaussian_pupil):
     return float(free_space*amplitude*np.sqrt(np.pi/a.real)/disk_factor)
 
 
-def analyze_crl(configuration: CRLFocusConfig, *, kohn_gaussian_pupil: bool=False) -> CRLAnalyticalResult:
+def analyze_crl(configuration: CRLFocusConfig, *, kohn_gaussian_pupil: bool=False) -> CRLAnalyticalResult | CrossedCRLAnalysis:
     """Return cheap analytical material/lens parameters for any material mode.
 
     Focal and image distances use the CRL exit reference. Counts and geometry
@@ -2852,6 +2906,8 @@ def analyze_crl(configuration: CRLFocusConfig, *, kohn_gaussian_pupil: bool=Fals
     if not isinstance(configuration,CRLFocusConfig):
         raise TypeError("Pass a CRLFocusConfig instance.")
     cfg=configuration
+    if cfg.geometry == "crossed":
+        return analyze_crossed_crl(cfg, kohn_gaussian_pupil=kohn_gaussian_pupil)
     delta,beta=cfg.create_material().optical_constants(cfg.energy_kev)
     # One reference element avoids warnings from a temporarily excessive N
     # while editing the form. Even N=1 can be invalid for extreme constants;
@@ -2883,6 +2939,167 @@ def analyze_crl(configuration: CRLFocusConfig, *, kohn_gaussian_pupil: bool=Fals
         float(reference.element_period*cfg.n_elements),bool(external),bool(real),magnification,
         reference.element_period,web_transmission,rocking_fwhm,_gaussian_coherence_exit(reference,cfg),
         _kohn_effective_aperture(reference,cfg,kohn_gaussian_pupil))
+
+
+@dataclass(frozen=True)
+class CrossedCRLAnalysis:
+    """Paraxial alignment of an x-focusing stack followed by a y-focusing stack.
+
+    image_x_m and image_y_m both use the second CRL exit as z=0. A negative
+    value lies upstream of that exit. The individual lens results use their
+    respective entrance and exit planes. The separation is signed (y minus x).
+    """
+
+    x_lens: CRLAnalyticalResult
+    y_lens: CRLAnalyticalResult
+    gap_m: float | None
+    recommended_gap_m: float | None
+    image_x_m: float | None
+    image_y_m: float | None
+    common_image_m: float | None
+    collimated_focus_m: float | None
+    message: str
+
+    @property
+    def image_separation_m(self) -> float | None:
+        if all(z is not None and np.isfinite(z) for z in (self.image_x_m, self.image_y_m)):
+            return self.image_y_m - self.image_x_m
+        return None
+
+    @property
+    def aligned(self) -> bool:
+        return self.common_image_m is not None
+
+    @property
+    def magnification_at_image(self) -> tuple[float | None, float | None]:
+        return tuple(lens.magnification_at_image[0] for lens in (self.x_lens, self.y_lens))
+
+
+def _ray_drift(distance):
+    return np.array([[1., distance], [0., 1.]])
+
+
+def _paraxial_image(matrix, source_distance):
+    incident = np.array([1., 0.]) if source_distance is None else np.array([source_distance, 1.])
+    height, angle = matrix @ incident
+    return -float(height / angle) if angle else np.inf
+
+
+def _crossed_matching_gap(x_image, y_matrix, lens_lengths, source_distance):
+    """Solve g + L_y + q_y(s + L_x + g) = q_x for a downstream image."""
+    lx, ly = lens_lengths
+    back = _paraxial_image(y_matrix, None)
+    available = x_image - ly
+    excess = available - back
+    if excess < -1e-12:
+        return None
+    if source_distance is None:
+        return max(0., excess)
+
+    # q_y(s') = back + h**2 / (s' - front), where h is the effective
+    # focal length from the principal plane, and front is from the entrance.
+    c, d = y_matrix[1]
+    front, h = -d / c, abs(1 / c)
+    total = (source_distance + lx - front) + excess
+    if total < 2 * h:
+        return None
+    large = (total + np.sqrt((total - 2 * h) * (total + 2 * h))) / 2
+    candidates = (excess - h**2 / large, excess - large)
+    valid = [max(0., float(gap)) for gap in candidates
+             if gap >= -1e-12 and available > gap and source_distance + lx + gap > front]
+    return min(valid, default=None)
+
+
+def analyze_crossed_crl(configuration: CRLFocusConfig, *, kohn_gaussian_pupil: bool=False) -> CrossedCRLAnalysis:
+    """Align two centered orthogonal stacks with the discrete CRL ray matrices.
+
+    The source distance is measured to the x stack entrance. Along y, that
+    whole stack acts as a drift in the ray model. Along x, the gap and y
+    stack act as drifts after x focusing. The smallest physical matching gap
+    is used when gap_m is None. A manual gap is reported as entered.
+    """
+    if not isinstance(configuration, CRLFocusConfig) or configuration.geometry != "crossed":
+        raise ValueError("Use a CRLFocusConfig with geometry='crossed'.")
+    cfg = configuration
+    x_cfg = replace(cfg, geometry="one-dimensional", second_crl=None, gap_m=None)
+    y_cfg = cfg.second_crl._as_focus_config(cfg.energy_kev, cfg.source_distance_m)
+    x = analyze_crl(x_cfg, kohn_gaussian_pupil=kohn_gaussian_pupil)
+    y = analyze_crl(y_cfg, kohn_gaussian_pupil=kohn_gaussian_pupil)
+    lens_lengths = x.lens_length_m, y.lens_length_m
+    if not (x.external_focus and y.external_focus):
+        return CrossedCRLAnalysis(x, y, cfg.gap_m, None, None, None, None, None,
+            "No common image plane: a stack exceeds its external-focus element limit.")
+
+    grid = Grid1D(cfg.aperture_m, 2, backend="numpy")
+    mx = CRL(grid=grid, **_focus_lens_parameters(x_cfg)).ray_transfer_matrix()
+    my = CRL(grid=grid, **_focus_lens_parameters(y_cfg)).ray_transfer_matrix()
+    bx, by = _paraxial_image(mx, None), _paraxial_image(my, None)
+    s = cfg.source_distance_m
+    qx = _paraxial_image(mx, s)
+    recommended = (_crossed_matching_gap(qx, my, lens_lengths, s)
+                   if np.isfinite(qx) and qx > 0 and bx > 0 and by > 0 else None)
+    gap = recommended if cfg.gap_m is None else cfg.gap_m
+    x = replace(x, collimated_focus_m=bx, image_distance_m=qx,
+                magnification_at_image=(float(mx[0,0]+qx*mx[1,0]) if s is not None and np.isfinite(qx) else None,None),
+                real_image=bool(np.isfinite(qx) and qx > 0))
+    if gap is None:
+        return CrossedCRLAnalysis(x, y, None, None, None, None, None, None,
+            "No common downstream image plane is attainable with a nonnegative gap. Adjust the lens parameters.")
+
+    lx, ly = lens_lengths
+    source_to_y = None if s is None else s + lx + gap
+    qy = _paraxial_image(my, source_to_y)
+    y = replace(y, collimated_focus_m=by, image_distance_m=qy,
+                magnification_at_image=(float(my[0,0]+qy*my[1,0]) if s is not None and np.isfinite(qy) else None,None),
+                real_image=bool(np.isfinite(qy) and qy > 0))
+    image_x = qx - gap - ly
+    collimated_x = bx - gap - ly
+
+    def common(a, b):
+        if np.isfinite(a) and np.isfinite(b) and min(a, b) > 0 and abs(a-b) <= cfg.alignment_tolerance_m:
+            return float((a+b) / 2)
+        return None
+
+    image = common(image_x, qy)
+    if image is not None:
+        message = "The x and y image planes coincide within the axial alignment tolerance."
+    elif not (np.isfinite(image_x) and np.isfinite(qy) and image_x > 0 and qy > 0):
+        message = "No common downstream image plane: at least one axis has no real image beyond the y CRL."
+    else:
+        message = "Astigmatic focus: the x and y image planes do not coincide."
+    return CrossedCRLAnalysis(x, y, gap, recommended, image_x, qy, image,
+                              common(collimated_x, by), message)
+
+
+class _CrossedCRL:
+    """Apply the same two stack and gap operations to coherent and batched fields."""
+
+    def __init__(self, first, second, alignment):
+        self.first, self.second, self.alignment = first, second, alignment
+        gap_m = self.gap_m = alignment.gap_m
+        self.k, self.grid = first.k, first.grid
+        self.length = first.length + gap_m + second.length
+        self._second_pupil = second._entrance_pupil()
+        if not bool(self.grid.xp.any(self._second_pupil).item()):
+            raise ValueError("The y CRL entrance aperture is not resolved by the grid.")
+        self._matrices = (_ray_drift(gap_m + second.length) @ first.ray_transfer_matrix(),
+                          second.ray_transfer_matrix() @ _ray_drift(first.length + gap_m))
+
+    def apply_to_fields(self, fields):
+        fields = self.first.apply_to_fields(fields)
+        if self.gap_m:
+            spectra = self.grid._transform_batch(fields)
+            fields = self.grid._propagate_mode_spectra(spectra, self.gap_m, self.k)
+            del spectra
+        fields *= self._second_pupil
+        return self.second.apply_to_fields(fields)
+
+    def E(self):
+        return self.apply_to_fields(self.first.input_field[None, ...])[0]
+
+    def magnification(self, z, source_distance):
+        return tuple(-float(matrix[0, 1] + z * matrix[1, 1]) / source_distance
+                     for matrix in self._matrices)
 
 
 @dataclass
@@ -2963,18 +3180,21 @@ class _CRLFocusSession:
         """Resolve the detector peak without globally oversampling the lens plane."""
         cfg=self.cfg
         wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
-        factor=.886 if cfg.geometry=="one-dimensional" else 1.028
-        coherent_width=factor*wavelength*analytic/cfg.aperture_m
+        focal_widths=_focus_width_estimates(cfg,wavelength,analytic,getattr(self.crl,"alignment",None))
         projected=np.zeros(self.grid.dimension)
         if cfg.source_type=="gaussian":
             projected=np.abs(self.magnification(analytic))*np.array(self.source_sigma[:self.grid.dimension])*2*np.sqrt(2*np.log(2))
-        widths=[24*max(coherent_width,projected[0])]
-        targets=[coherent_width/24]
+        widths=[24*max(width,projected[i]) for i,width in enumerate(focal_widths)]
+        targets=[width/24 for width in focal_widths]
+        if cfg.geometry=="crossed":
+            alignment=self.crl.alignment
+            separation=abs(alignment.image_separation_m or 0)
+            for i,lens in enumerate((self.crl.first,self.crl.second)):
+                focus=(alignment.x_lens,alignment.y_lens)[i].image_distance_m
+                if focus and np.isfinite(focus):
+                    widths[i]+=lens.aperture*separation/abs(focus)
         if self.grid.dimension==2:
-            if cfg.geometry=="two-dimensional":
-                widths.append(24*max(coherent_width,projected[1]))
-                targets.append(coherent_width/24)
-            else:
+            if cfg.geometry=="one-dimensional":
                 widths.append(max(2*cfg.structure_depth_m,12*projected[1]))
                 targets.append(min(cfg.structure_depth_m/192,np.sqrt(wavelength*analytic)/24))
         propagation_widths=[self.grid.nx*self.grid.dx]
@@ -3020,11 +3240,10 @@ class _CRLFocusSession:
         if cfg.accuracy=="refined":
             limits=(cfg.detector_roi_m,) if self.grid.dimension==1 else cfg.detector_roi_m
             wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
-            factor=.886 if cfg.geometry=="one-dimensional" else 1.028
-            target=factor*wavelength*analytic/(24*cfg.aperture_m)
-            targets=[target]*self.grid.dimension
+            targets=[width/24 for width in
+                     _focus_width_estimates(cfg,wavelength,analytic,getattr(self.crl,"alignment",None))]
             if self.grid.dimension==2 and cfg.geometry=="one-dimensional":
-                targets[1]=min(cfg.structure_depth_m/192,np.sqrt(wavelength*analytic)/24)
+                targets.append(min(cfg.structure_depth_m/192,np.sqrt(wavelength*analytic)/24))
             padding=np.zeros(self.grid.dimension)
             if cfg.source_type=="gaussian" and cfg.source_method=="convolution":
                 max_scale=np.max(np.abs([self.magnification(z) for z in z_bounds]),axis=0)
@@ -3159,6 +3378,8 @@ class _CRLFocusSession:
     def magnification(self,z):
         if self.cfg.source_type=="plane":
             return (None,)*self.grid.dimension
+        if self.cfg.geometry=="crossed":
+            return self.crl.magnification(z,self.cfg.source_distance_m)
         values=[self.crl.source_magnification(z,self.cfg.source_distance_m)]
         if self.grid.dimension==2:
             values.append(self.crl.source_magnification(z,self.cfg.source_distance_m,
@@ -3247,7 +3468,7 @@ class _CRLFocusSession:
     def metrics(self,image):
         region=self.measurement_slices
         return _intensity_metrics_batch(image[region][None,...],self.detector_grid,region,
-                       measure_y_fwhm=self.cfg.geometry=="two-dimensional",
+                       measure_y_fwhm=len(self.cfg.focusing_axes)==2,
                        coordinates=self.detector_coordinates(region))[0]
 
     def plane(self,z):
@@ -3299,8 +3520,8 @@ class CRLFocusResult:
     """
     configuration: CRLFocusConfig
     backend: str
-    analytical_image_distance_m: float
-    collimated_focus_m: float
+    analytical_image_distance_m: float | None
+    collimated_focus_m: float | None
     numerical_peak: PeakIntensitySearchResult
     z_m: np.ndarray
     peak_intensity: np.ndarray
@@ -3325,6 +3546,7 @@ class CRLFocusResult:
     reference_metrics: BeamMetrics | None = None
     reference_point_metrics: BeamMetrics | None = None
     display_signal_bounds_m: tuple[tuple[float,float],tuple[float,float]] | None = None
+    crossed_alignment: CrossedCRLAnalysis | None = None
 
     @property
     def peak_z_m(self):
@@ -3342,7 +3564,7 @@ class CRLFocusResult:
     @property
     def fwhm_axes(self):
         """Axes on which focal/exit intensity FWHM is physically reported."""
-        return ("x","y") if self.configuration.geometry=="two-dimensional" else ("x",)
+        return self.configuration.focusing_axes
 
     @property
     def analytical_focus_m(self):
@@ -3401,18 +3623,29 @@ class CRLFocusResult:
         return max(float(np.max(self.peak_intensity)),float(reference))
 
     @property
-    def effective_aperture_m(self) -> float:
+    def effective_aperture_m(self) -> float | None:
         """Flux-equivalent width or circular diameter in metres.
 
         Uses the transmitted fraction of power incident within the entrance
         pupil, independent of detector position or sampling. Gaussian point
         sampling uses the weighted exit power of all modes; convolution uses
         central-point transmission under the shift-invariant approximation.
+        For crossed CRLs use equivalent_aperture_area_m2.
         """
+        if self.crossed_alignment is not None:
+            return None
         return _effective_aperture_from_transmission(
             self.configuration.aperture_m, self.transmission,
             circular=self.configuration.geometry == "two-dimensional",
         )
+
+    @property
+    def equivalent_aperture_area_m2(self) -> float | None:
+        """Transmission times the rectangular entrance-pupil area for crossed CRLs."""
+        if self.crossed_alignment is None:
+            return None
+        cfg = self.configuration
+        return self.transmission * cfg.aperture_m * cfg.structure_depth_m
 
     @property
     def magnification_at_peak(self):
@@ -3450,13 +3683,20 @@ class CRLFocusResult:
                 "transmission":self.transmission,"grid_shape":self.grid_shape,
                 "effective_aperture_m":self.effective_aperture_m,
                 "effective_aperture_convention":"integrated_transmission",
+                **({"crossed_alignment":{
+                        name: getattr(self.crossed_alignment, name) for name in
+                        ("gap_m", "recommended_gap_m", "image_x_m", "image_y_m",
+                         "image_separation_m", "common_image_m", "aligned", "message")},
+                    "equivalent_aperture_area_m2":self.equivalent_aperture_area_m2}
+                   if self.crossed_alignment is not None else {}),
                 "grid_step_m":self.grid_step_m,"grid_step_y_m":self.grid_step_y_m,
                 "detector_shape":self.detector_shape,"detector_step_m":self.detector_step_m,
                 "detector_step_y_m":self.detector_step_y_m,
                 "lens_length_m":self.lens_length_m,"diagnostics":list(self.diagnostics),
                 "peak_search_evaluations":self.numerical_peak.evaluations,
                 "peak_search_converged":self.numerical_peak.converged,
-                "source_width_convention":"FWHM", "distance_reference":"CRL exit",
+                "source_width_convention":"FWHM",
+                "distance_reference":"y CRL exit" if self.crossed_alignment is not None else "CRL exit",
                 "intensity_units":"relative", "convergence_checked":False}
 
 
@@ -3592,11 +3832,21 @@ def _edge_power_fractions(image,xp):
     return tuple(fractions)
 
 
-def _build_focus_session(cfg,backend,parameters,analytic,progress=None):
+def _focus_width_estimates(cfg, wavelength, analytic, alignment=None):
+    if alignment is None:
+        count = len(cfg.focusing_axes)
+        return ((.886 if count==1 else 1.028)*wavelength*analytic/cfg.aperture_m,)*count
+    lenses = (alignment.x_lens, alignment.y_lens)
+    apertures = (cfg.aperture_m, cfg.second_crl.aperture_m)
+    distances = [lens.image_distance_m if lens.real_image else analytic for lens in lenses]
+    return tuple(.886*wavelength*distance/aperture for distance,aperture in zip(distances,apertures))
+
+
+def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignment=None):
     """Fit CRL geometry first, resolve its physics, then check propagation edges."""
     wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
-    factor=.886 if cfg.geometry=="one-dimensional" else 1.028
-    target_x=factor*wavelength*analytic/cfg.aperture_m/6
+    focus_widths=_focus_width_estimates(cfg,wavelength,analytic,alignment)
+    target_x=focus_widths[0]/6
     if cfg.source_type!="plane":
         target_x=min(target_x,wavelength*cfg.source_distance_m/(2*cfg.aperture_m))
     quick_cap=65536 if cfg.grid_dimension==1 else (2048 if backend=="cupy" else 1024)
@@ -3609,6 +3859,15 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None):
     width_x=cfg.window_factor*cfg.aperture_m
     depth=cfg.aperture_m if cfg.geometry=="two-dimensional" else cfg.structure_depth_m
     width_y=None if cfg.grid_dimension==1 else cfg.window_factor*depth
+    phase_target_y=phase_target
+    if alignment is not None:
+        second=cfg.second_crl
+        y_parameters=_focus_lens_parameters(second._as_focus_config(cfg.energy_kev,cfg.source_distance_m))
+        width_x=cfg.window_factor*max(cfg.aperture_m,second.structure_depth_m)
+        width_y=cfg.window_factor*max(depth,second.aperture_m)
+        slope_y=k*alignment.y_lens.delta*second.n_elements*second.aperture_m/second.radius_m
+        slope_y+=k*depth*source_curvature/2
+        phase_target_y=(np.pi/3)/slope_y
     if cfg.detector_roi_m is not None:
         limits=(cfg.detector_roi_m,) if cfg.grid_dimension==1 else cfg.detector_roi_m
         width_x=max(width_x,2.1*max(map(abs,limits[0])))
@@ -3631,6 +3890,10 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None):
         else:
             if cfg.geometry=="two-dimensional":
                 target_y=target_x
+            elif alignment is not None:
+                target_y=focus_widths[1]/6
+                if cfg.source_type!="plane":
+                    target_y=min(target_y,wavelength*cfg.source_distance_m/(2*depth))
             else:
                 target_y=min(depth/128,wavelength*analytic/(6*depth))
                 if cfg.source_type!="plane":
@@ -3638,8 +3901,8 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None):
             required_y=_fast_grid_size(max(128,width_y/target_y))
             if cfg.accuracy=="refined":
                 required_y=_fast_grid_size(1.25*min(required_y,quick_cap))
-                if cfg.geometry=="two-dimensional":
-                    required_y=max(required_y,_fast_grid_size(width_y/phase_target))
+                if len(cfg.focusing_axes)==2:
+                    required_y=max(required_y,_fast_grid_size(width_y/phase_target_y))
             ny,dy=_focus_axis_sampling(width_y,required_y,cfg.grid_points_y,cfg.grid_step_y_m,cap,128)
             if cfg.grid_points_y is None and ny<required_y:
                 messages.append("grid_cap_y: Automatic y sampling reached its memory cap; refine the grid.")
@@ -3649,13 +3912,17 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None):
         incident=(xp.ones(grid.shape,dtype=xp.complex128) if cfg.source_type=="plane" else
                   PointSource(grid=grid,position=position,energy_kev=cfg.energy_kev).E(cfg.source_distance_m))
         lens_parameters=dict(parameters)
-        if grid.dimension==2 and cfg.geometry=="one-dimensional":
+        if grid.dimension==2 and cfg.geometry!="two-dimensional":
             lens_parameters["transverse_length"]=cfg.structure_depth_m
         crl=CRL(grid=grid,**lens_parameters)
         incident*=crl._entrance_pupil()
         if _to_python_float(xp.sum(abs(incident)**2))<=0:
             raise ValueError("The entrance aperture is not resolved by the grid.")
         crl.input_field=incident
+        if alignment is not None:
+            second_crl=CRL(grid=grid,**y_parameters,rotation=np.pi/2,
+                           transverse_length=cfg.second_crl.structure_depth_m)
+            crl=_CrossedCRL(crl,second_crl,alignment)
         probe_cfg=replace(cfg,source_method="convolution") if cfg.source_type=="gaussian" else cfg
         probe=_CRLFocusSession(probe_cfg,grid,crl,incident)
         if not cfg.adaptive_window:
@@ -3711,18 +3978,31 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     reporter.start("preparing",detail="Selecting backend and material properties")
     cfg=configuration
     backend=select_backend(cfg.backend)
-    material=cfg.create_material()
-    parameters=dict(radius=cfg.radius_m,aperture=cfg.aperture_m,
-        bridge_thickness=cfg.bridge_thickness_m,n_elements=cfg.n_elements,
-        material=material,energy_kev=cfg.energy_kev)
-    reference=CRL(grid=Grid1D(cfg.aperture_m,2,backend="numpy"),**parameters)
-    if not reference.is_focus_outside_crl():
-        raise ValueError("The element count puts the formal focus inside the CRL.")
-    analytic=(reference.theoretical_focus() if cfg.source_type=="plane" else
-              reference.effective_focus(cfg.source_distance_m))
-    if not np.isfinite(analytic) or analytic<=0:
-        raise ValueError("This source/lens configuration has no finite real image after the CRL.")
-    grid,crl,coherent,messages=_build_focus_session(cfg,backend,parameters,analytic,reporter)
+    parameters=_focus_lens_parameters(cfg)
+    alignment=None
+    image_positions=[]
+    if cfg.geometry=="crossed":
+        alignment=analyze_crossed_crl(cfg)
+        image_positions=sorted(z for z in (alignment.image_x_m,alignment.image_y_m)
+                               if z is not None and np.isfinite(z) and z>0)
+        if not image_positions:
+            raise ValueError(alignment.message)
+        analytic=float(np.mean(image_positions))
+        analytical_image=alignment.common_image_m
+        collimated_focus=alignment.collimated_focus_m
+    else:
+        reference=CRL(grid=Grid1D(cfg.aperture_m,2,backend="numpy"),**parameters)
+        if not reference.is_focus_outside_crl():
+            raise ValueError("The element count puts the formal focus inside the CRL.")
+        collimated_focus=reference.theoretical_focus()
+        analytic=(collimated_focus if cfg.source_type=="plane" else
+                  reference.effective_focus(cfg.source_distance_m))
+        if not np.isfinite(analytic) or analytic<=0:
+            raise ValueError("This source/lens configuration has no finite real image after the CRL.")
+        analytical_image=float(analytic)
+    grid,crl,coherent,messages=_build_focus_session(cfg,backend,parameters,analytic,reporter,alignment=alignment)
+    if alignment is not None and not alignment.aligned:
+        messages.append("crossed_alignment: "+alignment.message)
     search_cfg=(replace(cfg,source_type="point",source_fwhm_x_m=0.0,source_fwhm_y_m=0.0)
                 if cfg.source_type=="gaussian" else cfg)
     search_session=(_CRLFocusSession(search_cfg,grid,crl,coherent.incident,coherent_state=coherent)
@@ -3732,10 +4012,9 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         search_session.configure_refined_detector(analytic)
     xp=grid.xp
     wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
-    factor=.886 if cfg.geometry=="one-dimensional" else 1.028
     search_bounds=cfg.scan_range_m or (max(1e-9,.05*analytic),3*analytic)
     basis="Plane wave" if cfg.source_type=="plane" else "Central point source"
-    reporter.start("peak_search",detail=basis+" · starting at the analytical image distance")
+    reporter.start("peak_search",detail=basis+" · starting at the paraxial estimate")
     evaluations=0
     def search_objective(z):
         nonlocal evaluations
@@ -3756,6 +4035,10 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         reporter.advance(roi_evaluations)
         return value
     bounds=cfg.scan_range_m or _peak_z_roi(roi_objective,numerical,search_bounds,cfg.axial_roi_level)
+    if cfg.scan_range_m is None and len(image_positions)==2 and not alignment.aligned:
+        left,right=image_positions
+        margin=.05*(right-left)
+        bounds=(min(bounds[0],max(0.,left-margin)),max(bounds[1],right+margin))
     if bounds[1]<=bounds[0]:
         raise ArithmeticError("The peak-intensity ROI has zero extent.")
     if cfg.scan_range_m is None and (bounds[0]==search_bounds[0] or bounds[1]==search_bounds[1]):
@@ -3820,18 +4103,24 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
                    if cfg.source_type=="gaussian" else None)
     best_index=int(np.argmin(abs(positions-numerical.z_m)))
     widths=np.asarray([np.nan if m.fwhm is None else m.fwhm for m in metrics],dtype=float)
-    active_count=len(("x","y") if cfg.geometry=="two-dimensional" else ("x",))
+    active_count=len(cfg.focusing_axes)
     best_widths=np.asarray([np.nan if v is None else v for v in np.atleast_1d(best.metrics.fwhm)[:active_count]],dtype=float)
     steps=np.array([detector.dx] if active_count==1 else [detector.dx,detector.dy])
     if np.any(~np.isfinite(best_widths)):
         messages.append("fwhm_missing: Half-maximum crossings are outside the calculation window.")
     elif np.any(best_widths/steps<6):
         messages.append("sampling: Fewer than six points across a transverse FWHM; refine the grid.")
-    slope=crl.k*crl.delta*cfg.n_elements*cfg.aperture_m/cfg.radius_m*grid.dx
+    delta,beta=parameters['material'].optical_constants(cfg.energy_kev)
+    slope=crl.k*delta*cfg.n_elements*cfg.aperture_m/cfg.radius_m*grid.dx
     if cfg.source_type!="plane":
         slope+=crl.k*cfg.aperture_m/(2*cfg.source_distance_m)*grid.dx
     if slope>np.pi/2:
         messages.append("phase_sampling: Phase changes too rapidly between x samples; refine the grid.")
+    if alignment is not None:
+        lens=cfg.second_crl
+        slope_y=crl.k*alignment.y_lens.delta*lens.n_elements*lens.aperture_m/lens.radius_m*grid.dy
+        if slope_y>np.pi/2:
+            messages.append("phase_sampling_y: Phase changes too rapidly between y samples; refine the grid.")
     image=session.intensity(numerical.z_m)[session.measurement_slices]
     rim_x=max(1,image.shape[-1]//20)
     if grid.dimension==1:
@@ -3853,15 +4142,15 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     if cfg.source_type=="gaussian" and cfg.source_method=="points":
         source_sigma=np.array(session.source_sigma[:grid.dimension])
         shift=np.abs(session.magnification(numerical.z_m))*source_sigma
-        point_width=factor*wavelength*analytic/cfg.aperture_m
-        if np.max(shift)*np.pi/np.sqrt(2*cfg.source_points)>point_width/2:
+        point_widths=_focus_width_estimates(cfg,wavelength,analytic,alignment)
+        if np.max(shift/point_widths)*np.pi/np.sqrt(2*cfg.source_points)>.5:
             messages.append("source_quadrature: Gaussian source nodes may be too sparse; compare with a higher point count.")
-    result=CRLFocusResult(cfg,backend,float(analytic),reference.theoretical_focus(),numerical,
+    result=CRLFocusResult(cfg,backend,analytical_image,collimated_focus,numerical,
         positions,np.asarray([m.max_intensity for m in metrics]),widths,best_index,
         best.x_m,best.y_m,best.intensity,np.stack(lines)[:,x_slice].copy(),
-        session.transmission,float(crl.delta),float(crl.beta),grid.dx,grid.shape,
+        session.transmission,float(delta),float(beta),grid.dx,grid.shape,
         None if grid.dimension==1 else grid.dy,image.shape,detector.dx,
         None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics,point_metrics,
-        display_signal_bounds)
+        display_signal_bounds,alignment)
     reporter.finish()
     return result
