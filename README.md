@@ -2,6 +2,10 @@
 
 XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating monochromatic X-ray propagation, diffraction, and focusing. It propagates complex wavefields on one- and two-dimensional transverse grids using FFTs. Calculations run on the CPU with NumPy or on an NVIDIA GPU with CuPy.
 
+Try XPOSim for X-ray focusing with a compound refractive lens.
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/a2077873f421b7404785ab3c30a0194e160d0d83/notebooks/CRL_Focus_Colab.ipynb)
+
 [Installation](#installation) · [Quick start](#quick-start) · [Library guide](DOCUMENTATION.md) · [API reference](DOCUMENTATION.md#8-api-reference)
 
 <a id="1-about-xposim"></a>
@@ -81,7 +85,7 @@ The distances are measured from the CRL exit. Use `plane.x_m` and `plane.intensi
 
 - Build an optical system from grids, a source, and individual elements. [Worked Python example](DOCUMENTATION.md#2-complete-example-point-source-crl-and-detector)
 - Configure a CRL scan, choose the illumination model, and compare focus metrics. [High-level CRL workflow](DOCUMENTATION.md#high-level-crl-workflow)
-- Explore a CRL focus interactively and export a simulation report. [Colab notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/a2077873f421b7404785ab3c30a0194e160d0d83/notebooks/CRL_Focus_Colab.ipynb) · [Notebook guide](COLAB_GUIDE.md)
+- Explore a CRL focus interactively and export a simulation report. [Notebook source](notebooks/CRL_Focus_Colab.ipynb) · [Notebook guide](COLAB_GUIDE.md)
 
 <a id="3-physical-model"></a>
 
