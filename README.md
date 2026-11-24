@@ -1,6 +1,6 @@
 # XPOSim
 
-XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating monochromatic X-ray propagation, diffraction, and focusing. It propagates complex wavefields on one- and two-dimensional transverse grids using FFTs. Calculations run on the CPU with NumPy or on an NVIDIA GPU with CuPy.
+XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating monochromatic X-ray propagation, diffraction, and focusing. It propagates complex wavefields on one- and two-dimensional transverse grids using FFTs. Calculations run on the CPU with NumPy or on an NVIDIA GPU with CuPy or PyTorch.
 
 Try XPOSim for X-ray focusing with a compound refractive lens.
 
@@ -50,6 +50,21 @@ conda activate cu_env
 ```
 
 Select `backend="cupy"` to require GPU execution. In the high-level CRL workflow, `backend="auto"` tries a small GPU calculation and falls back to NumPy if CUDA is unavailable.
+
+### NVIDIA GPU with PyTorch
+
+Install NumPy and SciPy as above, then install a CUDA-enabled PyTorch build compatible with your NVIDIA driver. [PyTorch installation instructions](https://pytorch.org/get-started/locally/)
+
+Set `backend="torch"` on a grid or on `CRLFocusConfig`. XPOSim uses the current CUDA device and raises an error if CUDA is unavailable. For example:
+
+```python
+import torch
+import XPOSim as xpos
+
+grid = xpos.Grid1D(dx=1e-7, nx=512, backend="torch")
+field = torch.ones(grid.shape, dtype=torch.complex128, device=grid.x.device)
+propagated = grid.propagate(field, z=0.02, k=6e10)  # CUDA tensor
+```
 
 ## Quick start
 

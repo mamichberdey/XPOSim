@@ -8,7 +8,7 @@ The module deliberately keeps the public model small:
   for ``z=0`` and Fresnel-propagates that field for ``z>0``;
 * :class:`PointSource` creates a field and therefore is the only object that
   does not consume an input field;
-* NumPy and CuPy are supported without changing the array type of a field;
+* NumPy, CuPy and PyTorch are supported without changing the array type of a field;
 * CRL surface errors are specified as sampled height deviations and interpolated
   onto the calculation grid.
 * cached configuration parameters are read-only; CRL.with_parameters constructs
@@ -23,10 +23,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field, replace
+from functools import lru_cache, partial
 from numbers import Integral
 import os
 from pathlib import Path
 import re
+import sys
 from shutil import disk_usage
 from tempfile import TemporaryFile, gettempdir
 from threading import Lock
@@ -45,7 +47,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.30.0"
+__version__ = "0.31.0"
 
 
 __all__ = [
@@ -97,35 +99,119 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+def _is_tensor(value):
+    # Recognize tensors supplied by callers without importing PyTorch for NumPy users.
+    torch = sys.modules.get("torch")
+    return torch is not None and isinstance(value, torch.Tensor)
+
+
+class _TorchArrays:
+    """Device-bound factories and NumPy conventions used by the shared optics code."""
+
+    def __init__(self, device):
+        import torch
+        self.device = device
+        self.torch = torch
+        for name in ("arange", "empty", "zeros", "ones"):
+            setattr(self, name, partial(getattr(torch, name), device=device))
+        self.linspace = partial(torch.linspace, dtype=torch.float64, device=device)
+        self.meshgrid = partial(torch.meshgrid, indexing="xy")
+        self.max = torch.amax
+        self.min = torch.amin
+        self.result_type = torch.promote_types
+
+    def __getattr__(self, name):
+        return getattr(self.torch, name)
+
+    def asarray(self, value, dtype=None):
+        if not _is_tensor(value):
+            value = np.asarray(value)
+            if not value.flags.writeable or any(s < 0 for s in value.strides):
+                value = value.copy()
+        if dtype is float:
+            dtype = self.float64
+        return self.torch.as_tensor(value, dtype=dtype, device=self.device)
+
+    def full(self, size, value):
+        return self.torch.full((size,), value, dtype=self.float64, device=self.device)
+
+    def minimum(self, array, upper):
+        return self.torch.clamp_max(array, upper)
+
+    def brackets(self, x, axis):
+        i = self.torch.searchsorted(axis, x.contiguous()).clamp(1, len(axis)-1)
+        weight = (x - axis[i-1]) / (axis[i] - axis[i-1])
+        return i, weight
+
+    def interp(self, x, axis, values, *, left, right):
+        i, w = self.brackets(x, axis)
+        result = self.torch.lerp(values[i-1], values[i], w)
+        return self.where(x < axis[0], left, self.where(x > axis[-1], right, result))
+
+    def interp_map(self, values, x_axis, y_axis, grid, fill):
+        x, y, data = map(self.asarray, (x_axis, y_axis, values))
+        i, wx = self.brackets(grid.x_axis, x)
+        j, wy = self.brackets(grid.y_axis, y)
+        # Separable linear interpolation on a rectilinear mesh.
+        rows = self.torch.lerp(data[:, i-1], data[:, i], wx)
+        result = self.torch.lerp(rows[j-1], rows[j], wy[:, None])
+        inside = (grid.x >= x[0]) & (grid.x <= x[-1]) & (grid.y >= y[0]) & (grid.y <= y[-1])
+        return self.where(inside, result, fill)
+
+    def gaussian_filter(self, image, sigmas):
+        """Match ndimage's separable, zero-padded Gaussian with truncate=5."""
+        for axis, sigma in enumerate(np.atleast_1d(sigmas)):
+            radius = int(5 * sigma + 0.5)
+            if radius == 0:
+                continue
+            offsets = self.arange(-radius, radius + 1, dtype=image.dtype)
+            kernel = self.exp(-0.5 * (offsets / sigma)**2)
+            lines = image.moveaxis(axis, -1)
+            filtered = self.torch.nn.functional.conv1d(
+                lines.reshape(-1, 1, lines.shape[-1]),
+                (kernel / kernel.sum()).reshape(1, 1, -1), padding=radius,
+            )
+            image = filtered.reshape(lines.shape).moveaxis(-1, axis)
+        return image
+
+
+@lru_cache(maxsize=None)
+def _torch_arrays(device):
+    return _TorchArrays(device)
+
+
+def _torch_gpu():
+    try:
+        import torch
+    except (ImportError, OSError) as exc:
+        raise RuntimeError("Torch backend requires PyTorch with CUDA support.") from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError("Torch backend requires an available CUDA GPU.")
+    return _torch_arrays(torch.device("cuda", torch.cuda.current_device()))
+
+
+def _numeric_dtype(array):
+    if _is_tensor(array):
+        return array.dtype != sys.modules["torch"].bool
+    return np.issubdtype(array.dtype, np.number)
+
+
 def _array_module(array: Any):
-    """Return the NumPy/CuPy module corresponding to ``array``.
-
-    Parameters
-    ----------
-    array:
-        NumPy or CuPy ndarray.
-
-    Returns
-    -------
-    module
-        ``numpy`` for NumPy arrays or ``cupy`` for CuPy arrays.
-
-    Raises
-    ------
-    TypeError
-        If ``array`` is not a supported ndarray type.
-    """
-
+    """Numerical operations for the array on its own device."""
     if isinstance(array, np.ndarray):
         return np
     if CUPY_AVAILABLE and isinstance(array, cp.ndarray):
         return cp
-    raise TypeError("Field must be a NumPy or CuPy ndarray.")
+    if _is_tensor(array):
+        return _torch_arrays(array.device)
+    raise TypeError("Field must be a NumPy array, CuPy array or Torch tensor.")
 
 
 def _backend_name(array: Any) -> str:
-    """Return ``'numpy'`` or ``'cupy'`` for a supported ndarray."""
+    """Return the backend name for a supported field."""
 
+    if _is_tensor(array):
+        return "torch"
     return "cupy" if CUPY_AVAILABLE and isinstance(array, cp.ndarray) else "numpy"
 
 
@@ -144,6 +230,8 @@ def _to_numpy(value: Any) -> np.ndarray:
 
     if CUPY_AVAILABLE and isinstance(value, cp.ndarray):
         return cp.asnumpy(value)
+    if _is_tensor(value):
+        return value.detach().resolve_conj().resolve_neg().cpu().numpy()
     return np.asarray(value)
 
 
@@ -496,7 +584,9 @@ def _backend_module(backend: str):
         if not CUPY_AVAILABLE:
             raise RuntimeError("CuPy backend requested, but CuPy is not installed.")
         return cp
-    raise ValueError("backend must be 'numpy' or 'cupy'.")
+    if backend == "torch":
+        return _torch_gpu()
+    raise ValueError("backend must be numpy, cupy or torch.")
 
 
 def _centered_coordinates(n: int, step: float, xp) -> Any:
@@ -529,7 +619,7 @@ def _fft1d(array: Any, dx: float, phase_data: Any = None) -> Any:
     """Centered continuous FFT along the last axis, including field batches."""
     xp = _array_module(array)
     phase, scalar = phase_data or _fourier_phase(array.shape[-1], +1, xp)
-    result = xp.fft.fft(array * phase, axis=-1)
+    result = xp.fft.fft(array * phase)
     result *= phase
     result *= dx * scalar
     return result
@@ -539,7 +629,7 @@ def _ifft1d(array: Any, dx: float, phase_data: Any = None) -> Any:
     """Centered continuous inverse FFT along the last axis."""
     xp = _array_module(array)
     phase, scalar = phase_data or _fourier_phase(array.shape[-1], -1, xp)
-    result = xp.fft.ifft(array * phase, axis=-1)
+    result = xp.fft.ifft(array * phase)
     result *= phase
     result *= scalar / dx
     return result
@@ -558,7 +648,7 @@ def _transform2d(array: Any, dx: float, dy: float, inverse: bool,
     work = array * px
     work *= py[:, None]
     transform = xp.fft.ifft2 if inverse else xp.fft.fft2
-    result = transform(work, axes=(-2, -1))
+    result = transform(work)
     result *= px
     result *= py[:, None]
     result *= sx * sy / (dx * dy) if inverse else dx * dy * sx * sy
@@ -579,7 +669,7 @@ class _InverseFourierAxis:
         from scipy.fft import next_fast_len
         self.xp=xp
         self.n=n
-        self.m=int(output_axis.size)
+        self.m=len(output_axis)
         self.length=next_fast_len(n+self.m-1)
         first=float(_to_python_float(output_axis[0]))
         step=float(_to_python_float(output_axis[1]-output_axis[0]))
@@ -594,9 +684,9 @@ class _InverseFourierAxis:
     def apply(self,array,axis=-1):
         xp=self.xp
         work=xp.moveaxis(array,axis,-1)
-        work=xp.fft.fft(work*self.pre,n=self.length,axis=-1)
+        work=xp.fft.fft(work*self.pre,n=self.length)
         work*=self.kernel
-        result=xp.fft.ifft(work,axis=-1)[...,self.n-1:self.n-1+self.m]*self.post
+        result=xp.fft.ifft(work)[...,self.n-1:self.n-1+self.m]*self.post
         return xp.moveaxis(result,-1,axis)
 
 
@@ -659,15 +749,19 @@ class BaseGrid(_Configured, ABC):
 
     @property
     def xp(self):
+        if self.backend == "torch" and hasattr(self, "x"):
+            return _torch_arrays(self.x.device)
         return _backend_module(self.backend)
 
     def _validate_field_backend(self, field: Any) -> None:
         _array_module(field)
         if _backend_name(field) != self.backend:
             raise TypeError(f"Field backend is {_backend_name(field)!r}, but the grid uses {self.backend!r}.")
+        if self.backend == "torch" and field.device != self.xp.device:
+            raise TypeError(f"Field must be on grid device {self.xp.device}.")
         if tuple(field.shape) != self.shape:
             raise ValueError(f"Expected field shape {self.shape}, got {field.shape}.")
-        if not np.issubdtype(field.dtype, np.number):
+        if not _numeric_dtype(field):
             raise TypeError("Field arrays must have a numeric dtype.")
 
     def _transform_batch(self, fields: Any, inverse: bool = False) -> Any:
@@ -698,7 +792,7 @@ class BaseGrid(_Configured, ABC):
     def _propagate_spectrum(self, spectrum: Any, z_values: np.ndarray, k: float) -> Any:
         """Batched inverse FFTs, with separable Fresnel factors along x and y."""
         xp = self.xp
-        z = xp.asarray(z_values)[:, None]
+        z = xp.asarray(z_values, dtype=xp.float64)[:, None]
         qx = self.qx if self.dimension == 1 else self.qx_axis
         phase_x = xp.exp((-0.5j / k) * z * qx**2)
         work = spectrum[None, ...] * (phase_x if self.dimension == 1 else phase_x[:, None, :])
@@ -722,7 +816,7 @@ class BaseGrid(_Configured, ABC):
         _validate_finite("z", z)
         _validate_positive("k", k)
         if z == 0:
-            return field.copy()
+            return field.clone() if _is_tensor(field) else field.copy()
         return self._propagate_spectrum(self.fft(field), np.asarray([z]), k)[0]
 
     def propagate_to_grid(self, field: Any, z: float, k: float, detector: "BaseGrid") -> Any:
@@ -736,18 +830,28 @@ class BaseGrid(_Configured, ABC):
         self._validate_field_backend(field)
         _validate_finite("z",z)
         _validate_positive("k",k)
+        if self.backend == detector.backend == "torch" and self.xp.device != detector.xp.device:
+            raise ValueError("Detector and propagation grid must use the same Torch device.")
         if detector.dimension!=self.dimension or detector.backend!=self.backend:
             raise ValueError("Detector dimension/backend must match the propagation grid.")
         return _DetectorFourierPlan(self,detector).propagate(self.fft(field),z,k)
+
+    def _free_gpu_memory(self):
+        if self.backend == "cupy":
+            return cp.cuda.runtime.memGetInfo()[0]
+        if self.backend == "torch" and self.xp.device.type == "cuda":
+            return self.xp.cuda.mem_get_info(self.xp.device)[0]
+        return None
 
     def _batch_size(self, n_planes: int, dtype: Any, batch_size: int | None) -> int:
         if batch_size is not None:
             _validate_count("batch_size", batch_size)
             return min(n_planes, batch_size)
-        if self.backend == "numpy":
-            return 1  # GPU batching is optional; keep CPU working memory small.
-        free_bytes, _ = cp.cuda.runtime.memGetInfo()
-        field_bytes = int(np.prod(self.shape)) * np.dtype(dtype).itemsize
+        free_bytes = self._free_gpu_memory()
+        if free_bytes is None:
+            return 1
+        itemsize = dtype.itemsize if self.backend == "torch" else np.dtype(dtype).itemsize
+        field_bytes = int(np.prod(self.shape)) * itemsize
         # Reserve space for FFT workspace, spectra, intensity and retained output.
         return max(1, min(n_planes, 16, int(free_bytes * 0.25) // (6 * field_bytes)))
 
@@ -774,7 +878,7 @@ class BaseGrid(_Configured, ABC):
             fields = self._propagate_spectrum(spectrum, positions, k)
             zero = np.flatnonzero(positions == 0)
             if zero.size:
-                fields[self.xp.asarray(zero)] = field
+                fields[self.xp.asarray(zero)] = self.xp.asarray(field, dtype=fields.dtype)
             yield slice(start, stop), fields
 
     def propagate_many(self, field: Any, z_values: Sequence[float], k: float, *,
@@ -808,7 +912,7 @@ def _validated_distances(z_values: Sequence[float], *, nonnegative: bool = False
 
 @dataclass
 class Grid1D(BaseGrid):
-    """Uniform 1D grid: dx in metres, nx samples, NumPy or CuPy backend."""
+    """Uniform 1D grid: dx in metres, nx samples, NumPy, CuPy or Torch backend."""
 
     dx: float
     nx: int
@@ -1125,15 +1229,16 @@ class Hole(OpticalElement):
         xp = self.grid.xp
         if self.grid.dimension == 1:
             x0 = float(self.center_offset)
-            return (
+            mask = (
                 ((self.grid.x - x0) ** 2 <= self.radius**2)
                 | ((self.grid.x + x0) ** 2 <= self.radius**2)
-            ).astype(self.input_field.dtype if self.input_field is not None else float)
+            )
+            return xp.asarray(mask, dtype=self.input_field.dtype if self.input_field is not None else float)
 
         x0, y0 = self.center_offset
         first = (self.grid.x - x0) ** 2 + (self.grid.y - y0) ** 2 <= self.radius**2
         second = (self.grid.x + x0) ** 2 + (self.grid.y + y0) ** 2 <= self.radius**2
-        return (first | second).astype(self.input_field.dtype if self.input_field is not None else float)
+        return xp.asarray(first | second, dtype=self.input_field.dtype if self.input_field is not None else float)
 
     def _field_after_element(self) -> Any:
         """Multiply the input field by the hole mask."""
@@ -1151,9 +1256,11 @@ class Blade(OpticalElement):
     def transmission_mask(self) -> Any:
         """Return the binary blade mask for the object's grid."""
 
-        if self.grid.dimension == 1:
-            return (self.grid.x >= 0).astype(self.input_field.dtype if self.input_field is not None else float)
-        return ((self.grid.x >= 0) & (self.grid.y >= 0)).astype(self.input_field.dtype if self.input_field is not None else float)
+        mask = self.grid.x >= 0
+        if self.grid.dimension == 2:
+            mask = mask & (self.grid.y >= 0)
+        dtype = self.input_field.dtype if self.input_field is not None else float
+        return self.grid.xp.asarray(mask, dtype=dtype)
 
     def _field_after_element(self) -> Any:
         """Multiply the input field by the blade mask."""
@@ -1249,13 +1356,15 @@ class InterpolatedThicknessDefect(ThicknessDefect):
                                left=self.fill_value, right=self.fill_value)
         else:
             values = _interpolate_map(self.defect_array, *self.coords, grid, self.fill_value)
-        return thickness + values.astype(thickness.dtype, copy=False)
+        return thickness + xp.asarray(values, dtype=thickness.dtype)
 
 
 def _interpolate_map(values: Any, x_axis: Any, y_axis: Any,
                      grid: BaseGrid, fill_value: float) -> Any:
     """Interpolate a 2D map on its calculation backend when CuPy supports it."""
     xp = grid.xp
+    if grid.backend == "torch":
+        return xp.interp_map(values, x_axis, y_axis, grid, fill_value)
     interpolator_type = RegularGridInterpolator
     if grid.backend == "cupy":
         try:
@@ -1741,7 +1850,7 @@ class CRL(OpticalElement):
             sag = xp.minimum(radial_sag, h_max)
 
         if self._surface_error is not None:
-            error_map = self._surface_error.on_grid(self.grid).astype(sag.dtype, copy=False)
+            error_map = xp.asarray(self._surface_error.on_grid(self.grid), dtype=sag.dtype)
             # Sampled errors use laboratory coordinates; the aperture mask follows
             # the rotated lens geometry.
             if self.grid.dimension == 1:
@@ -1774,7 +1883,7 @@ class CRL(OpticalElement):
         thickness = self._ideal_thickness()
 
         self.grid._validate_field_backend(thickness)
-        if not np.issubdtype(thickness.dtype, np.number):
+        if not _numeric_dtype(thickness):
             raise TypeError("CRL thickness defect returned a non-numeric array.")
         if bool(self.grid.xp.any(~self.grid.xp.isfinite(thickness) | (thickness <= 0)).item()):
             min_thickness = _to_python_float(self.grid.xp.min(thickness))
@@ -1833,6 +1942,7 @@ class CRL(OpticalElement):
         """
         _array_module(fields)
         if (_backend_name(fields) != self.grid.backend or
+                (self.grid.backend == "torch" and fields.device != self.grid.xp.device) or
                 fields.ndim != self.grid.dimension + 1 or fields.shape[1:] != self.grid.shape):
             raise ValueError("Expected a source batch with shape (batch, *grid.shape) on the grid backend.")
         k, _, _ = self._require_optical_constants()
@@ -2029,7 +2139,7 @@ class CRL(OpticalElement):
         # Free-space propagation changes Fourier phase, not angular intensity.
         div = _divergence_from_spectrum(spectrum, self.grid, self.k) if calculate_divergence else None
         x_roi, y_roi = _coordinates_for_slices(self.grid, slices)
-        roi_shape = (x_roi.size,) if self.grid.dimension == 1 else (y_roi.size, x_roi.size)
+        roi_shape = (len(x_roi),) if self.grid.dimension == 1 else (len(y_roi), len(x_roi))
         E_array = (self.grid.xp.empty((len(z_array), *roi_shape), dtype=spectrum.dtype)
                    if return_fields else None)
         metrics: list[BeamMetrics] = []
@@ -2154,12 +2264,12 @@ def full_width_half_max(intensity_array: Any, coordinate: Any) -> float | None:
     The profile stays on its backend; only the final scalar is transferred from
     a GPU. Both half-maximum crossings must lie inside the sampled coordinates.
     """
-    xp = cp if CUPY_AVAILABLE and isinstance(intensity_array, cp.ndarray) else np
+    xp = _array_module(intensity_array) if _backend_name(intensity_array) != "numpy" else np
     arr = xp.asarray(intensity_array, dtype=float)
     if arr.ndim != 1:
         arr = arr.squeeze()
     coord = xp.asarray(_to_numpy(coordinate) if xp is np else coordinate, dtype=float)
-    if arr.ndim != 1 or coord.ndim != 1 or arr.size != coord.size:
+    if arr.ndim != 1 or coord.ndim != 1 or len(arr) != len(coord):
         raise ValueError("full_width_half_max expects matching one-dimensional arrays.")
     if not bool(xp.all(xp.isfinite(coord)).item()) or bool(xp.any(xp.diff(coord) <= 0).item()):
         raise ValueError("FWHM coordinates must be finite and strictly increasing.")
@@ -2324,8 +2434,12 @@ def select_backend(preferred: str = "auto") -> str:
     auto falls back to NumPy. An explicit cupy request raises a diagnostic error
     when CUDA cannot execute. This does not install dependencies or change drivers.
     """
-    if preferred not in {"auto", "numpy", "cupy"}:
-        raise ValueError("backend must be auto, numpy or cupy.")
+    if preferred not in {"auto", "numpy", "cupy", "torch"}:
+        raise ValueError("backend must be auto, numpy, cupy or torch.")
+    if preferred == "torch":
+        xp = _torch_gpu()
+        xp.fft.fft(xp.ones(2, dtype=xp.complex128))[0].item()
+        return "torch"
     if preferred == "numpy":
         return "numpy"
     failure = "CuPy is not installed or its CUDA libraries could not be imported."
@@ -2694,7 +2808,7 @@ class CRLFocusConfig:
             _validate_finite(name,value)
             if value<0: raise ValueError("Source FWHM must be non-negative.")
             object.__setattr__(self,name,float(value))
-        if self.accuracy not in {"preview","refined"} or self.backend not in {"auto","numpy","cupy"}:
+        if self.accuracy not in {"preview","refined"} or self.backend not in {"auto","numpy","cupy","torch"}:
             raise ValueError("Invalid accuracy or backend.")
         for name in ("axial_roi_level","transverse_roi_level"):
             value=getattr(self,name)
@@ -3321,10 +3435,8 @@ class _CRLFocusSession:
         """Store each exit spectrum once for the scan and later detector planes."""
         self._mode_bytes=self.spectrum.nbytes
         required=len(self.weights)*self._mode_bytes
-        gpu_budget=0
-        if self.grid.backend=="cupy":
-            free,_=cp.cuda.runtime.memGetInfo()
-            gpu_budget=min(1024**3,free//4)
+        free = self.grid._free_gpu_memory()
+        gpu_budget = min(1024**3, free//4) if free is not None else 0
 
         cache_location="GPU" if required<=gpu_budget else "RAM"
         scratch=None
@@ -3350,6 +3462,7 @@ class _CRLFocusSession:
                     if scratch is None:
                         self._mode_batches.append(host_spectrum)
                     else:
+                        self._mode_file_dtype = host_spectrum.dtype
                         block=memoryview(np.ascontiguousarray(host_spectrum)).cast("B")
                         if scratch.write(block)!=block.nbytes:
                             raise OSError("Could not write the temporary source spectrum cache.")
@@ -3364,7 +3477,7 @@ class _CRLFocusSession:
             if scratch is not None and self._mode_file is None:
                 scratch.close()
 
-        if cache_location=="temporary storage" or (cache_location=="RAM" and self.grid.backend=="cupy"):
+        if cache_location=="temporary storage" or (cache_location=="RAM" and free is not None):
             self.diagnostics.append(
                 f"source_spectrum_cache: Source spectra are cached in {cache_location} "
                 "and reused for all detector planes."
@@ -3405,7 +3518,7 @@ class _CRLFocusSession:
             if self._mode_file is None:
                 spectra=self._mode_batches[index]
             else:
-                spectra=np.empty((stop-start,*self.grid.shape),dtype=self.spectrum.dtype)
+                spectra=np.empty((stop-start,*self.grid.shape),dtype=self._mode_file_dtype)
                 block=memoryview(spectra).cast("B")
                 with self._mode_io_lock:
                     self._mode_file.seek(start*self._mode_bytes)
@@ -3542,16 +3655,18 @@ class _CRLFocusSession:
     def _blur(self,image,z,*,displacement_scale=None):
         if self.cfg.source_type!="gaussian":
             return image
-        if self.grid.backend=="cupy":
-            from cupyx.scipy.ndimage import gaussian_filter
-        else:
-            from scipy.ndimage import gaussian_filter
         grid=self.detector_grid
         magnification=(self._source_displacement_scale(z) if displacement_scale is None
                        else displacement_scale)
         sigma_x=abs(magnification[0])*self.source_sigma[0]/grid.dx
         sigmas=sigma_x if self.grid.dimension==1 else (
             abs(magnification[1])*self.source_sigma[1]/grid.dy,sigma_x)
+        if self.grid.backend == "torch":
+            return self.xp.gaussian_filter(image, sigmas)
+        if self.grid.backend=="cupy":
+            from cupyx.scipy.ndimage import gaussian_filter
+        else:
+            from scipy.ndimage import gaussian_filter
         return gaussian_filter(image,sigmas,mode="constant",cval=0.0,truncate=5.0)
 
     def iter_intensities(self,z_values,progress=None):
@@ -4106,7 +4221,7 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
     target_x=focus_widths[0]/6
     if cfg.source_type!="plane":
         target_x=min(target_x,wavelength*cfg.source_distance_m/(2*cfg.aperture_m))
-    quick_cap=65536 if cfg.grid_dimension==1 else (2048 if backend=="cupy" else 1024)
+    quick_cap=65536 if cfg.grid_dimension==1 else (2048 if backend in {"cupy", "torch"} else 1024)
     cap=65536 if cfg.grid_dimension==1 else (4096 if cfg.accuracy=="refined" else quick_cap)
     k=2*np.pi/wavelength
     delta=parameters['material'].optical_constants(cfg.energy_kev)[0]
