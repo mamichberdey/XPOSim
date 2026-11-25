@@ -1,6 +1,6 @@
 # X-ray focusing with compound refractive lenses in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/b0d819d9d57ae8f6239413e8f1a12bd577093e46/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/368e831d7c13eb7e4050e9bf5470aef530daeeb4/notebooks/CRL_Focus_Colab.ipynb).
 
 Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. Cell 2 keeps the inputs in their own form while calculations update cell 3. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results stay in the active session.
 
@@ -12,7 +12,7 @@ In Results, choose **Download PDF report** after a successful calculation. The s
 
 1. Open the link and sign in to Colab. Optionally save a copy to your Drive.
 2. For GPU execution, use **Runtime → Change runtime type → GPU → Save**, reconnect, and run all cells. CPU execution is also supported.
-3. For GPU execution, the runtime needs any one of CuPy, PyTorch or TensorFlow with compatible GPU support. In **Show scan region and sampling settings → Compute backend**, select Auto, NumPy (CPU), CuPy (CUDA), PyTorch (CUDA) or TensorFlow (GPU). Auto probes the installed GPU backends in that order after excluding NumPy, then falls back to NumPy.
+3. For GPU execution, the runtime needs any one of CuPy, PyTorch or TensorFlow with compatible GPU support. In **Show scan region and sampling settings → Compute backend**, select Auto, NumPy (CPU), CuPy (CUDA), PyTorch (CUDA) or TensorFlow (GPU). Auto probes CuPy, PyTorch and TensorFlow in order, then falls back to NumPy.
 4. Run **2 · CRL and source parameters** to display the editable fields. The default is a silicon CRL at 12 keV with an apex radius of curvature of 6.25 µm, a geometric aperture of 50 µm, a web thickness of 2 µm, and 26 elements. The default structure depth for line focusing on a 2D grid is 30 µm. The source is 15 m from the CRL entrance. **Fast** sampling is selected initially.
 5. Run **3 · Results**, then press **Compute** after setting the inputs. To change the lens or source, edit the fields in cell 2 and press **Compute** again. The z slider navigates the calculated planes in the results cell.
 
