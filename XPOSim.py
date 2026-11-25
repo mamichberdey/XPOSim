@@ -47,7 +47,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.33.1"
+__version__ = "0.33.2"
 
 
 __all__ = [
@@ -214,6 +214,30 @@ class _TensorFlowArrays:
     def empty(self, shape, dtype):
         with self.tf.device(self.device):
             return self.tf.Variable(self.tf.zeros(shape, dtype), trainable=False)
+
+    @lru_cache(maxsize=4)
+    def lens_stack_graph(self, dimension):
+        tf = self.tf
+        fft, ifft = ((tf.signal.fft, tf.signal.ifft) if dimension == 1 else
+                     (tf.signal.fft2d, tf.signal.ifft2d))
+
+        @tf.function(autograph=False, reduce_retracing=True)
+        def propagate(field, transmission, center_phase, half_step, count):
+            with tf.device(self.device):
+                # Between successive centred FFT/IFFT pairs the phase ramps
+                # cancel. The diagonal lens transmission commutes with them.
+                field = tf.cast(field, tf.complex128) * center_phase
+                field = ifft(fft(field) * half_step)
+                full_step = half_step * half_step
+
+                def advance(i, wave):
+                    return i + 1, ifft(fft(wave * transmission) * full_step)
+
+                _, field = tf.while_loop(lambda i, wave: i < count - 1, advance,
+                                         (tf.constant(0), field), parallel_iterations=1)
+                return ifft(fft(field * transmission) * half_step) * tf.math.conj(center_phase)
+
+        return propagate
 
     def brackets(self, x, axis):
         i = self.tf.clip_by_value(self.tf.searchsorted(axis, x), 1, len(axis)-1)
@@ -1882,6 +1906,7 @@ class CRL(OpticalElement):
         if self.beta is not None and self.beta < 0:
             raise ValueError("material beta must be >= 0.")
 
+        self._tf_stack_factors = None
         self._thickness_cache: dict[int, Any] = {}
         self._transmission_cache: dict[int, Any] = {}
 
@@ -2122,10 +2147,29 @@ class CRL(OpticalElement):
 
         self._thickness_cache.clear()
         self._transmission_cache.clear()
+        self._tf_stack_factors = None
+
+    def _tensorflow_repeated_stack(self, field):
+        grid = self.grid
+        xp = grid.xp
+        transmission = self.transmission(0)
+        if self._tf_stack_factors is None:
+            phase, _ = _fourier_phase(grid.nx, +1, xp)
+            q_squared = (grid.qx if grid.dimension == 1 else grid.qx_axis)**2
+            if grid.dimension == 2:
+                phase_y, _ = _fourier_phase(grid.ny, +1, xp)
+                phase = phase * phase_y[:, None]
+                q_squared = q_squared + grid.qy_axis[:, None]**2
+            half_step = xp.exp((-0.25j * self.element_period / self.k) * q_squared)
+            self._tf_stack_factors = phase, half_step
+        return xp.lens_stack_graph(grid.dimension)(
+            field, transmission, *self._tf_stack_factors, xp.tf.constant(self.n_elements))
 
     def _field_after_element(self) -> Any:
         """Propagate through the complete CRL stack and return its exit-plane field."""
 
+        if self.grid.backend == "tensorflow" and self.reuse_element_geometry:
+            return self._tensorflow_repeated_stack(self._require_input_field())
         field = self.propagate(self._require_input_field(), self.element_period / 2)
         for element_index in range(self.n_elements):
             field = field * self.transmission(element_index)
@@ -2145,6 +2189,9 @@ class CRL(OpticalElement):
                 fields.ndim != self.grid.dimension + 1 or fields.shape[1:] != self.grid.shape):
             raise ValueError("Expected a source batch with shape (batch, *grid.shape) on the grid backend.")
         k, _, _ = self._require_optical_constants()
+
+        if self.grid.backend == "tensorflow" and self.reuse_element_geometry:
+            return self._tensorflow_repeated_stack(fields)
 
         def propagate_batch(field, distance):
             return self.grid._propagate_mode_spectra(
@@ -2342,20 +2389,30 @@ class CRL(OpticalElement):
         E_array = (self.grid.xp.empty((len(z_array), *roi_shape), dtype=spectrum.dtype)
                    if return_fields else None)
         metrics: list[BeamMetrics] = []
+        tables = []
+        measure_y = self.transverse_length is None
         for planes, fields in self.grid._iter_spectrum(E0, spectrum, z_array, self.k, batch_size):
-            metrics.extend(_beam_metrics_batch(fields, self.grid, slices, div,
-                measure_y_fwhm=self.transverse_length is None))
+            cropped = fields[(slice(None), *slices)]
+            values = abs(cropped)**2
+            if self.grid.backend == "tensorflow":
+                tables.append(_tensorflow_metrics(self.grid.xp, values, x_roi, y_roi, measure_y))
+            else:
+                metrics.extend(_intensity_metrics_batch(values, self.grid, slices, div,
+                    coordinates=(x_roi, y_roi), measure_y_fwhm=measure_y))
             if return_fields:
-                cropped = fields[(slice(None), *slices)]
                 if self.grid.backend == "tensorflow":
                     E_array[planes].assign(cropped)
                 elif self.grid.backend == "jax":
                     E_array = E_array.at[planes].set(cropped)
                 else:
                     E_array[planes] = cropped
-            del fields
-        if return_fields and self.grid.backend == "tensorflow":
-            E_array = E_array.read_value()
+            del values, cropped, fields
+        if tables:
+            # One compact host read for the entire scan, after all batches.
+            table = self.grid.xp.tf.concat(tables, axis=0).numpy()
+            metrics = _metrics_from_table(table, self.grid.dimension, div)
+            if return_fields:
+                E_array = E_array.read_value()
 
         peaks = np.asarray([m.max_intensity for m in metrics])
         peak_index = None if np.all(np.isnan(peaks)) else int(np.nanargmax(peaks))
@@ -2565,6 +2622,12 @@ def _tensorflow_metric_graph(xp, shape, dtype, axis_dtype, measure_y_fwhm):
     return reduce_batch
 
 
+def _tensorflow_metrics(xp, values, x, y, measure_y):
+    reduce_batch = _tensorflow_metric_graph(xp, tuple(values.shape), values.dtype, x.dtype, measure_y)
+    axes = (x,) if y is None else (x, y)
+    return reduce_batch(values, *axes)
+
+
 def _intensity_metrics_batch(values: Any, grid: BaseGrid, slices: tuple[slice, ...],
                              divergence_value: Any = None, *, measure_y_fwhm: bool = True,
                              coordinates=None) -> list[BeamMetrics]:
@@ -2572,13 +2635,14 @@ def _intensity_metrics_batch(values: Any, grid: BaseGrid, slices: tuple[slice, .
     xp = grid.xp
     x, y = _coordinates_for_slices(grid, slices) if coordinates is None else coordinates
     if grid.backend == "tensorflow":
-        reduce_batch = _tensorflow_metric_graph(xp, tuple(values.shape), values.dtype,
-                                                x.dtype, measure_y_fwhm)
-        axes = (x,) if y is None else (x, y)
-        table = _to_numpy(reduce_batch(values, *axes))
+        table = _tensorflow_metrics(xp, values, x, y, measure_y_fwhm).numpy()
     else:
         table = _to_numpy(_metric_table(values, x, y, measure_y_fwhm, xp))
-    if grid.dimension == 1:
+    return _metrics_from_table(table, grid.dimension, divergence_value)
+
+
+def _metrics_from_table(table, dimension, divergence_value):
+    if dimension == 1:
         return [BeamMetrics(float(m), float(c), _optional_float(w), divergence_value)
                 if ok else BeamMetrics(np.nan, None, None, None) for m, c, w, ok in table]
     return [BeamMetrics(float(m), (float(cx), float(cy)),
