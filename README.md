@@ -1,6 +1,6 @@
 # XPOSim
 
-XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating monochromatic X-ray propagation, diffraction, and focusing. It propagates complex wavefields on one- and two-dimensional transverse grids using FFTs. Calculations run on the CPU with NumPy or on an NVIDIA GPU with CuPy, PyTorch or TensorFlow.
+XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating monochromatic X-ray propagation, diffraction, and focusing. It propagates complex wavefields on one- and two-dimensional transverse grids using FFTs. Calculations run on the CPU with NumPy or on an NVIDIA GPU with CuPy, PyTorch, TensorFlow or JAX.
 
 Try XPOSim for X-ray focusing with a compound refractive lens.
 
@@ -23,7 +23,7 @@ Try XPOSim for X-ray focusing with a compound refractive lens.
 
 Keep `XPOSim.py` alongside `xray_material_data/` for formula-based materials. XPOSim requires NumPy and SciPy. Plotting examples also use Matplotlib.
 
-For NVIDIA GPU calculations, install **any one** of CuPy, PyTorch or TensorFlow with GPU support compatible with your system and driver. Select the corresponding backend on a grid or in `CRLFocusConfig`.
+For NVIDIA GPU calculations, install **any one** of CuPy, PyTorch, TensorFlow or JAX with GPU support compatible with your system and driver. Select the corresponding backend on a grid or in `CRLFocusConfig`.
 
 | Compute backend | Setting |
 | --- | --- |
@@ -31,8 +31,9 @@ For NVIDIA GPU calculations, install **any one** of CuPy, PyTorch or TensorFlow 
 | CuPy on GPU | `backend="cupy"` |
 | PyTorch on GPU | `backend="torch"` |
 | TensorFlow on GPU | `backend="tensorflow"` |
+| JAX on GPU | `backend="jax"` |
 
-The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch and TensorFlow in that order and uses NumPy if no GPU backend can run. An explicit GPU selection requires that backend to execute on a visible GPU.
+The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch, TensorFlow and JAX in that order and uses NumPy if no GPU backend can run. An explicit GPU selection requires that backend to execute on a visible GPU.
 
 ## Quick start
 
@@ -47,7 +48,7 @@ import XPOSim as xpos
 
 requested = "auto"
 available = []
-for name in ("cupy", "torch", "tensorflow", "numpy"):
+for name in ("cupy", "torch", "tensorflow", "jax", "numpy"):
     try:
         available.append(xpos.select_backend(name))
     except (ImportError, OSError, RuntimeError):

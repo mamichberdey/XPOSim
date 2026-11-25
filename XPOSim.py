@@ -8,7 +8,7 @@ The module deliberately keeps the public model small:
   for ``z=0`` and Fresnel-propagates that field for ``z>0``;
 * :class:`PointSource` creates a field and therefore is the only object that
   does not consume an input field;
-* NumPy, CuPy, PyTorch and TensorFlow are supported without changing the array type of a field;
+* NumPy, CuPy, PyTorch, TensorFlow and JAX are supported without changing the array type of a field;
 * CRL surface errors are specified as sampled height deviations and interpolated
   onto the calculation grid.
 * cached configuration parameters are read-only; CRL.with_parameters constructs
@@ -47,7 +47,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.32.0"
+__version__ = "0.33.0"
 
 
 __all__ = [
@@ -97,6 +97,68 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Backend helpers
 # ---------------------------------------------------------------------------
+
+
+def _is_jax_array(value):
+    jax = sys.modules.get("jax")
+    return jax is not None and isinstance(value, jax.Array)
+
+
+class _JaxArrays:
+    """JAX's NumPy API with factories bound to the calculation device."""
+
+    def __init__(self, device):
+        import jax
+        import jax.numpy as jnp
+
+        jax.config.update("jax_enable_x64", True)
+        self.device = device
+        self.np = jnp
+        for name in ("arange", "asarray", "empty", "full", "linspace", "ones", "zeros"):
+            setattr(self, name, partial(getattr(jnp, name), device=device))
+
+    def __getattr__(self, name):
+        return getattr(self.np, name)
+
+    def interp_map(self, values, x_axis, y_axis, grid, fill):
+        from jax.scipy.interpolate import RegularGridInterpolator
+        interp = RegularGridInterpolator(
+            (self.asarray(y_axis), self.asarray(x_axis)), self.asarray(values), fill_value=fill)
+        points = self.stack((grid.y, grid.x), axis=-1)
+        return interp(points)
+
+    def gaussian_filter(self, image, sigmas):
+        for axis, sigma in enumerate(np.atleast_1d(sigmas)):
+            radius = int(5 * sigma + .5)
+            if radius:
+                offsets = self.arange(-radius, radius + 1, dtype=image.dtype)
+                kernel = self.exp(-.5 * (offsets / sigma)**2)
+                image = self.apply_along_axis(
+                    lambda line: self.convolve(self.pad(line, radius), kernel / kernel.sum(), "valid"),
+                    axis, image)
+        return image
+
+
+@lru_cache(maxsize=None)
+def _jax_arrays(device):
+    return _JaxArrays(device)
+
+
+@lru_cache(maxsize=1)
+def _jax_gpu():
+    try:
+        import jax
+    except (ImportError, OSError) as exc:
+        raise RuntimeError("JAX backend requires a GPU-enabled JAX installation.") from exc
+    try:
+        device = jax.devices("gpu")[0]
+        xp = _jax_arrays(device)
+        probe = xp.fft.fft(xp.ones(2, dtype=xp.complex128)).block_until_ready()
+    except (RuntimeError, IndexError) as exc:
+        raise RuntimeError("JAX backend requires a GPU capable of complex128 FFTs.") from exc
+    if probe.device != device or probe.dtype != np.complex128:
+        raise RuntimeError("JAX could not execute a complex128 FFT on the selected GPU.")
+    return xp
 
 
 def _is_tf_tensor(value):
@@ -313,16 +375,20 @@ def _array_module(array: Any):
         return np
     if CUPY_AVAILABLE and isinstance(array, cp.ndarray):
         return cp
+    if _is_jax_array(array):
+        return _jax_arrays(array.device)
     if _is_tf_tensor(array):
         return _tensorflow_arrays(array.device)
     if _is_tensor(array):
         return _torch_arrays(array.device)
-    raise TypeError("Field must be a NumPy array, CuPy array, Torch tensor or TensorFlow tensor.")
+    raise TypeError("Field must be a NumPy array, CuPy array, Torch tensor, TensorFlow tensor or JAX array.")
 
 
 def _backend_name(array: Any) -> str:
     """Return the backend name for a supported field."""
 
+    if _is_jax_array(array):
+        return "jax"
     if _is_tf_tensor(array):
         return "tensorflow"
     if _is_tensor(array):
@@ -699,11 +765,13 @@ def _backend_module(backend: str):
         if not CUPY_AVAILABLE:
             raise RuntimeError("CuPy backend requested, but CuPy is not installed.")
         return cp
+    if backend == "jax":
+        return _jax_gpu()
     if backend == "tensorflow":
         return _tensorflow_gpu()
     if backend == "torch":
         return _torch_gpu()
-    raise ValueError("backend must be numpy, cupy, torch or tensorflow.")
+    raise ValueError("backend must be numpy, cupy, torch, tensorflow or jax.")
 
 
 def _centered_coordinates(n: int, step: float, xp) -> Any:
@@ -874,7 +942,7 @@ class BaseGrid(_Configured, ABC):
         _array_module(field)
         if _backend_name(field) != self.backend:
             raise TypeError(f"Field backend is {_backend_name(field)!r}, but the grid uses {self.backend!r}.")
-        if self.backend in {"tensorflow", "torch"} and field.device != self.xp.device:
+        if self.backend in {"tensorflow", "torch", "jax"} and field.device != self.xp.device:
             raise TypeError(f"Field must be on grid device {self.xp.device}.")
         if tuple(field.shape) != self.shape:
             raise ValueError(f"Expected field shape {self.shape}, got {field.shape}.")
@@ -949,7 +1017,7 @@ class BaseGrid(_Configured, ABC):
         self._validate_field_backend(field)
         _validate_finite("z",z)
         _validate_positive("k",k)
-        if self.backend == detector.backend and self.backend in {"torch", "tensorflow"} and self.xp.device != detector.xp.device:
+        if self.backend == detector.backend and self.backend in {"torch", "tensorflow", "jax"} and self.xp.device != detector.xp.device:
             raise ValueError("Detector and propagation grid must use the same device.")
         if detector.dimension!=self.dimension or detector.backend!=self.backend:
             raise ValueError("Detector dimension/backend must match the propagation grid.")
@@ -968,9 +1036,9 @@ class BaseGrid(_Configured, ABC):
             return min(n_planes, batch_size)
         free_bytes = self._free_gpu_memory()
         if free_bytes is None:
-            # TensorFlow exposes allocator usage but not free device memory.
-            if self.backend == "tensorflow":
-                field_bytes = int(np.prod(self.shape)) * dtype.size
+            if self.backend in {"tensorflow", "jax"}:
+                itemsize = dtype.size if self.backend == "tensorflow" else dtype.itemsize
+                field_bytes = int(np.prod(self.shape)) * itemsize
                 return max(1, min(n_planes, 16, (64 << 20) // (6 * field_bytes)))
             return 1
         itemsize = dtype.itemsize if self.backend == "torch" else np.dtype(dtype).itemsize
@@ -1000,7 +1068,7 @@ class BaseGrid(_Configured, ABC):
             positions = z_array[start:stop]
             fields = self._propagate_spectrum(spectrum, positions, k)
             zero = np.flatnonzero(positions == 0)
-            if zero.size and self.backend == "tensorflow":
+            if zero.size and self.backend in {"tensorflow", "jax"}:
                 mask = self.xp.asarray(positions == 0)
                 fields = self.xp.where(self.xp.reshape(mask, (-1,) + (1,)*self.dimension), field, fields)
             elif zero.size:
@@ -1021,6 +1089,8 @@ class BaseGrid(_Configured, ABC):
         for planes, fields in self.iter_propagate(field, z_array, k, batch_size=batch_size):
             if self.backend == "tensorflow":
                 result[planes].assign(fields)
+            elif self.backend == "jax":
+                result = result.at[planes].set(fields)
             else:
                 result[planes] = fields
         return result.read_value() if self.backend == "tensorflow" else result
@@ -1492,7 +1562,7 @@ def _interpolate_map(values: Any, x_axis: Any, y_axis: Any,
                      grid: BaseGrid, fill_value: float) -> Any:
     """Interpolate a 2D map on its calculation backend when CuPy supports it."""
     xp = grid.xp
-    if grid.backend in {"torch", "tensorflow"}:
+    if grid.backend in {"torch", "tensorflow", "jax"}:
         return xp.interp_map(values, x_axis, y_axis, grid, fill_value)
     interpolator_type = RegularGridInterpolator
     if grid.backend == "cupy":
@@ -2071,7 +2141,7 @@ class CRL(OpticalElement):
         """
         _array_module(fields)
         if (_backend_name(fields) != self.grid.backend or
-                (self.grid.backend in {"torch", "tensorflow"} and fields.device != self.grid.xp.device) or
+                (self.grid.backend in {"torch", "tensorflow", "jax"} and fields.device != self.grid.xp.device) or
                 fields.ndim != self.grid.dimension + 1 or fields.shape[1:] != self.grid.shape):
             raise ValueError("Expected a source batch with shape (batch, *grid.shape) on the grid backend.")
         k, _, _ = self._require_optical_constants()
@@ -2279,11 +2349,13 @@ class CRL(OpticalElement):
                 cropped = fields[(slice(None), *slices)]
                 if self.grid.backend == "tensorflow":
                     E_array[planes].assign(cropped)
+                elif self.grid.backend == "jax":
+                    E_array = E_array.at[planes].set(cropped)
                 else:
                     E_array[planes] = cropped
+            del fields
         if return_fields and self.grid.backend == "tensorflow":
             E_array = E_array.read_value()
-            del fields
 
         peaks = np.asarray([m.max_intensity for m in metrics])
         peak_index = None if np.all(np.isnan(peaks)) else int(np.nanargmax(peaks))
@@ -2569,8 +2641,11 @@ def select_backend(preferred: str = "auto") -> str:
     auto falls back to NumPy. An explicit cupy request raises a diagnostic error
     when CUDA cannot execute. This does not install dependencies or change drivers.
     """
-    if preferred not in {"auto", "numpy", "cupy", "torch", "tensorflow"}:
-        raise ValueError("backend must be auto, numpy, cupy, torch or tensorflow.")
+    if preferred not in {"auto", "numpy", "cupy", "torch", "tensorflow", "jax"}:
+        raise ValueError("backend must be auto, numpy, cupy, torch, tensorflow or jax.")
+    if preferred == "jax":
+        _jax_gpu()
+        return "jax"
     if preferred == "tensorflow":
         _tensorflow_gpu()
         return "tensorflow"
@@ -2592,7 +2667,7 @@ def select_backend(preferred: str = "auto") -> str:
             failure = f"CUDA probe failed: {exc}"
     if preferred == "cupy":
         raise RuntimeError(failure + " Use backend='auto' or 'numpy' for CPU execution.")
-    for candidate in ("torch", "tensorflow"):
+    for candidate in ("torch", "tensorflow", "jax"):
         try:
             return select_backend(candidate)
         except (RuntimeError, ImportError, OSError):
@@ -2951,7 +3026,7 @@ class CRLFocusConfig:
             _validate_finite(name,value)
             if value<0: raise ValueError("Source FWHM must be non-negative.")
             object.__setattr__(self,name,float(value))
-        if self.accuracy not in {"preview","refined"} or self.backend not in {"auto","numpy","cupy","torch","tensorflow"}:
+        if self.accuracy not in {"preview","refined"} or self.backend not in {"auto","numpy","cupy","torch","tensorflow", "jax"}:
             raise ValueError("Invalid accuracy or backend.")
         for name in ("axial_roi_level","transverse_roi_level"):
             value=getattr(self,name)
@@ -3804,7 +3879,7 @@ class _CRLFocusSession:
         sigma_x=abs(magnification[0])*self.source_sigma[0]/grid.dx
         sigmas=sigma_x if self.grid.dimension==1 else (
             abs(magnification[1])*self.source_sigma[1]/grid.dy,sigma_x)
-        if self.grid.backend in {"torch", "tensorflow"}:
+        if self.grid.backend in {"torch", "tensorflow", "jax"}:
             return self.xp.gaussian_filter(image, sigmas)
         if self.grid.backend=="cupy":
             from cupyx.scipy.ndimage import gaussian_filter
@@ -4364,7 +4439,7 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
     target_x=focus_widths[0]/6
     if cfg.source_type!="plane":
         target_x=min(target_x,wavelength*cfg.source_distance_m/(2*cfg.aperture_m))
-    quick_cap=65536 if cfg.grid_dimension==1 else (2048 if backend in {"cupy", "torch", "tensorflow"} else 1024)
+    quick_cap=65536 if cfg.grid_dimension==1 else (2048 if backend in {"cupy", "torch", "tensorflow", "jax"} else 1024)
     cap=65536 if cfg.grid_dimension==1 else (4096 if cfg.accuracy=="refined" else quick_cap)
     k=2*np.pi/wavelength
     delta=parameters['material'].optical_constants(cfg.energy_kev)[0]
