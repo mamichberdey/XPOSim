@@ -47,7 +47,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.33.0"
+__version__ = "0.33.1"
 
 
 __all__ = [
@@ -2431,9 +2431,9 @@ def intensity(field: Any) -> Any:
     return abs(field) ** 2
 
 
-def _widths_batch(profiles: Any, coordinates: Any) -> Any:
+def _widths_batch(profiles: Any, coordinates: Any, *, xp=None) -> Any:
     """Vectorized, peak-crossing FWHM for (batch, samples) profiles on CPU/GPU."""
-    xp = _array_module(profiles)
+    xp = _array_module(profiles) if xp is None else xp
     batch, n = profiles.shape
     if n < 2:
         return xp.full(batch, xp.nan)
@@ -2530,28 +2530,57 @@ def _beam_metrics_batch(fields: Any, grid: BaseGrid, slices: tuple[slice, ...],
         measure_y_fwhm=measure_y_fwhm)
 
 
-def _intensity_metrics_batch(values: Any, grid: BaseGrid, slices: tuple[slice, ...],
-                             divergence_value: Any = None, *, measure_y_fwhm: bool = True,
-                             coordinates=None) -> list[BeamMetrics]:
-    """Measure already-incoherent intensities without creating artificial fields."""
-    xp = grid.xp
+def _metric_table(values, x_axis, y_axis, measure_y_fwhm, xp):
+    """Reduce a batch to peak intensity, coordinates, widths and validity."""
     batch = values.shape[0]
     rows = xp.arange(batch)
     flat = xp.where(xp.isnan(values), -xp.inf, values).reshape(batch, -1)
     peaks = xp.argmax(flat, axis=1)
     maxima = flat[rows, peaks]
     finite = xp.any(xp.isfinite(values).reshape(batch, -1), axis=1)
-    x_axis, y_axis = _coordinates_for_slices(grid, slices) if coordinates is None else coordinates
+    if y_axis is None:
+        widths = _widths_batch(values, x_axis, xp=xp)
+        return xp.stack((maxima, x_axis[peaks], widths, finite), axis=1)
+    j, i = peaks // values.shape[-1], peaks % values.shape[-1]
+    width_x = _widths_batch(values[rows, j, :], x_axis, xp=xp)
+    width_y = (_widths_batch(values[rows, :, i], y_axis, xp=xp) if measure_y_fwhm else
+               xp.full(batch,xp.nan))
+    return xp.stack((maxima, x_axis[i], y_axis[j], width_x, width_y, finite), axis=1)
+
+
+@lru_cache(maxsize=32)
+def _tensorflow_metric_graph(xp, shape, dtype, axis_dtype, measure_y_fwhm):
+    """Cache the reduction for each batch shape, including the shorter final batch."""
+    tf = xp.tf
+    specs = [tf.TensorSpec(shape, dtype), tf.TensorSpec((shape[-1],), axis_dtype)]
+    if len(shape) == 3:
+        specs.append(tf.TensorSpec((shape[-2],), axis_dtype))
+
+    @tf.function(input_signature=specs, autograph=False)
+    def reduce_batch(values, *axes):
+        with tf.device(xp.device):
+            y = axes[1] if len(axes) == 2 else None
+            return _metric_table(values, axes[0], y, measure_y_fwhm, xp)
+
+    return reduce_batch
+
+
+def _intensity_metrics_batch(values: Any, grid: BaseGrid, slices: tuple[slice, ...],
+                             divergence_value: Any = None, *, measure_y_fwhm: bool = True,
+                             coordinates=None) -> list[BeamMetrics]:
+    """Measure already-incoherent intensities without creating artificial fields."""
+    xp = grid.xp
+    x, y = _coordinates_for_slices(grid, slices) if coordinates is None else coordinates
+    if grid.backend == "tensorflow":
+        reduce_batch = _tensorflow_metric_graph(xp, tuple(values.shape), values.dtype,
+                                                x.dtype, measure_y_fwhm)
+        axes = (x,) if y is None else (x, y)
+        table = _to_numpy(reduce_batch(values, *axes))
+    else:
+        table = _to_numpy(_metric_table(values, x, y, measure_y_fwhm, xp))
     if grid.dimension == 1:
-        widths = _widths_batch(values, x_axis)
-        table = _to_numpy(xp.stack((maxima, x_axis[peaks], widths, finite), axis=1))
         return [BeamMetrics(float(m), float(c), _optional_float(w), divergence_value)
                 if ok else BeamMetrics(np.nan, None, None, None) for m, c, w, ok in table]
-    j, i = peaks // values.shape[-1], peaks % values.shape[-1]
-    width_x = _widths_batch(values[rows, j, :], x_axis)
-    width_y = (_widths_batch(values[rows, :, i], y_axis) if measure_y_fwhm else
-               xp.full(batch,xp.nan))
-    table = _to_numpy(xp.stack((maxima, x_axis[i], y_axis[j], width_x, width_y, finite), axis=1))
     return [BeamMetrics(float(m), (float(cx), float(cy)),
                         (_optional_float(wx), _optional_float(wy)), divergence_value)
             if ok else BeamMetrics(np.nan, None, None, None)
