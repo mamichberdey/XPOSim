@@ -8,7 +8,7 @@ The module deliberately keeps the public model small:
   for ``z=0`` and Fresnel-propagates that field for ``z>0``;
 * :class:`PointSource` creates a field and therefore is the only object that
   does not consume an input field;
-* NumPy, CuPy and PyTorch are supported without changing the array type of a field;
+* NumPy, CuPy, PyTorch and TensorFlow are supported without changing the array type of a field;
 * CRL surface errors are specified as sampled height deviations and interpolated
   onto the calculation grid.
 * cached configuration parameters are read-only; CRL.with_parameters constructs
@@ -47,7 +47,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.31.0"
+__version__ = "0.32.0"
 
 
 __all__ = [
@@ -97,6 +97,115 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Backend helpers
 # ---------------------------------------------------------------------------
+
+
+def _is_tf_tensor(value):
+    tf = sys.modules.get("tensorflow")
+    return tf is not None and isinstance(value, (tf.Tensor, tf.Variable))
+
+
+class _TensorFlowFFT:
+    def __init__(self, tf):
+        self.tf = tf
+
+    def fft(self, field, n=None):
+        if n is not None:
+            length = field.shape[-1]
+            field = self.tf.pad(field[..., :n], [(0, 0)] * (len(field.shape)-1)
+                                + [(0, max(0, n-length))])
+        return self.tf.signal.fft(field)
+
+    def ifft(self, field):
+        return self.tf.signal.ifft(field)
+
+    def fft2(self, field):
+        return self.tf.signal.fft2d(field)
+
+    def ifft2(self, field):
+        return self.tf.signal.ifft2d(field)
+
+
+class _TensorFlowArrays:
+    """TensorFlow eager operations for the shared array-based optical model."""
+
+    def __init__(self, device):
+        import tensorflow as tf
+        self.tf = tf
+        self.device = device
+        self.np = tf.experimental.numpy
+        self.nan = np.nan
+        self.np.experimental_enable_numpy_behavior(prefer_float32=False)
+        self.fft = _TensorFlowFFT(tf)
+        # Place factories explicitly, including those called without input tensors.
+        for name in ("arange", "linspace", "ones", "zeros", "full", "asarray"):
+            setattr(self, name, self._placed(getattr(self.np, name)))
+
+    def _placed(self, operation):
+        def on_device(*args, **kwargs):
+            with self.tf.device(self.device):
+                return operation(*args, **kwargs)
+        return on_device
+
+    def __getattr__(self, name):
+        return getattr(self.np, name)
+
+    def empty(self, shape, dtype):
+        with self.tf.device(self.device):
+            return self.tf.Variable(self.tf.zeros(shape, dtype), trainable=False)
+
+    def brackets(self, x, axis):
+        i = self.tf.clip_by_value(self.tf.searchsorted(axis, x), 1, len(axis)-1)
+        return i, (x-axis[i-1]) / (axis[i]-axis[i-1])
+
+    def interp(self, x, axis, values, *, left, right):
+        i, w = self.brackets(x, axis)
+        result = values[i-1] + w * (values[i]-values[i-1])
+        return self.where(x < axis[0], left, self.where(x > axis[-1], right, result))
+
+    def interp_map(self, values, x_axis, y_axis, grid, fill):
+        x, y, data = map(self.asarray, (x_axis, y_axis, values))
+        i, wx = self.brackets(grid.x_axis, x)
+        j, wy = self.brackets(grid.y_axis, y)
+        rows = data[:, i-1] + wx * (data[:, i] - data[:, i-1])
+        result = rows[j-1] + wy[:, None] * (rows[j]-rows[j-1])
+        inside = (grid.x >= x[0]) & (grid.x <= x[-1]) & (grid.y >= y[0]) & (grid.y <= y[-1])
+        return self.where(inside, result, fill)
+
+    def gaussian_filter(self, image, sigmas):
+        for axis, sigma in enumerate(np.atleast_1d(sigmas)):
+            radius = int(5 * sigma + .5)
+            if radius:
+                offsets = self.arange(-radius, radius+1, dtype=image.dtype)
+                kernel = self.exp(-.5*(offsets/sigma)**2)
+                lines = self.moveaxis(image, axis, -1)
+                result = self.tf.nn.conv1d(self.reshape(lines, (-1, lines.shape[-1], 1)),
+                    self.reshape(kernel/self.sum(kernel), (-1, 1, 1)), stride=1, padding="SAME")
+                image = self.moveaxis(self.reshape(result, lines.shape), -1, axis)
+        return image
+
+
+@lru_cache(maxsize=None)
+def _tensorflow_arrays(device):
+    return _TensorFlowArrays(device)
+
+
+@lru_cache(maxsize=1)
+def _tensorflow_gpu():
+    try:
+        import tensorflow as tf
+    except (ImportError, OSError) as exc:
+        raise RuntimeError("TensorFlow backend requires TensorFlow with GPU support.") from exc
+    if not tf.config.list_physical_devices("GPU"):
+        raise RuntimeError("TensorFlow backend requires a visible GPU.")
+    try:
+        with tf.device("/GPU:0"):
+            probe = tf.signal.fft(tf.ones(2, dtype=tf.complex128))
+            probe.numpy()
+    except tf.errors.OpError as exc:
+        raise RuntimeError("TensorFlow GPU FFT failed.") from exc
+    if tf.DeviceSpec.from_string(probe.device).device_type != "GPU":
+        raise RuntimeError("TensorFlow could not execute a complex FFT on GPU.")
+    return _tensorflow_arrays(probe.device)
 
 
 def _is_tensor(value):
@@ -191,6 +300,8 @@ def _torch_gpu():
 
 
 def _numeric_dtype(array):
+    if _is_tf_tensor(array):
+        return array.dtype.is_floating or array.dtype.is_integer or array.dtype.is_complex
     if _is_tensor(array):
         return array.dtype != sys.modules["torch"].bool
     return np.issubdtype(array.dtype, np.number)
@@ -202,14 +313,18 @@ def _array_module(array: Any):
         return np
     if CUPY_AVAILABLE and isinstance(array, cp.ndarray):
         return cp
+    if _is_tf_tensor(array):
+        return _tensorflow_arrays(array.device)
     if _is_tensor(array):
         return _torch_arrays(array.device)
-    raise TypeError("Field must be a NumPy array, CuPy array or Torch tensor.")
+    raise TypeError("Field must be a NumPy array, CuPy array, Torch tensor or TensorFlow tensor.")
 
 
 def _backend_name(array: Any) -> str:
     """Return the backend name for a supported field."""
 
+    if _is_tf_tensor(array):
+        return "tensorflow"
     if _is_tensor(array):
         return "torch"
     return "cupy" if CUPY_AVAILABLE and isinstance(array, cp.ndarray) else "numpy"
@@ -584,9 +699,11 @@ def _backend_module(backend: str):
         if not CUPY_AVAILABLE:
             raise RuntimeError("CuPy backend requested, but CuPy is not installed.")
         return cp
+    if backend == "tensorflow":
+        return _tensorflow_gpu()
     if backend == "torch":
         return _torch_gpu()
-    raise ValueError("backend must be numpy, cupy or torch.")
+    raise ValueError("backend must be numpy, cupy, torch or tensorflow.")
 
 
 def _centered_coordinates(n: int, step: float, xp) -> Any:
@@ -757,7 +874,7 @@ class BaseGrid(_Configured, ABC):
         _array_module(field)
         if _backend_name(field) != self.backend:
             raise TypeError(f"Field backend is {_backend_name(field)!r}, but the grid uses {self.backend!r}.")
-        if self.backend == "torch" and field.device != self.xp.device:
+        if self.backend in {"tensorflow", "torch"} and field.device != self.xp.device:
             raise TypeError(f"Field must be on grid device {self.xp.device}.")
         if tuple(field.shape) != self.shape:
             raise ValueError(f"Expected field shape {self.shape}, got {field.shape}.")
@@ -816,6 +933,8 @@ class BaseGrid(_Configured, ABC):
         _validate_finite("z", z)
         _validate_positive("k", k)
         if z == 0:
+            if self.backend == "tensorflow":
+                return self.xp.tf.identity(field)
             return field.clone() if _is_tensor(field) else field.copy()
         return self._propagate_spectrum(self.fft(field), np.asarray([z]), k)[0]
 
@@ -830,8 +949,8 @@ class BaseGrid(_Configured, ABC):
         self._validate_field_backend(field)
         _validate_finite("z",z)
         _validate_positive("k",k)
-        if self.backend == detector.backend == "torch" and self.xp.device != detector.xp.device:
-            raise ValueError("Detector and propagation grid must use the same Torch device.")
+        if self.backend == detector.backend and self.backend in {"torch", "tensorflow"} and self.xp.device != detector.xp.device:
+            raise ValueError("Detector and propagation grid must use the same device.")
         if detector.dimension!=self.dimension or detector.backend!=self.backend:
             raise ValueError("Detector dimension/backend must match the propagation grid.")
         return _DetectorFourierPlan(self,detector).propagate(self.fft(field),z,k)
@@ -849,6 +968,10 @@ class BaseGrid(_Configured, ABC):
             return min(n_planes, batch_size)
         free_bytes = self._free_gpu_memory()
         if free_bytes is None:
+            # TensorFlow exposes allocator usage but not free device memory.
+            if self.backend == "tensorflow":
+                field_bytes = int(np.prod(self.shape)) * dtype.size
+                return max(1, min(n_planes, 16, (64 << 20) // (6 * field_bytes)))
             return 1
         itemsize = dtype.itemsize if self.backend == "torch" else np.dtype(dtype).itemsize
         field_bytes = int(np.prod(self.shape)) * itemsize
@@ -877,7 +1000,10 @@ class BaseGrid(_Configured, ABC):
             positions = z_array[start:stop]
             fields = self._propagate_spectrum(spectrum, positions, k)
             zero = np.flatnonzero(positions == 0)
-            if zero.size:
+            if zero.size and self.backend == "tensorflow":
+                mask = self.xp.asarray(positions == 0)
+                fields = self.xp.where(self.xp.reshape(mask, (-1,) + (1,)*self.dimension), field, fields)
+            elif zero.size:
                 fields[self.xp.asarray(zero)] = self.xp.asarray(field, dtype=fields.dtype)
             yield slice(start, stop), fields
 
@@ -893,8 +1019,11 @@ class BaseGrid(_Configured, ABC):
         dtype = self.xp.result_type(field.dtype, self.xp.complex128)
         result = self.xp.empty((len(z_array), *self.shape), dtype=dtype)
         for planes, fields in self.iter_propagate(field, z_array, k, batch_size=batch_size):
-            result[planes] = fields
-        return result
+            if self.backend == "tensorflow":
+                result[planes].assign(fields)
+            else:
+                result[planes] = fields
+        return result.read_value() if self.backend == "tensorflow" else result
 
     def convolve(self, field_a: Any, field_b: Any) -> Any:
         """Convolve two fields using the continuous Fourier convention."""
@@ -912,7 +1041,7 @@ def _validated_distances(z_values: Sequence[float], *, nonnegative: bool = False
 
 @dataclass
 class Grid1D(BaseGrid):
-    """Uniform 1D grid: dx in metres, nx samples, NumPy, CuPy or Torch backend."""
+    """Uniform 1D grid: dx in metres, nx samples, NumPy, CuPy, Torch or TensorFlow backend."""
 
     dx: float
     nx: int
@@ -1363,7 +1492,7 @@ def _interpolate_map(values: Any, x_axis: Any, y_axis: Any,
                      grid: BaseGrid, fill_value: float) -> Any:
     """Interpolate a 2D map on its calculation backend when CuPy supports it."""
     xp = grid.xp
-    if grid.backend == "torch":
+    if grid.backend in {"torch", "tensorflow"}:
         return xp.interp_map(values, x_axis, y_axis, grid, fill_value)
     interpolator_type = RegularGridInterpolator
     if grid.backend == "cupy":
@@ -1885,7 +2014,7 @@ class CRL(OpticalElement):
         self.grid._validate_field_backend(thickness)
         if not _numeric_dtype(thickness):
             raise TypeError("CRL thickness defect returned a non-numeric array.")
-        if bool(self.grid.xp.any(~self.grid.xp.isfinite(thickness) | (thickness <= 0)).item()):
+        if bool(self.grid.xp.any(~self.grid.xp.isfinite(thickness) | (thickness <= 0))):
             min_thickness = _to_python_float(self.grid.xp.min(thickness))
             raise ValueError(
                 "surface_error removes too much material: the resulting CRL "
@@ -1942,7 +2071,7 @@ class CRL(OpticalElement):
         """
         _array_module(fields)
         if (_backend_name(fields) != self.grid.backend or
-                (self.grid.backend == "torch" and fields.device != self.grid.xp.device) or
+                (self.grid.backend in {"torch", "tensorflow"} and fields.device != self.grid.xp.device) or
                 fields.ndim != self.grid.dimension + 1 or fields.shape[1:] != self.grid.shape):
             raise ValueError("Expected a source batch with shape (batch, *grid.shape) on the grid backend.")
         k, _, _ = self._require_optical_constants()
@@ -2147,7 +2276,13 @@ class CRL(OpticalElement):
             metrics.extend(_beam_metrics_batch(fields, self.grid, slices, div,
                 measure_y_fwhm=self.transverse_length is None))
             if return_fields:
-                E_array[planes] = fields[(slice(None), *slices)]
+                cropped = fields[(slice(None), *slices)]
+                if self.grid.backend == "tensorflow":
+                    E_array[planes].assign(cropped)
+                else:
+                    E_array[planes] = cropped
+        if return_fields and self.grid.backend == "tensorflow":
+            E_array = E_array.read_value()
             del fields
 
         peaks = np.asarray([m.max_intensity for m in metrics])
@@ -2271,7 +2406,7 @@ def full_width_half_max(intensity_array: Any, coordinate: Any) -> float | None:
     coord = xp.asarray(_to_numpy(coordinate) if xp is np else coordinate, dtype=float)
     if arr.ndim != 1 or coord.ndim != 1 or len(arr) != len(coord):
         raise ValueError("full_width_half_max expects matching one-dimensional arrays.")
-    if not bool(xp.all(xp.isfinite(coord)).item()) or bool(xp.any(xp.diff(coord) <= 0).item()):
+    if not bool(xp.all(xp.isfinite(coord))) or bool(xp.any(xp.diff(coord) <= 0)):
         raise ValueError("FWHM coordinates must be finite and strictly increasing.")
     return _optional_float(_to_python_float(_widths_batch(arr[None, :], coord)[0]))
 
@@ -2374,13 +2509,13 @@ def _divergence_from_spectrum(spectrum: Any, grid: BaseGrid, k: float) -> Any:
     values = abs(spectrum)**2
     qx = grid.qx if grid.dimension == 1 else grid.qx_axis
     valid_x = abs(qx) <= k
-    if int(xp.count_nonzero(valid_x).item()) < 3:
+    if int(xp.count_nonzero(valid_x)) < 3:
         return None
     theta_x = xp.arcsin(xp.clip(qx[valid_x] / k, -1, 1))
     if grid.dimension == 1:
         return _optional_float(_to_python_float(_widths_batch(values[None, valid_x], theta_x)[0]))
     valid_y = abs(grid.qy_axis) <= k
-    if int(xp.count_nonzero(valid_y).item()) < 3:
+    if int(xp.count_nonzero(valid_y)) < 3:
         return None
     theta_y = xp.arcsin(xp.clip(grid.qy_axis[valid_y] / k, -1, 1))
     peak = xp.argmax(values)
@@ -2434,8 +2569,11 @@ def select_backend(preferred: str = "auto") -> str:
     auto falls back to NumPy. An explicit cupy request raises a diagnostic error
     when CUDA cannot execute. This does not install dependencies or change drivers.
     """
-    if preferred not in {"auto", "numpy", "cupy", "torch"}:
-        raise ValueError("backend must be auto, numpy, cupy or torch.")
+    if preferred not in {"auto", "numpy", "cupy", "torch", "tensorflow"}:
+        raise ValueError("backend must be auto, numpy, cupy, torch or tensorflow.")
+    if preferred == "tensorflow":
+        _tensorflow_gpu()
+        return "tensorflow"
     if preferred == "torch":
         xp = _torch_gpu()
         xp.fft.fft(xp.ones(2, dtype=xp.complex128))[0].item()
@@ -2454,6 +2592,11 @@ def select_backend(preferred: str = "auto") -> str:
             failure = f"CUDA probe failed: {exc}"
     if preferred == "cupy":
         raise RuntimeError(failure + " Use backend='auto' or 'numpy' for CPU execution.")
+    for candidate in ("torch", "tensorflow"):
+        try:
+            return select_backend(candidate)
+        except (RuntimeError, ImportError, OSError):
+            continue
     return "numpy"
 
 
@@ -2808,7 +2951,7 @@ class CRLFocusConfig:
             _validate_finite(name,value)
             if value<0: raise ValueError("Source FWHM must be non-negative.")
             object.__setattr__(self,name,float(value))
-        if self.accuracy not in {"preview","refined"} or self.backend not in {"auto","numpy","cupy","torch"}:
+        if self.accuracy not in {"preview","refined"} or self.backend not in {"auto","numpy","cupy","torch","tensorflow"}:
             raise ValueError("Invalid accuracy or backend.")
         for name in ("axial_roi_level","transverse_roi_level"):
             value=getattr(self,name)
@@ -3204,7 +3347,7 @@ class _CrossedCRL:
         self.k, self.grid = first.k, first.grid
         self.length = first.length + gap_m + second.length
         self._second_pupil = second._entrance_pupil()
-        if not bool(self.grid.xp.any(self._second_pupil).item()):
+        if not bool(self.grid.xp.any(self._second_pupil)):
             raise ValueError("The y CRL entrance aperture is not resolved by the grid.")
         self._matrices = (_ray_drift(gap_m + second.length) @ first.ray_transfer_matrix(),
                           second.ray_transfer_matrix() @ _ray_drift(first.length + gap_m))
@@ -3433,7 +3576,7 @@ class _CRLFocusSession:
 
     def _prepare_mode_cache(self, progress):
         """Store each exit spectrum once for the scan and later detector planes."""
-        self._mode_bytes=self.spectrum.nbytes
+        self._mode_bytes=int(np.prod(self.spectrum.shape)) * self.spectrum.dtype.size if self.grid.backend == "tensorflow" else self.spectrum.nbytes
         required=len(self.weights)*self._mode_bytes
         free = self.grid._free_gpu_memory()
         gpu_budget = min(1024**3, free//4) if free is not None else 0
@@ -3574,9 +3717,9 @@ class _CRLFocusSession:
             for distance in (near,far):
                 field=inverse.apply(spectrum*xp.exp(distance*phase),axis=-1-axis)
                 # Parseval allows integration over the other direction in Fourier space.
-                profile=(abs(field)**2).sum(axis=axis)
+                profile=xp.sum(abs(field)**2, axis=axis)
                 del field
-                power=_to_python_float(profile.sum())
+                power=_to_python_float(xp.sum(profile))
                 centers.append(_to_python_float(xp.dot(coordinates,profile))/power if power>0 else np.nan)
             slope=(centers[1]-centers[0])/((far-near)*offset)
             response=(centers[0]/offset-near*slope,slope)
@@ -3661,7 +3804,7 @@ class _CRLFocusSession:
         sigma_x=abs(magnification[0])*self.source_sigma[0]/grid.dx
         sigmas=sigma_x if self.grid.dimension==1 else (
             abs(magnification[1])*self.source_sigma[1]/grid.dy,sigma_x)
-        if self.grid.backend == "torch":
+        if self.grid.backend in {"torch", "tensorflow"}:
             return self.xp.gaussian_filter(image, sigmas)
         if self.grid.backend=="cupy":
             from cupyx.scipy.ndimage import gaussian_filter
@@ -4221,7 +4364,7 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
     target_x=focus_widths[0]/6
     if cfg.source_type!="plane":
         target_x=min(target_x,wavelength*cfg.source_distance_m/(2*cfg.aperture_m))
-    quick_cap=65536 if cfg.grid_dimension==1 else (2048 if backend in {"cupy", "torch"} else 1024)
+    quick_cap=65536 if cfg.grid_dimension==1 else (2048 if backend in {"cupy", "torch", "tensorflow"} else 1024)
     cap=65536 if cfg.grid_dimension==1 else (4096 if cfg.accuracy=="refined" else quick_cap)
     k=2*np.pi/wavelength
     delta=parameters['material'].optical_constants(cfg.energy_kev)[0]
@@ -4506,8 +4649,8 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     both_axes=len(cfg.focusing_axes)==2
     x_full,y_full=session.detector_coordinates(session.measurement_slices)
     if both_axes:
-        center_x=int(xp.argmin(abs(x_full)).item())
-        center_y=int(xp.argmin(abs(y_full)).item())
+        center_x=int(xp.argmin(abs(x_full)))
+        center_y=int(xp.argmin(abs(y_full)))
     transverse_x=xp.zeros(detector.nx,dtype=xp.float64)
     transverse_y=None if grid.dimension==1 else xp.zeros(detector.ny,dtype=xp.float64)
     reporter.start("sampling",len(positions),"Calculating detector planes and beam metrics")

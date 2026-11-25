@@ -1,6 +1,6 @@
 # XPOSim
 
-XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating monochromatic X-ray propagation, diffraction, and focusing. It propagates complex wavefields on one- and two-dimensional transverse grids using FFTs. Calculations run on the CPU with NumPy or on an NVIDIA GPU with CuPy or PyTorch.
+XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating monochromatic X-ray propagation, diffraction, and focusing. It propagates complex wavefields on one- and two-dimensional transverse grids using FFTs. Calculations run on the CPU with NumPy or on an NVIDIA GPU with CuPy, PyTorch or TensorFlow.
 
 Try XPOSim for X-ray focusing with a compound refractive lens.
 
@@ -21,50 +21,18 @@ Try XPOSim for X-ray focusing with a compound refractive lens.
 
 ## Installation
 
-Clone the repository or extract the source archive. Keep `xray_material_data/` alongside `XPOSim.py` when using formula-based materials. [Download ZIP](https://github.com/mamichberdey/XPOSim/archive/refs/heads/main.zip)
+Keep `XPOSim.py` alongside `xray_material_data/` for formula-based materials. XPOSim requires NumPy and SciPy. Plotting examples also use Matplotlib.
 
-```bash
-git clone https://github.com/mamichberdey/XPOSim.git
-cd XPOSim
-```
+For NVIDIA GPU calculations, install **any one** of CuPy, PyTorch or TensorFlow with GPU support compatible with your system and driver. Select the corresponding backend on a grid or in `CRLFocusConfig`.
 
-### CPU with NumPy
+| Compute backend | Setting |
+| --- | --- |
+| NumPy on CPU | `backend="numpy"` |
+| CuPy on GPU | `backend="cupy"` |
+| PyTorch on GPU | `backend="torch"` |
+| TensorFlow on GPU | `backend="tensorflow"` |
 
-Create a virtual environment from the repository root. The activation command below is for Linux, macOS, and WSL.
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install numpy scipy
-```
-
-Select `backend="numpy"` for CPU calculations. Install Matplotlib if you want to run the plotting examples.
-
-### NVIDIA GPU with CuPy
-
-The supplied Conda environment targets Linux x86-64 and WSL 2 with CUDA 13.4. It requires a compatible NVIDIA driver. [Install Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install) · [CUDA on WSL](https://docs.nvidia.com/cuda/wsl-user-guide/)
-
-```bash
-conda env create -f environment.yml
-conda activate cu_env
-```
-
-Select `backend="cupy"` to require GPU execution. In the high-level CRL workflow, `backend="auto"` tries a small GPU calculation and falls back to NumPy if CUDA is unavailable.
-
-### NVIDIA GPU with PyTorch
-
-Install NumPy and SciPy as above, then install a CUDA-enabled PyTorch build compatible with your NVIDIA driver. [PyTorch installation instructions](https://pytorch.org/get-started/locally/)
-
-Set `backend="torch"` on a grid or on `CRLFocusConfig`. XPOSim uses the current CUDA device and raises an error if CUDA is unavailable. For example:
-
-```python
-import torch
-import XPOSim as xpos
-
-grid = xpos.Grid1D(dx=1e-7, nx=512, backend="torch")
-field = torch.ones(grid.shape, dtype=torch.complex128, device=grid.x.device)
-propagated = grid.propagate(field, z=0.02, k=6e10)  # CUDA tensor
-```
+The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch and TensorFlow in that order and uses NumPy if no GPU backend can run. An explicit GPU selection requires that backend to execute on a visible GPU.
 
 ## Quick start
 
