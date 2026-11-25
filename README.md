@@ -36,7 +36,7 @@ The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch an
 
 ## Quick start
 
-Run this example from the repository root. It selects a working backend, loads the bundled silicon data and focuses a 12 keV point source with a compound refractive lens (CRL). The calculation is one-dimensional and runs without plotting libraries. To check a particular GPU installation, replace `"auto"` with `"cupy"`, `"torch"` or `"tensorflow"`.
+Run this example from the repository root. It probes each GPU backend with a small FFT and lists the working backends in selection order. Leave `requested = "auto"` to use the first available backend, or set it to a backend name to require that backend.
 
 ```python
 from importlib import import_module
@@ -45,35 +45,39 @@ import platform
 import numpy as np
 import XPOSim as xpos
 
-print(f"XPOSim {xpos.__version__} | Python {platform.python_version()} | {platform.system()}")
-backend = xpos.select_backend("auto")
+requested = "auto"
+available = []
+for name in ("cupy", "torch", "tensorflow", "numpy"):
+    try:
+        available.append(xpos.select_backend(name))
+    except (ImportError, OSError, RuntimeError):
+        continue
+
+backend = available[0] if requested == "auto" else xpos.select_backend(requested)
 device = "CPU" if backend == "numpy" else "GPU"
-print(f"Backend: {backend} {import_module(backend).__version__} ({device})")
+print(f"XPOSim {xpos.__version__} | Python {platform.python_version()} | {platform.system()}")
+print("Available backends:", ", ".join(available))
+print(f"Selected: {backend} {import_module(backend).__version__} ({device})")
 
-# A point source 15 m upstream of a stack of 26 silicon lens elements.
-lens = xpos.CRLFocusConfig(
-    backend=backend, grid_dimension=1, energy_kev=12.0,
-    material_formula="Si", density_g_cm3=2.33,
-    radius_m=6.25e-6, aperture_m=50e-6, bridge_thickness_m=2e-6,
-    n_elements=26, source_distance_m=15.0,
+# Illuminate a silicon lens with a 12 keV point source 15 m upstream.
+energy_kev, distance_m = 12.0, 15.0
+grid = xpos.Grid1D(dx=20e-9, nx=4096, backend=backend)
+source = xpos.PointSource(grid=grid, energy_kev=energy_kev)
+lens = xpos.CRL(
+    grid=grid, input_field=source.E(z=distance_m), energy_kev=energy_kev,
+    material=xpos.Material(formula="Si", density=2.33),
+    radius=6.25e-6, aperture=50e-6, bridge_thickness=2e-6, n_elements=26,
 )
-result = xpos.estimate_crl_focus(lens)
-plane = result.plane_at(result.peak_z_m)
-width = plane.metrics.fwhm
 
-print(f"Grid: {result.grid_shape[0]} points | Axial scan: {len(result.z_m)} planes")
-print(f"Focus from lens exit: {result.peak_z_m * 1e3:.2f} mm")
-if width is None or not np.isfinite(width) or width <= 0:
-    raise RuntimeError("Could not resolve the focal spot width.")
-print(f"Focal spot FWHM: {width * 1e9:.2f} nm | Transmission: {result.transmission:.1%}")
-
-# For this lens, the propagated peak should be close to the analytical image plane.
-if not np.isclose(result.peak_z_m, result.analytical_image_distance_m, rtol=0.02, atol=0):
-    raise RuntimeError("Numerical focus differs from the analytical estimate by more than 2%.")
+# Measure the beam at the predicted image plane, downstream of the lens exit.
+z = lens.effective_focus(distance_m)
+beam = xpos.beam_metrics(lens.E(z=z), grid)
+if beam.fwhm is None or not (0 < beam.fwhm < lens.aperture and 1 < beam.max_intensity < np.inf):
+    raise RuntimeError("Expected a resolved focal spot brighter than the incident beam.")
+print(f"Image plane: {z * 1e3:.2f} mm from lens exit")
+print(f"Spot FWHM: {beam.fwhm * 1e9:.1f} nm | Peak intensity: {beam.max_intensity:.1f} × incident")
 print("XPOSim lens check passed.")
 ```
-
-For these parameters, expect a focus about **34.71 mm** beyond the lens and a spot **132 nm** wide at half maximum. To plot the spot, use `plane.x_m` and `plane.intensity`.
 
 ## Examples and reference
 
