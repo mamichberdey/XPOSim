@@ -1,6 +1,6 @@
 # X-ray focusing with compound refractive lenses in Google Colab
 
-[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/368e831d7c13eb7e4050e9bf5470aef530daeeb4/notebooks/CRL_Focus_Colab.ipynb).
+[Open the notebook](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/c92fea3b20ce89885f7d5d81dd733a55ec08792b/notebooks/CRL_Focus_Colab.ipynb).
 
 Run all once to initialize two separate outputs: **2 · CRL and source parameters** contains the editable inputs; **3 · Results** contains Compute, the plots and the z slider. Enter the lens/source parameters in cell 2, then press **Compute** in cell 3. Cell 2 keeps the inputs in their own form while calculations update cell 3. Reinitializing the parameter cell in the same live session preserves entered values. No optical calculation starts automatically. Results stay in the active session.
 
