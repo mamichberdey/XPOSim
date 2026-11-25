@@ -80,6 +80,16 @@ print(f"Spot FWHM: {beam.fwhm * 1e9:.1f} nm | Peak intensity: {beam.max_intensit
 print("XPOSim lens check passed.")
 ```
 
+## Performance benchmark
+
+Run the same 2D silicon lens scan in each environment, changing only the backend:
+
+```bash
+python benchmark_focus_scan.py --backend torch
+```
+
+Choose `numpy`, `cupy`, `torch`, `tensorflow`, `jax` or `auto` (default). An explicit GPU backend must pass its GPU probe. The script warms up once, then times five complete `CRL.focus_scan` calls on a 512 × 512 grid with 33 detector planes and a fixed batch size of 8. Timing includes propagation through the lens and reduction to host-side beam metrics. Setup and warm-up are excluded. Compare the median seconds per scan and planes per second, and use the reported peak position and intensity to cross-check results.
+
 ## Examples and reference
 
 - Build an optical system from grids, a source, and individual elements. [Worked Python example](DOCUMENTATION.md#2-complete-example-point-source-crl-and-detector)
