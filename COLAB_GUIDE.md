@@ -12,7 +12,7 @@ In Results, choose **Download PDF report** after a successful calculation. The s
 
 1. Open the link and sign in to Colab. Optionally save a copy to your Drive.
 2. For GPU execution, use **Runtime → Change runtime type → GPU → Save**, reconnect, and run all cells. CPU execution is also supported.
-3. For GPU execution, the runtime needs any one of CuPy, PyTorch or JAX with compatible GPU support. In **Show scan region and sampling settings → Compute backend**, select Auto, NumPy (CPU), CuPy (CUDA), PyTorch (CUDA) or JAX (GPU). Auto probes CuPy, PyTorch and JAX in order, then falls back to NumPy.
+3. NumPy and SciPy are required for both CPU and GPU calculations. For GPU execution, the runtime additionally needs any one of CuPy, PyTorch or JAX with compatible GPU support. In **Show scan region and sampling settings → Compute backend**, select Auto, NumPy (CPU), CuPy (CUDA), PyTorch (CUDA) or JAX (GPU). Auto probes CuPy, PyTorch and JAX in order, then falls back to NumPy.
 4. Run **2 · CRL and source parameters** to display the editable fields. The default is a silicon CRL at 12 keV with an apex radius of curvature of 6.25 µm, a geometric aperture of 50 µm, a web thickness of 2 µm, and 26 elements. The default structure depth for line focusing on a 2D grid is 30 µm. The source is 15 m from the CRL entrance. **Fast** sampling is selected initially.
 5. Run **3 · Results**, then press **Compute** after setting the inputs. To change the lens or source, edit the fields in cell 2 and press **Compute** again. The z slider navigates the calculated planes in the results cell.
 

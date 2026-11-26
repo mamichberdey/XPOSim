@@ -9,7 +9,7 @@ This guide covers the grid and optical-element API and the high-level CRL workfl
 
 Install XPOSim from a checkout with `python -m pip install --no-deps .`, from GitHub with `python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"`, or from a downloaded wheel with `python -m pip install --no-deps path/to/xposim-0.36.0-py3-none-any.whl`.
 
-Package metadata intentionally declares no runtime dependencies. NumPy and SciPy must already be installed. GPU calculation additionally uses one of CuPy, Torch or JAX. Matplotlib is needed for plots. Dependency versions belong to the surrounding environment. Missing packages are installed explicitly by the user. The `--no-deps` flag also explicitly disables pip dependency resolution.
+Package metadata intentionally declares no runtime dependencies. NumPy and SciPy must already be installed for every backend, including GPU execution. NumPy supplies host arrays and CPU calculations, while SciPy supplies interpolation, optimization and numerical helpers. GPU calculation additionally uses one of CuPy, Torch or JAX. Matplotlib is needed for plots. Dependency versions belong to the surrounding environment. Missing packages are installed explicitly by the user. The `--no-deps` flag also explicitly disables pip dependency resolution.
 
 A wheel installs the module and its three material tables directly. Source builds use setuptools in an isolated temporary build environment, which can download build tools. For an offline source installation, provide setuptools 61 or newer and wheel in the environment and add `--no-build-isolation`. The import remains `import XPOSim`, including outside the source checkout. Single-file use with an adjacent `xray_material_data/` directory also remains supported.
 

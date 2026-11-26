@@ -21,19 +21,37 @@ Try XPOSim for X-ray focusing with a compound refractive lens.
 
 ## Installation
 
-Install into your active environment from GitHub.
+Use Python 3.10 or newer and activate the environment where you will run XPOSim.
+
+### 1. Prepare the required numerical packages
+
+**NumPy and SciPy are required for every backend, including GPU calculations.** NumPy provides host arrays and CPU calculations. SciPy provides interpolation, optimization and other numerical helpers used by the library.
+
+If both packages are already installed, use the existing installations. In a new environment, install them with your package manager, for example with pip.
+
+```sh
+python -m pip install numpy scipy
+```
+
+For an existing environment with a missing package, follow its package manager's compatibility requirements. Official installation guides are available for both packages. [NumPy](https://numpy.org/install/) · [SciPy](https://scipy.org/install/)
+
+### 2. Install XPOSim
 
 ```sh
 python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"
 ```
 
-XPOSim declares **no runtime dependencies** in its package metadata. Installation uses the numerical packages already present in your environment. NumPy and SciPy are required to import and run XPOSim. Plotting examples also use Matplotlib. Install any missing packages separately using the package manager appropriate for your environment.
+XPOSim leaves dependency management to your environment. Its package metadata declares no runtime dependencies, and `--no-deps` explicitly disables dependency resolution. The required numerical packages from step 1 must be available when importing XPOSim.
 
-For an existing checkout, use `python -m pip install --no-deps .`. A built wheel can be installed with `python -m pip install --no-deps path/to/xposim-0.36.0-py3-none-any.whl`. Wheel installation requires no build tools. Building from Git or a source archive uses setuptools in a temporary build environment. If your environment already provides setuptools 61 or newer and wheel, `--no-build-isolation` also avoids downloading isolated build tools.
+The material tables are included, and the public import is `import XPOSim`. For wheel, local-checkout and offline source installations, see the installation guide. [Other installation methods](DOCUMENTATION.md#installation-into-an-existing-environment)
 
-The material tables are included in the distribution. The public import is `import XPOSim`. Direct single-file use also works when `XPOSim.py` is kept alongside `xray_material_data/`.
+**Plotting is optional.** Install Matplotlib with `python -m pip install matplotlib` to use plotting helpers and plotting examples. The quick start below prints its results and works with the numerical packages from step 1.
 
-For NVIDIA GPU calculations, install **any one** of CuPy, PyTorch or JAX with GPU support compatible with your system and driver. Select the corresponding backend on a grid or in `CRLFocusConfig`.
+### 3. Choose CPU or GPU execution
+
+For **CPU calculations**, the required NumPy and SciPy installations are sufficient. Select `backend="numpy"`.
+
+For **GPU calculations**, additionally install **one** of CuPy, PyTorch or JAX with GPU support compatible with your system and driver. NumPy and SciPy are still required. Select the corresponding backend on a grid or in `CRLFocusConfig`.
 
 | Compute backend | Setting | Installation |
 | --- | --- | --- |
@@ -42,7 +60,7 @@ For NVIDIA GPU calculations, install **any one** of CuPy, PyTorch or JAX with GP
 | PyTorch on GPU | `backend="torch"` | [Guide](https://pytorch.org/get-started/locally/) |
 | JAX on GPU | `backend="jax"` | [Guide](https://docs.jax.dev/en/latest/installation.html) |
 
-The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch and JAX in that order and uses NumPy if no GPU backend can run. An explicit GPU selection requires that backend to execute on a visible GPU.
+The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch and JAX in that order and uses NumPy if no GPU backend can run. An explicit GPU selection requires that backend to execute on a visible GPU. In Jupyter, restart the kernel after installing packages.
 
 <a href="docs/assets/backend-benchmark.png"><img src="docs/assets/backend-benchmark.png" width="720" alt="XPOSim CPU and GPU benchmark on Intel Core i5-12450H and NVIDIA GeForce RTX 4060 Laptop GPU. Logarithmic scan time above, GPU speedup relative to NumPy below. NumPy is blue, CuPy green, and PyTorch orange."></a>
 
@@ -59,6 +77,7 @@ from importlib import import_module
 import platform
 
 import numpy as np
+import scipy
 import XPOSim as xpos
 
 requested = "auto"
@@ -72,6 +91,7 @@ for name in ("cupy", "torch", "jax", "numpy"):
 backend = available[0] if requested == "auto" else xpos.select_backend(requested)
 device = "CPU" if backend == "numpy" else "GPU"
 print(f"XPOSim {xpos.__version__} | Python {platform.python_version()} | {platform.system()}")
+print(f"Core packages: NumPy {np.__version__} | SciPy {scipy.__version__}")
 print("Available backends:", ", ".join(available))
 print(f"Selected: {backend} {import_module(backend).__version__} ({device})")
 
