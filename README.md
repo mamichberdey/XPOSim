@@ -4,9 +4,9 @@ XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating mo
 
 Try XPOSim for X-ray focusing with a compound refractive lens.
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/60049afd607a504065c3de014c06a70065b658fe/notebooks/CRL_Focus_Colab.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/d83465d52d4c8d2244240a464f0bc8927dd8b390/notebooks/CRL_Focus_Colab.ipynb)
 
-[Installation](#installation) · [Quick start](#quick-start) · [Library guide](DOCUMENTATION.md) · [API reference](DOCUMENTATION.md#8-api-reference)
+[Installation](#installation) · [Quick start](#quick-start) · [Library guide](https://github.com/mamichberdey/XPOSim/blob/main/DOCUMENTATION.md) · [API reference](https://github.com/mamichberdey/XPOSim/blob/main/DOCUMENTATION.md#8-api-reference)
 
 <a id="1-about-xposim"></a>
 
@@ -37,13 +37,21 @@ For an existing environment with a missing NumPy installation, follow its packag
 
 ### 2. Install XPOSim
 
+For a published PyPI release:
+
+```sh
+python -m pip install XPOSim
+```
+
+Before the first PyPI release, or to install the current GitHub source, use:
+
 ```sh
 python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"
 ```
 
-XPOSim leaves dependency management to your environment. Its package metadata declares no runtime dependencies, and `--no-deps` explicitly disables dependency resolution. NumPy from step 1 must be available when importing XPOSim.
+XPOSim leaves dependency management to your environment. Its package metadata declares no runtime dependencies, so a normal pip installation does not install or upgrade NumPy, CuPy, PyTorch or JAX. NumPy from step 1 must be available when importing XPOSim.
 
-The material tables are included, and the public import is `import XPOSim`. For wheel, local-checkout and offline source installations, see the installation guide. [Other installation methods](DOCUMENTATION.md#installation-into-an-existing-environment)
+The material tables are included, and the public import is `import XPOSim`. For wheel, local-checkout and offline source installations, see the installation guide. [Other installation methods](https://github.com/mamichberdey/XPOSim/blob/main/DOCUMENTATION.md#installation-into-an-existing-environment)
 
 **Plotting is optional.** Install Matplotlib with `python -m pip install matplotlib` to use plotting helpers and plotting examples. The quick start below prints its results and works with NumPy from step 1.
 
@@ -62,11 +70,11 @@ For **GPU calculations**, additionally install **one** of CuPy, PyTorch or JAX w
 
 The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch and JAX in that order and uses NumPy if no GPU backend can run. An explicit GPU selection requires that backend to execute on a visible GPU. In Jupyter, restart the kernel after installing packages.
 
-<a href="docs/assets/backend-benchmark.png"><img src="docs/assets/backend-benchmark.png" width="720" alt="XPOSim CPU and GPU benchmark on Intel Core i5-12450H and NVIDIA GeForce RTX 4060 Laptop GPU. Logarithmic scan time above, GPU speedup relative to NumPy below. NumPy is blue, CuPy green, and PyTorch orange."></a>
+<a href="https://github.com/mamichberdey/XPOSim/blob/main/docs/assets/backend-benchmark.png"><img src="https://raw.githubusercontent.com/mamichberdey/XPOSim/main/docs/assets/backend-benchmark.png" width="720" alt="XPOSim CPU and GPU benchmark on Intel Core i5-12450H and NVIDIA GeForce RTX 4060 Laptop GPU. Logarithmic scan time above, GPU speedup relative to NumPy below. NumPy is blue, CuPy green, and PyTorch orange."></a>
 
-In this workload, both measured GPU backends have lower median times from 32,768 points per plane onward. [Benchmark setup and results](docs/GPU_VALIDATION.md#extended-grid-comparison).
+In this workload, both measured GPU backends have lower median times from 32,768 points per plane onward. [Benchmark setup and results](https://github.com/mamichberdey/XPOSim/blob/main/docs/GPU_VALIDATION.md#extended-grid-comparison).
 
-GPU fields stay on the selected device during propagation, filtering and metric reduction. `focus_scan` transfers one compact metric table after the scan. The high-level workflow exports profiles in bounded chunks and returns NumPy arrays for plotting. Adaptive searches read scalar results to choose their next evaluation point. Retained CRL results support `with estimate_crl_focus(config) as result:` or explicit `result.close()`. Use `result.numerical_report` for sampling indicators and `result.check_convergence()` for optional grid/window comparisons. See [device memory and transfers](DOCUMENTATION.md#device-memory-and-transfers) for cache limits and synchronization details.
+GPU fields stay on the selected device during propagation, filtering and metric reduction. `focus_scan` transfers one compact metric table after the scan. The high-level workflow exports profiles in bounded chunks and returns NumPy arrays for plotting. Adaptive searches read scalar results to choose their next evaluation point. Retained CRL results support `with estimate_crl_focus(config) as result:` or explicit `result.close()`. Use `result.numerical_report` for sampling indicators and `result.check_convergence()` for optional grid/window comparisons. See [device memory and transfers](https://github.com/mamichberdey/XPOSim/blob/main/DOCUMENTATION.md#device-memory-and-transfers) for cache limits and synchronization details.
 
 ## Quick start
 
@@ -116,9 +124,9 @@ print("XPOSim lens check passed.")
 
 ## Examples and reference
 
-- Build an optical system from grids, a source, and individual elements. [Worked Python example](DOCUMENTATION.md#2-complete-example-point-source-crl-and-detector)
-- Configure a CRL scan, choose the illumination model, and compare focus metrics. [High-level CRL workflow](DOCUMENTATION.md#high-level-crl-workflow)
-- Explore a CRL focus interactively and export a simulation report. [Notebook source](notebooks/CRL_Focus_Colab.ipynb) · [Notebook guide](COLAB_GUIDE.md)
+- Build an optical system from grids, a source, and individual elements. [Worked Python example](https://github.com/mamichberdey/XPOSim/blob/main/DOCUMENTATION.md#2-complete-example-point-source-crl-and-detector)
+- Configure a CRL scan, choose the illumination model, and compare focus metrics. [High-level CRL workflow](https://github.com/mamichberdey/XPOSim/blob/main/DOCUMENTATION.md#high-level-crl-workflow)
+- Explore a CRL focus interactively and export a simulation report. [Notebook source](notebooks/CRL_Focus_Colab.ipynb) · [Notebook guide](https://github.com/mamichberdey/XPOSim/blob/main/COLAB_GUIDE.md)
 
 <a id="3-physical-model"></a>
 
@@ -230,10 +238,23 @@ The modulus removes the phase from the displayed intensity, but the phase remain
 
 The initial independent reference suite checks complex Gaussian propagation, thin-lens focusing, slit Fresnel diffraction, Fourier normalization, material attenuation and photon-energy units. Run `python -m unittest discover -s tests -p test_physics_validation.py` with NumPy installed. Optional SciPy reference checks include slit Fresnel integrals and comparisons of the numerical helpers. Tests use documented setups and numerical tolerances.
 
-- [Physical and numerical conventions](docs/PHYSICAL_CONVENTIONS.md)
-- [Reference cases and test tolerances](docs/VALIDATION.md)
-- [RTX 4060 GPU validation and measurements](docs/GPU_VALIDATION.md)
-- [Engineering audit and staged roadmap](docs/ENGINEERING_AUDIT.md)
-- [Proposed API evolution](docs/API_DESIGN.md)
+- [Physical and numerical conventions](https://github.com/mamichberdey/XPOSim/blob/main/docs/PHYSICAL_CONVENTIONS.md)
+- [Reference cases and test tolerances](https://github.com/mamichberdey/XPOSim/blob/main/docs/VALIDATION.md)
+- [RTX 4060 GPU validation and measurements](https://github.com/mamichberdey/XPOSim/blob/main/docs/GPU_VALIDATION.md)
+- [Engineering audit and staged roadmap](https://github.com/mamichberdey/XPOSim/blob/main/docs/ENGINEERING_AUDIT.md)
+- [Proposed API evolution](https://github.com/mamichberdey/XPOSim/blob/main/docs/API_DESIGN.md)
 
 The conventions document explains finite-window behavior on even grids and the entrance-pupil difference between low-level CRLs and the high-level focus workflow. GPU validation requires target hardware.
+
+
+## License and releases
+
+XPOSim code is distributed under the [MIT license](https://github.com/mamichberdey/XPOSim/blob/main/LICENSE). The bundled material
+tables retain the [DABAX MIT notice](https://github.com/mamichberdey/XPOSim/blob/main/xray_material_data/LICENSE) and
+[data provenance](https://github.com/mamichberdey/XPOSim/blob/main/xray_material_data/README.md). See [third-party notices](https://github.com/mamichberdey/XPOSim/blob/main/THIRD_PARTY_NOTICES.md).
+
+Version tags trigger a tested build and PyPI Trusted Publishing. Ordinary commits
+to `main` do not publish a new package. Maintainer setup and release commands are
+in the [release guide](https://github.com/mamichberdey/XPOSim/blob/main/docs/RELEASING.md). Users update with
+`python -m pip install --upgrade XPOSim`. Software/paper citation metadata will be
+added separately when supplied by the author.

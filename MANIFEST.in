@@ -1,4 +1,5 @@
-include README.md DOCUMENTATION.md COLAB_GUIDE.md
-recursive-include xray_material_data *.dat
+include README.md DOCUMENTATION.md COLAB_GUIDE.md LICENSE THIRD_PARTY_NOTICES.md
+recursive-include xray_material_data *.dat LICENSE README.md
 recursive-include tests *.py
 recursive-include docs *.md *.png
+recursive-include tools *.py

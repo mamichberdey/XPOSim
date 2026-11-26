@@ -132,6 +132,14 @@ def main():
         assert metadata["Name"].lower() == "xposim"
         assert not metadata.get_all("Requires-Dist"), "Wheel declares runtime dependencies"
         assert "XPOSim.py" in names
+        assert metadata["License-Expression"] == "MIT"
+        license_names = metadata.get_all("License-File") or []
+        assert set(license_names) == {"LICENSE", "THIRD_PARTY_NOTICES.md", "xray_material_data/LICENSE"}
+        dist_info = metadata_name.removesuffix("METADATA")
+        for name in license_names:
+            assert archive.read(dist_info + "licenses/" + name) == (source/name).read_bytes()
+        assert archive.read("xray_material_data/LICENSE") == (source/"xray_material_data/LICENSE").read_bytes()
+        assert archive.read("xray_material_data/README.md") == (source/"xray_material_data/README.md").read_bytes()
         for name in DATA_FILES:
             data = archive.read("xray_material_data/" + name)
             assert hashlib.sha256(data).digest() == hashlib.sha256(
@@ -139,6 +147,8 @@ def main():
     with tarfile.open(archives[0], "r:gz") as archive:
         names = archive.getnames()
         for name in ("XPOSim.py", "pyproject.toml", "tests/backend_parity.py",
+                     "LICENSE", "THIRD_PARTY_NOTICES.md", "xray_material_data/LICENSE",
+                     "xray_material_data/README.md", "tools/check_release.py",
                      *("xray_material_data/" + name for name in DATA_FILES)):
             assert any(path.endswith("/" + name) for path in names), name
     env = {key: value for key, value in os.environ.items()

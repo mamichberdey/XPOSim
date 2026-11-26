@@ -7,6 +7,8 @@ This guide covers the grid and optical-element API and the high-level CRL workfl
 
 ## Installation into an existing environment
 
+After the first PyPI release, install with `python -m pip install XPOSim` and update with `python -m pip install --upgrade XPOSim`. These commands leave numerical dependencies unchanged. Maintainers publish version tags using [Trusted Publishing](docs/RELEASING.md).
+
 Install XPOSim from a checkout with `python -m pip install --no-deps .`, from GitHub with `python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"`, or from a downloaded wheel with `python -m pip install --no-deps path/to/xposim-0.38.0-py3-none-any.whl`.
 
 Package metadata intentionally declares no runtime dependencies. NumPy must already be installed for every backend, including GPU execution. NumPy and the standard library supply host arrays, interpolation, scalar searches, source quadrature and CPU calculations. SciPy is optional for independent reference tests. GPU calculation additionally uses one of CuPy, Torch or JAX. These frameworks retain their own dependency requirements, including SciPy for JAX distributions. Matplotlib is needed for plots. Dependency versions belong to the surrounding environment. Missing packages are installed explicitly by the user. The `--no-deps` flag also explicitly disables pip dependency resolution.

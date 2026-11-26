@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +9,8 @@ description = "Scalar paraxial X-ray wave optics with NumPy, CuPy, PyTorch and J
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "xray_material_data/LICENSE"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -20,6 +22,8 @@ classifiers = [
 Homepage = "https://github.com/mamichberdey/XPOSim"
 Documentation = "https://github.com/mamichberdey/XPOSim/blob/main/DOCUMENTATION.md"
 Issues = "https://github.com/mamichberdey/XPOSim/issues"
+Source = "https://github.com/mamichberdey/XPOSim"
+Releases = "https://github.com/mamichberdey/XPOSim/releases"
 
 [tool.setuptools]
 py-modules = ["XPOSim"]
@@ -29,4 +33,4 @@ packages = ["xray_material_data"]
 version = {attr = "XPOSim.__version__"}
 
 [tool.setuptools.package-data]
-xray_material_data = ["*.dat"]
+xray_material_data = ["*.dat", "LICENSE", "README.md"]
