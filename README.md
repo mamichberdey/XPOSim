@@ -49,7 +49,7 @@ Before the first PyPI release, or to install the current GitHub source, use:
 python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"
 ```
 
-XPOSim leaves dependency management to your environment. Its package metadata declares no runtime dependencies, so a normal pip installation does not install or upgrade NumPy, CuPy, PyTorch or JAX. NumPy from step 1 must be available when importing XPOSim.
+XPOSim leaves dependency management to your environment. Its package metadata declares no runtime dependencies, so a normal pip installation does not install or upgrade NumPy, CuPy, PyTorch or JAX. NumPy from step 1 must be available when importing XPOSim. Update an installed PyPI release with `python -m pip install --upgrade XPOSim`.
 
 The material tables are included, and the public import is `import XPOSim`. For wheel, local-checkout and offline source installations, see the installation guide. [Other installation methods](https://github.com/mamichberdey/XPOSim/blob/main/DOCUMENTATION.md#installation-into-an-existing-environment)
 
@@ -247,14 +247,8 @@ The initial independent reference suite checks complex Gaussian propagation, thi
 The conventions document explains finite-window behavior on even grids and the entrance-pupil difference between low-level CRLs and the high-level focus workflow. GPU validation requires target hardware.
 
 
-## License and releases
+## License
 
 XPOSim code is distributed under the [MIT license](https://github.com/mamichberdey/XPOSim/blob/main/LICENSE). The bundled material
 tables retain the [DABAX MIT notice](https://github.com/mamichberdey/XPOSim/blob/main/xray_material_data/LICENSE) and
 [data provenance](https://github.com/mamichberdey/XPOSim/blob/main/xray_material_data/README.md). See [third-party notices](https://github.com/mamichberdey/XPOSim/blob/main/THIRD_PARTY_NOTICES.md).
-
-Version tags trigger a tested build and PyPI Trusted Publishing. Ordinary commits
-to `main` do not publish a new package. Maintainer setup and release commands are
-in the [release guide](https://github.com/mamichberdey/XPOSim/blob/main/docs/RELEASING.md). Users update with
-`python -m pip install --upgrade XPOSim`. Software/paper citation metadata will be
-added separately when supplied by the author.
