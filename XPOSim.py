@@ -47,7 +47,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.34.1"
+__version__ = "0.34.2"
 
 
 __all__ = [
@@ -236,6 +236,32 @@ class _TensorFlowArrays:
                 _, field = tf.while_loop(lambda i, wave: i < count - 1, advance,
                                          (tf.constant(0), field), parallel_iterations=1)
                 return ifft(fft(field * transmission) * half_step) * tf.math.conj(center_phase)
+
+        return propagate
+
+    @lru_cache(maxsize=4)
+    def spectrum_graph(self, dimension):
+        """Fuse spectral phase factors and the centered inverse transform."""
+        tf = self.tf
+
+        @tf.function(autograph=False, reduce_retracing=True)
+        def propagate(spectrum, z, k, qx, px, factor, *y_data):
+            with tf.device(self.device):
+                scale = tf.multiply(tf.divide(tf.constant(-.5, tf.float64), k), z)
+                angles_x = tf.multiply(scale, tf.square(qx))
+                phase_x = tf.exp(tf.complex(tf.zeros_like(angles_x), angles_x))
+                spectrum = tf.cast(spectrum, tf.complex128)
+                if dimension == 1:
+                    work = spectrum[None, :] * phase_x * px
+                    result = tf.signal.ifft(work) * px
+                else:
+                    qy, py = y_data
+                    angles_y = tf.multiply(scale, tf.square(qy))
+                    phase_y = tf.exp(tf.complex(tf.zeros_like(angles_y), angles_y))
+                    work = spectrum[None, :, :] * phase_x[:, None, :] * phase_y[:, :, None]
+                    work = work * px * py[:, None]
+                    result = tf.signal.ifft2d(work) * px * py[:, None]
+                return result * factor
 
         return propagate
 
@@ -974,7 +1000,7 @@ class BaseGrid(_Configured, ABC):
         if not _numeric_dtype(field):
             raise TypeError("Field arrays must have a numeric dtype.")
 
-    def _transform_batch(self, fields: Any, inverse: bool = False) -> Any:
+    def _transform_phases(self, inverse: bool):
         key = -1 if inverse else +1
         if key not in self._phase_cache:
             px, sx = _fourier_phase(self.nx, key, self.xp)
@@ -983,7 +1009,10 @@ class BaseGrid(_Configured, ABC):
             else:
                 py, sy = _fourier_phase(self.ny, key, self.xp)
                 self._phase_cache[key] = (px, sx, py, sy)
-        phase = self._phase_cache[key]
+        return self._phase_cache[key]
+
+    def _transform_batch(self, fields: Any, inverse: bool = False) -> Any:
+        phase = self._transform_phases(inverse)
         if self.dimension == 1:
             transform = _ifft1d if inverse else _fft1d
             return transform(fields, self.dx, phase)
@@ -1004,6 +1033,16 @@ class BaseGrid(_Configured, ABC):
         xp = self.xp
         z = xp.asarray(z_values, dtype=xp.float64)[:, None]
         qx = self.qx if self.dimension == 1 else self.qx_axis
+        if self.backend == "tensorflow":
+            phase = self._transform_phases(inverse=True)
+            factor = phase[1] / self.dx
+            y_data = ()
+            if self.dimension == 2:
+                factor = phase[1] * phase[3] / (self.dx * self.dy)
+                y_data = (self.qy_axis, phase[2])
+            return xp.spectrum_graph(self.dimension)(
+                spectrum, z, xp.asarray(k, dtype=xp.float64), qx, phase[0],
+                xp.asarray(factor, dtype=xp.complex128), *y_data)
         phase_x = xp.exp((-0.5j / k) * z * qx**2)
         work = spectrum[None, ...] * (phase_x if self.dimension == 1 else phase_x[:, None, :])
         if self.dimension == 2:

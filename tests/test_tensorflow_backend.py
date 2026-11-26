@@ -103,6 +103,30 @@ class TensorFlowBackendTests(TestCase):
                 np.testing.assert_allclose(lens.apply_to_fields(fields),
                     sequential.apply_to_fields(fields), rtol=2e-11, atol=1e-12)
 
+    def test_spectrum_graph_reuses_current_grid_and_physical_inputs(self):
+        xp = xpos._tensorflow_arrays(tf.constant(0).device)
+        rng = np.random.default_rng(3719)
+        with patch.object(xpos, "_tensorflow_gpu", return_value=xp):
+            for grid_type, args in (
+                (xpos.Grid1D, (1e-7, 32)),
+                (xpos.Grid1D, (1.5e-7, 33)),
+                (xpos.Grid2D, (1e-7, 2e-7, 32, 27)),
+                (xpos.Grid2D, (2e-7, 1.5e-7, 29, 30)),
+            ):
+                reference = grid_type(*args, backend="numpy")
+                grid = grid_type(*args, backend="tensorflow")
+                field = rng.normal(size=grid.shape) + 1j*rng.normal(size=grid.shape)
+                for k, multiplier in ((6e10, 1.), (7e10, .2j)):
+                    positions = [0., -.012, .023, 0., .031]
+                    for batch_size in (1, 2, 4):
+                        with self.subTest(args=args, k=k, batch_size=batch_size):
+                            expected = reference.propagate_many(
+                                field*multiplier, positions, k, batch_size=batch_size)
+                            actual = grid.propagate_many(
+                                xp.asarray(field*multiplier), positions, k, batch_size=batch_size)
+                            np.testing.assert_allclose(actual, expected, rtol=2e-10,
+                                                       atol=2e-12*np.max(abs(expected)))
+
     def test_gpu(self):
         if not tf.config.list_physical_devices("GPU"):
             with self.assertRaisesRegex(RuntimeError, "GPU"):
