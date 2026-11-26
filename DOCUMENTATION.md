@@ -7,7 +7,7 @@ This guide covers the grid and optical-element API and the high-level CRL workfl
 
 ## Installation into an existing environment
 
-After the first PyPI release, install with `python -m pip install XPOSim` and update with `python -m pip install --upgrade XPOSim`. These commands leave numerical dependencies unchanged.
+Install with `python -m pip install XPOSim` and update with `python -m pip install --upgrade XPOSim`. These commands leave numerical dependencies unchanged.
 
 Install XPOSim from a checkout with `python -m pip install --no-deps .`, from GitHub with `python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"`, or from a downloaded wheel with `python -m pip install --no-deps path/to/xposim-0.38.0-py3-none-any.whl`.
 
@@ -272,7 +272,7 @@ Keep the source-to-element entrance distance separate from each subsequent gap. 
 
 ### High-level CRL workflow
 
-Use `CRLFocusConfig` to set the source, CRL geometry, material and grid. The [README quick start](README.md#quick-start) provides a self-contained CPU example.
+Use `CRLFocusConfig` to set the source, CRL geometry, material and grid. The [README quick start](README.md#quick-start) provides a self-contained source-and-lens example.
 
 | API | Purpose |
 | --- | --- |
@@ -2348,6 +2348,6 @@ These are documented implementation details, not changes to the library source. 
 
 ### Verification of these examples
 
-The Python examples have been run with NumPy on reduced grids and with the included silicon material tables. The README quick start runs directly on the CPU. GPU execution requires validation on the target system.
+The Python examples have been run with NumPy on reduced grids and with the included silicon material tables. The README quick start works with NumPy and selects a working GPU backend when available. GPU execution requires validation on the target system.
 
-[Physical model and references](README.md#physical-model)
+[Physical model and references](docs/PHYSICAL_MODEL.md)

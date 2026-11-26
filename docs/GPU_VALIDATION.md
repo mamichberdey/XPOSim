@@ -32,6 +32,11 @@ The expanded benchmark covers total plane sizes `nx*ny=2**p` for p from 8 throug
 
 The CPU is an Intel Core i5-12450H. GPU runs use the NVIDIA GeForce RTX 4060 Laptop GPU with 8 GB VRAM and driver 621.14. The NumPy CPU baseline and Torch environment use NumPy 1.26.4 and SciPy 1.13.1. The CuPy environment uses NumPy 2.4.6 and SciPy 1.17.1. Accelerator versions are CuPy 14.2.0 and Torch 2.5.1+cu121. JAX has no measurements in this dataset.
 
+<a href="assets/backend-benchmark.png"><img src="assets/backend-benchmark.png" width="900" alt="XPOSim benchmark on Intel Core i5-12450H and NVIDIA GeForce RTX 4060 Laptop GPU. Logarithmic scan time above, GPU speedup over NumPy below. NumPy is blue, CuPy green, and Torch orange." /></a>
+
+Lower scan time is better; higher speedup is better. These measurements apply
+to the workload, hardware and versions below.
+
 Each warmed scan evaluates a three-element CRL and nine detector planes from 0.01 to 0.05 m, exporting metrics with `return_fields=False`. Grid steps are 200 nm on both axes. Parameters are R=6.25 um, aperture=14 um, bridge=2 um, 12 keV, delta=3.35e-6 and beta=3.7e-8. The input amplitude is Gaussian with widths 3/2 um, offsets +0.31/-0.23 um and an x phase gradient of 1e5 rad/m. Fields use complex128.
 
 NumPy uses vectorized batches based on a conservative 64 MiB estimate for six field buffers, with a minimum batch of one. GPU cases use the library's automatic batching. Setup and the first warm-up scan are excluded from the times below. Each point uses the median of one, three or five timed runs, selected from the warm-up duration. CPU points from `2**20` onward have one timed run. Some GPU points also have one run. Figure bands show the sample 25th–75th percentiles, which collapse at single-sample points.
@@ -57,5 +62,3 @@ NumPy uses vectorized batches based on a conservative 64 MiB estimate for six fi
 NumPy has the lower median through 8,192 points. At 16,384 points, Torch's median is 6.47 ms against NumPy's 6.95 ms, with overlapping sample interquartile ranges. Both measured GPU backends have lower medians at 32,768 points and all larger measured sizes. This places the observed transition in the approximate 8,192–32,768 range, depending on backend and sample variation.
 
 At 4,194,304 points, the observed times are 4.641 s for NumPy, 0.222 s for CuPy and 0.195 s for Torch. Their ratios correspond to 20.9× and 23.8× GPU speedup for this workload. The CPU endpoint has one timed sample. Batching, environment versions, clock state and background workload affect these ratios and the crossover. Optical discretization requires separate convergence validation.
-
-[Open the full-resolution comparison](assets/backend-benchmark.png).
