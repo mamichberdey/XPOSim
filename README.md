@@ -4,6 +4,7 @@
 [![Python >=3.10](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB?logo=python&logoColor=white)](https://pypi.org/project/XPOSim/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/mamichberdey/XPOSim/blob/main/LICENSE)
 [![Numerical validation](https://github.com/mamichberdey/XPOSim/actions/workflows/validation.yml/badge.svg?branch=main)](https://github.com/mamichberdey/XPOSim/actions/workflows/validation.yml)
+[![Try it now in Google Colab](https://img.shields.io/badge/Google_Colab-Try_it_now-F9AB00?logo=googlecolab&logoColor=white)](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/d83465d52d4c8d2244240a464f0bc8927dd8b390/notebooks/CRL_Focus_Colab.ipynb)
 
 <a id="1-about-xposim"></a>
 
@@ -11,8 +12,6 @@ XPOSim (X-ray Paraxial Optical Simulation) models monochromatic X-ray propagatio
 diffraction and focusing on 1D and 2D grids. Build schemes from sources, compound
 refractive lenses, apertures and sampled objects, using NumPy on CPU or CuPy,
 PyTorch and JAX on GPU.
-
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/d83465d52d4c8d2244240a464f0bc8927dd8b390/notebooks/CRL_Focus_Colab.ipynb)
 
 <a id="3-physical-model"></a>
 <a id="physical-model"></a>
