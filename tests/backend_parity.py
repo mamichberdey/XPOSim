@@ -65,6 +65,6 @@ def compare_results(test, candidate):
     for name in ("best_intensity", "x_m", "longitudinal_intensity", "transmission"):
         np.testing.assert_allclose(getattr(result, name), getattr(reference, name),
                                    rtol=1e-8, atol=1e-13)
-    if candidate in {"tensorflow", "jax"} or result._session.grid._free_gpu_memory() is not None:
+    if candidate == "jax" or result._session.grid._free_gpu_memory() is not None:
         test.assertTrue(all(xpos._backend_name(batch) == candidate
                             for batch in result._session._mode_batches))

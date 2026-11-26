@@ -8,7 +8,7 @@ The module deliberately keeps the public model small:
   for ``z=0`` and Fresnel-propagates that field for ``z>0``;
 * :class:`PointSource` creates a field and therefore is the only object that
   does not consume an input field;
-* NumPy, CuPy, PyTorch, TensorFlow and JAX are supported without changing the array type of a field;
+* NumPy, CuPy, PyTorch and JAX are supported without changing the array type of a field;
 * CRL surface errors are specified as sampled height deviations and interpolated
   onto the calculation grid.
 * cached configuration parameters are read-only; CRL.with_parameters constructs
@@ -47,7 +47,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.34.2"
+__version__ = "0.35.0"
 
 
 __all__ = [
@@ -161,165 +161,6 @@ def _jax_gpu():
     return xp
 
 
-def _is_tf_tensor(value):
-    tf = sys.modules.get("tensorflow")
-    return tf is not None and isinstance(value, (tf.Tensor, tf.Variable))
-
-
-class _TensorFlowFFT:
-    def __init__(self, tf):
-        self.tf = tf
-
-    def fft(self, field, n=None):
-        if n is not None:
-            length = field.shape[-1]
-            field = self.tf.pad(field[..., :n], [(0, 0)] * (len(field.shape)-1)
-                                + [(0, max(0, n-length))])
-        return self.tf.signal.fft(field)
-
-    def ifft(self, field):
-        return self.tf.signal.ifft(field)
-
-    def fft2(self, field):
-        return self.tf.signal.fft2d(field)
-
-    def ifft2(self, field):
-        return self.tf.signal.ifft2d(field)
-
-
-class _TensorFlowArrays:
-    """TensorFlow eager operations for the shared array-based optical model."""
-
-    def __init__(self, device):
-        import tensorflow as tf
-        self.tf = tf
-        self.device = device
-        self.np = tf.experimental.numpy
-        self.nan = np.nan
-        self.np.experimental_enable_numpy_behavior(prefer_float32=False)
-        self.fft = _TensorFlowFFT(tf)
-        # Place factories explicitly, including those called without input tensors.
-        for name in ("arange", "linspace", "ones", "zeros", "full", "asarray"):
-            setattr(self, name, self._placed(getattr(self.np, name)))
-
-    def _placed(self, operation):
-        def on_device(*args, **kwargs):
-            with self.tf.device(self.device):
-                return operation(*args, **kwargs)
-        return on_device
-
-    def __getattr__(self, name):
-        return getattr(self.np, name)
-
-    def empty(self, shape, dtype):
-        with self.tf.device(self.device):
-            return self.tf.Variable(self.tf.zeros(shape, dtype), trainable=False)
-
-    @lru_cache(maxsize=4)
-    def lens_stack_graph(self, dimension):
-        tf = self.tf
-        fft, ifft = ((tf.signal.fft, tf.signal.ifft) if dimension == 1 else
-                     (tf.signal.fft2d, tf.signal.ifft2d))
-
-        @tf.function(autograph=False, reduce_retracing=True)
-        def propagate(field, transmission, center_phase, half_step, count):
-            with tf.device(self.device):
-                # Between successive centred FFT/IFFT pairs the phase ramps
-                # cancel. The diagonal lens transmission commutes with them.
-                field = tf.cast(field, tf.complex128) * center_phase
-                field = ifft(fft(field) * half_step)
-                full_step = half_step * half_step
-
-                def advance(i, wave):
-                    return i + 1, ifft(fft(wave * transmission) * full_step)
-
-                _, field = tf.while_loop(lambda i, wave: i < count - 1, advance,
-                                         (tf.constant(0), field), parallel_iterations=1)
-                return ifft(fft(field * transmission) * half_step) * tf.math.conj(center_phase)
-
-        return propagate
-
-    @lru_cache(maxsize=4)
-    def spectrum_graph(self, dimension):
-        """Fuse spectral phase factors and the centered inverse transform."""
-        tf = self.tf
-
-        @tf.function(autograph=False, reduce_retracing=True)
-        def propagate(spectrum, z, k, qx, px, factor, *y_data):
-            with tf.device(self.device):
-                scale = tf.multiply(tf.divide(tf.constant(-.5, tf.float64), k), z)
-                angles_x = tf.multiply(scale, tf.square(qx))
-                phase_x = tf.exp(tf.complex(tf.zeros_like(angles_x), angles_x))
-                spectrum = tf.cast(spectrum, tf.complex128)
-                if dimension == 1:
-                    work = spectrum[None, :] * phase_x * px
-                    result = tf.signal.ifft(work) * px
-                else:
-                    qy, py = y_data
-                    angles_y = tf.multiply(scale, tf.square(qy))
-                    phase_y = tf.exp(tf.complex(tf.zeros_like(angles_y), angles_y))
-                    work = spectrum[None, :, :] * phase_x[:, None, :] * phase_y[:, :, None]
-                    work = work * px * py[:, None]
-                    result = tf.signal.ifft2d(work) * px * py[:, None]
-                return result * factor
-
-        return propagate
-
-    def brackets(self, x, axis):
-        i = self.tf.clip_by_value(self.tf.searchsorted(axis, x), 1, len(axis)-1)
-        return i, (x-axis[i-1]) / (axis[i]-axis[i-1])
-
-    def interp(self, x, axis, values, *, left, right):
-        i, w = self.brackets(x, axis)
-        result = values[i-1] + w * (values[i]-values[i-1])
-        return self.where(x < axis[0], left, self.where(x > axis[-1], right, result))
-
-    def interp_map(self, values, x_axis, y_axis, grid, fill):
-        x, y, data = map(self.asarray, (x_axis, y_axis, values))
-        i, wx = self.brackets(grid.x_axis, x)
-        j, wy = self.brackets(grid.y_axis, y)
-        rows = data[:, i-1] + wx * (data[:, i] - data[:, i-1])
-        result = rows[j-1] + wy[:, None] * (rows[j]-rows[j-1])
-        inside = (grid.x >= x[0]) & (grid.x <= x[-1]) & (grid.y >= y[0]) & (grid.y <= y[-1])
-        return self.where(inside, result, fill)
-
-    def gaussian_filter(self, image, sigmas):
-        for axis, sigma in enumerate(np.atleast_1d(sigmas)):
-            radius = int(5 * sigma + .5)
-            if radius:
-                offsets = self.arange(-radius, radius+1, dtype=image.dtype)
-                kernel = self.exp(-.5*(offsets/sigma)**2)
-                lines = self.moveaxis(image, axis, -1)
-                result = self.tf.nn.conv1d(self.reshape(lines, (-1, lines.shape[-1], 1)),
-                    self.reshape(kernel/self.sum(kernel), (-1, 1, 1)), stride=1, padding="SAME")
-                image = self.moveaxis(self.reshape(result, lines.shape), -1, axis)
-        return image
-
-
-@lru_cache(maxsize=None)
-def _tensorflow_arrays(device):
-    return _TensorFlowArrays(device)
-
-
-@lru_cache(maxsize=1)
-def _tensorflow_gpu():
-    try:
-        import tensorflow as tf
-    except (ImportError, OSError) as exc:
-        raise RuntimeError("TensorFlow backend requires TensorFlow with GPU support.") from exc
-    if not tf.config.list_physical_devices("GPU"):
-        raise RuntimeError("TensorFlow backend requires a visible GPU.")
-    try:
-        with tf.device("/GPU:0"):
-            probe = tf.signal.fft(tf.ones(2, dtype=tf.complex128))
-            probe.numpy()
-    except tf.errors.OpError as exc:
-        raise RuntimeError("TensorFlow GPU FFT failed.") from exc
-    if tf.DeviceSpec.from_string(probe.device).device_type != "GPU":
-        raise RuntimeError("TensorFlow could not execute a complex FFT on GPU.")
-    return _tensorflow_arrays(probe.device)
-
-
 def _is_tensor(value):
     # Recognize tensors supplied by callers without importing PyTorch for NumPy users.
     torch = sys.modules.get("torch")
@@ -412,8 +253,6 @@ def _torch_gpu():
 
 
 def _numeric_dtype(array):
-    if _is_tf_tensor(array):
-        return array.dtype.is_floating or array.dtype.is_integer or array.dtype.is_complex
     if _is_tensor(array):
         return array.dtype != sys.modules["torch"].bool
     return np.issubdtype(array.dtype, np.number)
@@ -427,11 +266,9 @@ def _array_module(array: Any):
         return cp
     if _is_jax_array(array):
         return _jax_arrays(array.device)
-    if _is_tf_tensor(array):
-        return _tensorflow_arrays(array.device)
     if _is_tensor(array):
         return _torch_arrays(array.device)
-    raise TypeError("Field must be a NumPy array, CuPy array, Torch tensor, TensorFlow tensor or JAX array.")
+    raise TypeError("Field must be a NumPy array, CuPy array, Torch tensor or JAX array.")
 
 
 def _backend_name(array: Any) -> str:
@@ -439,8 +276,6 @@ def _backend_name(array: Any) -> str:
 
     if _is_jax_array(array):
         return "jax"
-    if _is_tf_tensor(array):
-        return "tensorflow"
     if _is_tensor(array):
         return "torch"
     return "cupy" if CUPY_AVAILABLE and isinstance(array, cp.ndarray) else "numpy"
@@ -817,11 +652,9 @@ def _backend_module(backend: str):
         return cp
     if backend == "jax":
         return _jax_gpu()
-    if backend == "tensorflow":
-        return _tensorflow_gpu()
     if backend == "torch":
         return _torch_gpu()
-    raise ValueError("backend must be numpy, cupy, torch, tensorflow or jax.")
+    raise ValueError("backend must be numpy, cupy, torch or jax.")
 
 
 def _centered_coordinates(n: int, step: float, xp) -> Any:
@@ -993,14 +826,14 @@ class BaseGrid(_Configured, ABC):
         _array_module(field)
         if _backend_name(field) != self.backend:
             raise TypeError(f"Field backend is {_backend_name(field)!r}, but the grid uses {self.backend!r}.")
-        if self.backend in {"tensorflow", "torch", "jax"} and field.device != self.xp.device:
+        if self.backend in {"torch", "jax"} and field.device != self.xp.device:
             raise TypeError(f"Field must be on grid device {self.xp.device}.")
         if tuple(field.shape) != self.shape:
             raise ValueError(f"Expected field shape {self.shape}, got {field.shape}.")
         if not _numeric_dtype(field):
             raise TypeError("Field arrays must have a numeric dtype.")
 
-    def _transform_phases(self, inverse: bool):
+    def _transform_batch(self, fields: Any, inverse: bool = False) -> Any:
         key = -1 if inverse else +1
         if key not in self._phase_cache:
             px, sx = _fourier_phase(self.nx, key, self.xp)
@@ -1009,10 +842,7 @@ class BaseGrid(_Configured, ABC):
             else:
                 py, sy = _fourier_phase(self.ny, key, self.xp)
                 self._phase_cache[key] = (px, sx, py, sy)
-        return self._phase_cache[key]
-
-    def _transform_batch(self, fields: Any, inverse: bool = False) -> Any:
-        phase = self._transform_phases(inverse)
+        phase = self._phase_cache[key]
         if self.dimension == 1:
             transform = _ifft1d if inverse else _fft1d
             return transform(fields, self.dx, phase)
@@ -1033,16 +863,6 @@ class BaseGrid(_Configured, ABC):
         xp = self.xp
         z = xp.asarray(z_values, dtype=xp.float64)[:, None]
         qx = self.qx if self.dimension == 1 else self.qx_axis
-        if self.backend == "tensorflow":
-            phase = self._transform_phases(inverse=True)
-            factor = phase[1] / self.dx
-            y_data = ()
-            if self.dimension == 2:
-                factor = phase[1] * phase[3] / (self.dx * self.dy)
-                y_data = (self.qy_axis, phase[2])
-            return xp.spectrum_graph(self.dimension)(
-                spectrum, z, xp.asarray(k, dtype=xp.float64), qx, phase[0],
-                xp.asarray(factor, dtype=xp.complex128), *y_data)
         phase_x = xp.exp((-0.5j / k) * z * qx**2)
         work = spectrum[None, ...] * (phase_x if self.dimension == 1 else phase_x[:, None, :])
         if self.dimension == 2:
@@ -1065,8 +885,6 @@ class BaseGrid(_Configured, ABC):
         _validate_finite("z", z)
         _validate_positive("k", k)
         if z == 0:
-            if self.backend == "tensorflow":
-                return self.xp.tf.identity(field)
             return field.clone() if _is_tensor(field) else field.copy()
         return self._propagate_spectrum(self.fft(field), np.asarray([z]), k)[0]
 
@@ -1081,7 +899,7 @@ class BaseGrid(_Configured, ABC):
         self._validate_field_backend(field)
         _validate_finite("z",z)
         _validate_positive("k",k)
-        if self.backend == detector.backend and self.backend in {"torch", "tensorflow", "jax"} and self.xp.device != detector.xp.device:
+        if self.backend == detector.backend and self.backend in {"torch", "jax"} and self.xp.device != detector.xp.device:
             raise ValueError("Detector and propagation grid must use the same device.")
         if detector.dimension!=self.dimension or detector.backend!=self.backend:
             raise ValueError("Detector dimension/backend must match the propagation grid.")
@@ -1100,8 +918,8 @@ class BaseGrid(_Configured, ABC):
             return min(n_planes, batch_size)
         free_bytes = self._free_gpu_memory()
         if free_bytes is None:
-            if self.backend in {"tensorflow", "jax"}:
-                itemsize = dtype.size if self.backend == "tensorflow" else dtype.itemsize
+            if self.backend == "jax":
+                itemsize = dtype.itemsize
                 field_bytes = int(np.prod(self.shape)) * itemsize
                 return max(1, min(n_planes, 16, (64 << 20) // (6 * field_bytes)))
             return 1
@@ -1132,7 +950,7 @@ class BaseGrid(_Configured, ABC):
             positions = z_array[start:stop]
             fields = self._propagate_spectrum(spectrum, positions, k)
             zero = np.flatnonzero(positions == 0)
-            if zero.size and self.backend in {"tensorflow", "jax"}:
+            if zero.size and self.backend == "jax":
                 mask = self.xp.asarray(positions == 0)
                 fields = self.xp.where(self.xp.reshape(mask, (-1,) + (1,)*self.dimension), field, fields)
             elif zero.size:
@@ -1151,13 +969,11 @@ class BaseGrid(_Configured, ABC):
         dtype = self.xp.result_type(field.dtype, self.xp.complex128)
         result = self.xp.empty((len(z_array), *self.shape), dtype=dtype)
         for planes, fields in self.iter_propagate(field, z_array, k, batch_size=batch_size):
-            if self.backend == "tensorflow":
-                result[planes].assign(fields)
-            elif self.backend == "jax":
+            if self.backend == "jax":
                 result = result.at[planes].set(fields)
             else:
                 result[planes] = fields
-        return result.read_value() if self.backend == "tensorflow" else result
+        return result
 
     def convolve(self, field_a: Any, field_b: Any) -> Any:
         """Convolve two fields using the continuous Fourier convention."""
@@ -1175,7 +991,7 @@ def _validated_distances(z_values: Sequence[float], *, nonnegative: bool = False
 
 @dataclass
 class Grid1D(BaseGrid):
-    """Uniform 1D grid: dx in metres, nx samples, NumPy, CuPy, Torch or TensorFlow backend."""
+    """Uniform 1D grid: dx in metres, nx samples, NumPy, CuPy, Torch or JAX backend."""
 
     dx: float
     nx: int
@@ -1626,7 +1442,7 @@ def _interpolate_map(values: Any, x_axis: Any, y_axis: Any,
                      grid: BaseGrid, fill_value: float) -> Any:
     """Interpolate a 2D map on its calculation backend when CuPy supports it."""
     xp = grid.xp
-    if grid.backend in {"torch", "tensorflow", "jax"}:
+    if grid.backend in {"torch", "jax"}:
         return xp.interp_map(values, x_axis, y_axis, grid, fill_value)
     interpolator_type = RegularGridInterpolator
     if grid.backend == "cupy":
@@ -1947,7 +1763,6 @@ class CRL(OpticalElement):
         if self.beta is not None and self.beta < 0:
             raise ValueError("material beta must be >= 0.")
 
-        self._tf_stack_factors = None
         self._thickness_cache: dict[int, Any] = {}
         self._transmission_cache: dict[int, Any] = {}
 
@@ -2188,29 +2003,11 @@ class CRL(OpticalElement):
 
         self._thickness_cache.clear()
         self._transmission_cache.clear()
-        self._tf_stack_factors = None
 
-    def _tensorflow_repeated_stack(self, field):
-        grid = self.grid
-        xp = grid.xp
-        transmission = self.transmission(0)
-        if self._tf_stack_factors is None:
-            phase, _ = _fourier_phase(grid.nx, +1, xp)
-            q_squared = (grid.qx if grid.dimension == 1 else grid.qx_axis)**2
-            if grid.dimension == 2:
-                phase_y, _ = _fourier_phase(grid.ny, +1, xp)
-                phase = phase * phase_y[:, None]
-                q_squared = q_squared + grid.qy_axis[:, None]**2
-            half_step = xp.exp((-0.25j * self.element_period / self.k) * q_squared)
-            self._tf_stack_factors = phase, half_step
-        return xp.lens_stack_graph(grid.dimension)(
-            field, transmission, *self._tf_stack_factors, xp.tf.constant(self.n_elements))
 
     def _field_after_element(self) -> Any:
         """Propagate through the complete CRL stack and return its exit-plane field."""
 
-        if self.grid.backend == "tensorflow" and self.reuse_element_geometry:
-            return self._tensorflow_repeated_stack(self._require_input_field())
         field = self.propagate(self._require_input_field(), self.element_period / 2)
         for element_index in range(self.n_elements):
             field = field * self.transmission(element_index)
@@ -2226,13 +2023,10 @@ class CRL(OpticalElement):
         """
         _array_module(fields)
         if (_backend_name(fields) != self.grid.backend or
-                (self.grid.backend in {"torch", "tensorflow", "jax"} and fields.device != self.grid.xp.device) or
+                (self.grid.backend in {"torch", "jax"} and fields.device != self.grid.xp.device) or
                 fields.ndim != self.grid.dimension + 1 or fields.shape[1:] != self.grid.shape):
             raise ValueError("Expected a source batch with shape (batch, *grid.shape) on the grid backend.")
         k, _, _ = self._require_optical_constants()
-
-        if self.grid.backend == "tensorflow" and self.reuse_element_geometry:
-            return self._tensorflow_repeated_stack(fields)
 
         def propagate_batch(field, distance):
             return self.grid._propagate_mode_spectra(
@@ -2436,17 +2230,13 @@ class CRL(OpticalElement):
             values = abs(cropped)**2
             tables.append(_device_metrics(self.grid, values, x_roi, y_roi, measure_y))
             if return_fields:
-                if self.grid.backend == "tensorflow":
-                    E_array[planes].assign(cropped)
-                elif self.grid.backend == "jax":
+                if self.grid.backend == "jax":
                     E_array = E_array.at[planes].set(cropped)
                 else:
                     E_array[planes] = cropped
             del values, cropped, fields
         table = _to_numpy(self.grid.xp.concatenate(tables, axis=0))
         metrics = _metrics_from_table(table, self.grid.dimension, div)
-        if return_fields and self.grid.backend == "tensorflow":
-            E_array = E_array.read_value()
 
         peaks = np.asarray([m.max_intensity for m in metrics])
         peak_index = None if np.all(np.isnan(peaks)) else int(np.nanargmax(peaks))
@@ -2643,82 +2433,8 @@ def _metric_table(values, x_axis, y_axis, measure_y_fwhm, xp):
     return xp.stack((maxima, x_axis[i], y_axis[j], width_x, width_y, finite), axis=1)
 
 
-def _tensorflow_widths(tf, profiles, coordinates, peak, maxima):
-    """Peak-crossing FWHM using native batched gathers and known peak indices."""
-    n = profiles.shape[-1]
-    dtype = tf.experimental.numpy.result_type(profiles.dtype, coordinates.dtype)
-    if n < 2:
-        return tf.fill(tf.shape(maxima), tf.constant(np.nan, dtype))
-    indices = tf.range(n)[None, :]
-    below_half = profiles < maxima[:, None] / 2
-    left = tf.reduce_max(tf.where((indices < peak[:, None]) & below_half, indices, -1), axis=1)
-    right = tf.reduce_min(tf.where((indices > peak[:, None]) & below_half, indices, n), axis=1)
-    li = tf.clip_by_value(left, 0, n - 2)
-    ri = tf.clip_by_value(right, 1, n - 1)
-    crossings = tf.stack((li, li + 1, ri - 1, ri), axis=1)
-    samples = tf.gather(profiles, crossings, axis=1, batch_dims=1)
-    positions = tf.cast(tf.gather(coordinates, crossings), dtype)
-    denominator = samples[:, 1::2] - samples[:, ::2]
-    fraction = (maxima[:, None] / 2 - samples[:, ::2]) / tf.where(
-        denominator == 0, tf.ones_like(denominator), denominator)
-    fraction = tf.cast(tf.where(denominator == 0, tf.cast(.5, fraction.dtype), fraction), dtype)
-    positions = positions[:, ::2] + fraction * (positions[:, 1::2] - positions[:, ::2])
-    widths = positions[:, 1] - positions[:, 0]
-    valid = (tf.reduce_all(tf.math.is_finite(profiles), axis=1) & (maxima > 0)
-             & (left >= 0) & (right < n) & (widths >= 0))
-    return tf.where(valid, widths, tf.constant(np.nan, dtype))
-
-
-def _tensorflow_metric_table(tf, values, x_axis, y_axis, measure_y):
-    """Reduce metrics without experimental.numpy advanced-index machinery."""
-    if not values.dtype.is_floating:
-        values = tf.cast(values, tf.experimental.numpy.result_type(values.dtype, x_axis.dtype))
-    flat = tf.reshape(values, (values.shape[0], -1))
-    flat = tf.where(tf.math.is_nan(flat), tf.cast(-np.inf, values.dtype), flat)
-    peaks = tf.argmax(flat, axis=1, output_type=tf.int32)
-    maxima = tf.gather(flat, peaks, axis=1, batch_dims=1)
-    finite = tf.reduce_any(tf.math.is_finite(flat), axis=1)
-    if y_axis is None:
-        widths = _tensorflow_widths(tf, values, x_axis, peaks, maxima)
-        columns = (maxima, tf.gather(x_axis, peaks), widths, finite)
-    else:
-        j, i = peaks // values.shape[-1], peaks % values.shape[-1]
-        horizontal = tf.gather(values, j, axis=1, batch_dims=1)
-        width_x = _tensorflow_widths(tf, horizontal, x_axis, i, maxima)
-        if measure_y:
-            vertical = tf.gather(values, i, axis=2, batch_dims=1)
-            width_y = _tensorflow_widths(tf, vertical, y_axis, j, maxima)
-        else:
-            width_y = tf.fill(tf.shape(maxima), tf.constant(np.nan, width_x.dtype))
-        columns = (maxima, tf.gather(x_axis, i), tf.gather(y_axis, j), width_x, width_y, finite)
-    dtype = tf.experimental.numpy.result_type(values.dtype, x_axis.dtype)
-    return tf.stack([tf.cast(column, dtype) for column in columns], axis=1)
-
-
-@lru_cache(maxsize=32)
-def _tensorflow_metric_graph(xp, shape, dtype, axis_dtype, measure_y_fwhm):
-    """Cache the reduction for each batch shape, including the shorter final batch."""
-    tf = xp.tf
-    specs = [tf.TensorSpec(shape, dtype), tf.TensorSpec((shape[-1],), axis_dtype)]
-    if len(shape) == 3:
-        specs.append(tf.TensorSpec((shape[-2],), axis_dtype))
-
-    @tf.function(input_signature=specs, autograph=False)
-    def reduce_batch(values, *axes):
-        with tf.device(xp.device):
-            y = axes[1] if len(axes) == 2 else None
-            return _tensorflow_metric_table(tf, values, axes[0], y, measure_y_fwhm)
-
-    return reduce_batch
-
-
 def _device_metrics(grid, values, x, y, measure_y):
-    xp = grid.xp
-    if grid.backend != "tensorflow":
-        return _metric_table(values, x, y, measure_y, xp)
-    reduce_batch = _tensorflow_metric_graph(xp, tuple(values.shape), values.dtype, x.dtype, measure_y)
-    axes = (x,) if y is None else (x, y)
-    return reduce_batch(values, *axes)
+    return _metric_table(values, x, y, measure_y, grid.xp)
 
 
 def _intensity_metrics_batch(values: Any, grid: BaseGrid, slices: tuple[slice, ...],
@@ -2830,14 +2546,11 @@ def select_backend(preferred: str = "auto") -> str:
     auto falls back to NumPy. An explicit cupy request raises a diagnostic error
     when CUDA cannot execute. This does not install dependencies or change drivers.
     """
-    if preferred not in {"auto", "numpy", "cupy", "torch", "tensorflow", "jax"}:
-        raise ValueError("backend must be auto, numpy, cupy, torch, tensorflow or jax.")
+    if preferred not in {"auto", "numpy", "cupy", "torch", "jax"}:
+        raise ValueError("backend must be auto, numpy, cupy, torch or jax.")
     if preferred == "jax":
         _jax_gpu()
         return "jax"
-    if preferred == "tensorflow":
-        _tensorflow_gpu()
-        return "tensorflow"
     if preferred == "torch":
         xp = _torch_gpu()
         xp.fft.fft(xp.ones(2, dtype=xp.complex128))[0].item()
@@ -2856,7 +2569,7 @@ def select_backend(preferred: str = "auto") -> str:
             failure = f"CUDA probe failed: {exc}"
     if preferred == "cupy":
         raise RuntimeError(failure + " Use backend='auto' or 'numpy' for CPU execution.")
-    for candidate in ("torch", "tensorflow", "jax"):
+    for candidate in ("torch", "jax"):
         try:
             return select_backend(candidate)
         except (RuntimeError, ImportError, OSError):
@@ -3215,7 +2928,7 @@ class CRLFocusConfig:
             _validate_finite(name,value)
             if value<0: raise ValueError("Source FWHM must be non-negative.")
             object.__setattr__(self,name,float(value))
-        if self.accuracy not in {"preview","refined"} or self.backend not in {"auto","numpy","cupy","torch","tensorflow", "jax"}:
+        if self.accuracy not in {"preview","refined"} or self.backend not in {"auto","numpy","cupy","torch","jax"}:
             raise ValueError("Invalid accuracy or backend.")
         for name in ("axial_roi_level","transverse_roi_level"):
             value=getattr(self,name)
@@ -3853,14 +3566,14 @@ class _CRLFocusSession:
 
     def _prepare_mode_cache(self, progress):
         """Store each exit spectrum once for the scan and later detector planes."""
-        self._mode_bytes=int(np.prod(self.spectrum.shape)) * self.spectrum.dtype.size if self.grid.backend == "tensorflow" else self.spectrum.nbytes
+        self._mode_bytes=self.spectrum.nbytes
         required=len(self.weights)*self._mode_bytes
         free = self.grid._free_gpu_memory()
         if free is not None:
             gpu_budget = min(1024**3, free//4)
         else:
             # Same conservative device budget as automatic propagation batches.
-            gpu_budget = (64 << 20) if self.grid.backend in {"tensorflow", "jax"} else 0
+            gpu_budget = (64 << 20) if self.grid.backend == "jax" else 0
 
         cache_location="GPU" if required<=gpu_budget else "RAM"
         scratch=None
@@ -4086,7 +3799,7 @@ class _CRLFocusSession:
         sigma_x=abs(magnification[0])*self.source_sigma[0]/grid.dx
         sigmas=sigma_x if self.grid.dimension==1 else (
             abs(magnification[1])*self.source_sigma[1]/grid.dy,sigma_x)
-        if self.grid.backend in {"torch", "tensorflow", "jax"}:
+        if self.grid.backend in {"torch", "jax"}:
             return self.xp.gaussian_filter(image, sigmas)
         if self.grid.backend=="cupy":
             from cupyx.scipy.ndimage import gaussian_filter
@@ -4647,7 +4360,7 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
     target_x=focus_widths[0]/6
     if cfg.source_type!="plane":
         target_x=min(target_x,wavelength*cfg.source_distance_m/(2*cfg.aperture_m))
-    quick_cap=65536 if cfg.grid_dimension==1 else (2048 if backend in {"cupy", "torch", "tensorflow", "jax"} else 1024)
+    quick_cap=65536 if cfg.grid_dimension==1 else (2048 if backend in {"cupy", "torch", "jax"} else 1024)
     cap=65536 if cfg.grid_dimension==1 else (4096 if cfg.accuracy=="refined" else quick_cap)
     k=2*np.pi/wavelength
     delta=parameters['material'].optical_constants(cfg.energy_kev)[0]

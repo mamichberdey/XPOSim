@@ -1,6 +1,6 @@
 # API evolution proposal
 
-This is a design proposal for incremental releases. It does not add public classes to XPOSim 0.34.0. The current `import XPOSim`, its 40 exports and existing keyword conventions remain the compatibility baseline.
+This is a design proposal for incremental releases. It does not add public classes to XPOSim 0.34.0. The current `import XPOSim`, its 40 exports and existing keyword conventions form the compatibility baseline. The supported backend contract in 0.35.0 is NumPy, CuPy, Torch and JAX. Auto-selection tries CuPy, Torch and JAX before NumPy.
 
 ## Core objects
 

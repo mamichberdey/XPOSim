@@ -33,7 +33,7 @@ Tolerances apply to the stated grids and normalizations. They are deliberately t
 
 ## Existing backend regressions
 
-`tests/backend_parity.py` checks complex fields, intensity, FWHM, filters, interpolation, divergence and high-level focus against NumPy. Torch, TensorFlow and JAX kernels can run in CPU-only validation using test-only device injection. Production accelerator selection continues to require a GPU. Actual-device tests run conditionally. CuPy requires a CUDA environment. Skipped tests must be reported alongside successful tests.
+`tests/backend_parity.py` checks complex fields, intensity, FWHM, filters, interpolation, divergence and high-level focus against NumPy. Torch and JAX kernels can run in CPU-only validation using test-only device injection. Production accelerator selection continues to require a GPU. Actual-device tests run conditionally. CuPy requires a CUDA environment. Skipped tests must be reported alongside successful tests.
 
 CPU emulation does not validate GPU placement, asynchronous timing, device peak memory or PCIe traffic. Those require the hardware jobs described in the roadmap.
 

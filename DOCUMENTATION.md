@@ -37,11 +37,11 @@ The examples below are sequential: run the setup once and then continue with the
 
 ### Device memory and transfers
 
-CuPy, PyTorch, TensorFlow and JAX keep propagated fields, Gaussian filtering and metric reductions on the calculation device. Uniform grid coordinates and ROI indices are derived from grid metadata on the host. Chirp-z plans and Gaussian Fourier filters use device scalars directly.
+CuPy, PyTorch and JAX keep propagated fields, Gaussian filtering and metric reductions on the calculation device. Uniform grid coordinates and ROI indices are derived from grid metadata on the host. Chirp-z plans and Gaussian Fourier filters use device scalars directly.
 
 `CRL.focus_scan` accumulates a compact device metric table across propagation batches and reads it once at completion. Returned fields stay on the device. The high-level `estimate_crl_focus` workflow packs metrics and longitudinal profiles into chunks of up to 16 planes and approximately 8 MiB per chunk, with a minimum of one plane. Its public results contain NumPy arrays for plotting and export. A detector-plane request packs its image and metrics into one host read.
 
-Gaussian point-source spectra are cached on the device when they fit the cache budget. CuPy and PyTorch use up to one quarter of available GPU memory, capped at 1 GiB. TensorFlow and JAX use a conservative 64 MiB budget when free device memory cannot be queried. Larger caches use RAM or temporary storage and transfer source batches back to the device during propagation. This bounds memory use for large source quadratures.
+Gaussian point-source spectra are cached on the device when they fit the cache budget. CuPy and PyTorch use up to one quarter of available GPU memory, capped at 1 GiB. JAX uses a conservative 64 MiB budget when free device memory cannot be queried. Larger caches use RAM or temporary storage and transfer source batches back to the device during propagation. This bounds memory use for large source quadratures.
 
 Adaptive peak and axial-ROI searches read scalar objective values because each value determines the next position. Geometry validation also reads device validity flags. Explicit backend probes synchronize a small FFT to detect execution failures. Public scalar results and host exports synchronize when requested. These operations remain part of the API's execution model.
 
@@ -62,7 +62,7 @@ Adaptive peak and axial-ROI searches read scalar objective values because each v
 
 Ordinary propagation uses the same transverse grid in every plane. Use `grid.propagate_to_grid(field, z, k, detector)` to evaluate the field on a different transverse grid with the same backend. Specify either `energy_kev` or `wavelength_m` for wave calculations. When given a wavelength, material-backed elements derive photon energy before looking up tabulated optical constants.
 
-NumPy arrays reside on the CPU. CuPy arrays, JAX arrays and Torch or TensorFlow grid tensors reside on the GPU. Torch uses the current CUDA device. TensorFlow uses its first visible logical GPU, eager tensors and TensorFlow’s process-wide NumPy-compatible tensor behavior. JAX uses the first visible JAX GPU and enables process-wide x64 mode to preserve double-precision coordinates and complex fields. Supply incident fields on the grid device. A grid validates the backend and shape of incident arrays. It does not automatically infer the grid, resample fields, or transfer them to another backend.
+NumPy arrays reside on the CPU. CuPy arrays, JAX arrays and Torch grid tensors reside on the GPU. Torch uses the current CUDA device. JAX uses the first visible JAX GPU and enables process-wide x64 mode to preserve double-precision coordinates and complex fields. Supply incident fields on the grid device. A grid validates the backend and shape of incident arrays. It does not automatically infer the grid, resample fields, or transfer them to another backend.
 
 ## 2. Complete example: point source, CRL, and detector
 
@@ -198,7 +198,7 @@ Use `CRLFocusConfig` to set the source, CRL geometry, material and grid. The [RE
 | `analyze_crossed_crl(config)` | Compute the two image positions for orthogonal stacks and determine a matching gap when possible. Set `geometry="crossed"` and give the second stack as `second_crl=CRLStackConfig(...)`. A numerical `gap_m` fixes the distance between the stacks. |
 | `estimate_crl_focus(config)` | Propagate the chosen source, evaluate an axial scan and return a `CRLFocusResult` with intensity, FWHM, transmission and grid information. `accuracy="refined"` can evaluate the field on a finer transverse grid. |
 | `result.plane_at(z_m)` | Evaluate an observation plane using the saved propagation state. Its coordinates are in metres. For crossed stacks, z is measured from the exit of the second stack. |
-| `select_backend("auto")` | Try a GPU FFT with CuPy, PyTorch, TensorFlow and JAX in order, then fall back to NumPy. The high-level workflow also accepts an explicit `backend="numpy"`, `backend="cupy"`, `backend="torch"`, `backend="tensorflow"`, or `backend="jax"`. |
+| `select_backend("auto")` | Try a GPU FFT with CuPy, PyTorch and JAX in order, then fall back to NumPy. The high-level workflow also accepts an explicit `backend="numpy"`, `backend="cupy"`, `backend="torch"`, or `backend="jax"`. |
 
 Set `source_type` to `"point"`, `"plane"` or `"gaussian"`. Gaussian source sizes are intensity FWHMs in metres. `source_method="convolution"` approximates finite-source broadening by shifting the central-point response. `source_method="points"` propagates independent source modes and sums their intensities.
 
@@ -451,7 +451,7 @@ CuPy availability is detected at import time. A successful CuPy import selects t
 
 ## 8. API reference
 
-Reference entries use the structure Parameters, Returns, Attributes, Raises/Warns, Notes, Examples, and See also where applicable. Signatures are taken from the supplied implementation. Required parameters have no default; `*` marks keyword-only arguments. `Array` below means a NumPy ndarray, CuPy ndarray, Torch tensor, TensorFlow tensor, or JAX array with the backend and shape required by its grid.
+Reference entries use the structure Parameters, Returns, Attributes, Raises/Warns, Notes, Examples, and See also where applicable. Signatures are taken from the supplied implementation. Required parameters have no default; `*` marks keyword-only arguments. `Array` below means a NumPy ndarray, CuPy ndarray, Torch tensor, or JAX array with the backend and shape required by its grid.
 
 Inherited field methods are documented once under [OpticalObject and OpticalElement](#api-opticalobject), and grid transform methods once under [grid methods](#api-grid-methods). Concrete element entries inherit those methods unless an override is described.
 
@@ -633,7 +633,7 @@ Grid1D(dx: float, nx: int, backend: str = 'cupy' if CUPY_AVAILABLE else 'numpy')
 | --- | --- | --- | --- |
 | `dx` | float | `required` | Positive x sampling interval, metres. |
 | `nx` | int | `required` | Number of x samples; at least 2. |
-| `backend` | str | `CuPy if importable; else NumPy` | "numpy", "cupy", "torch", "tensorflow", or "jax" (case-insensitive). Default is "cupy" if CuPy imported successfully, otherwise "numpy". Fixed at module import, not selected by a device test. |
+| `backend` | str | `CuPy if importable; else NumPy` | "numpy", "cupy", "torch", or "jax" (case-insensitive). Default is "cupy" if CuPy imported successfully, otherwise "numpy". Fixed at module import, not selected by a device test. |
 
 **Returns**
 
@@ -673,7 +673,7 @@ Grid2D(dx: float, dy: float, nx: int, ny: int, backend: str = 'cupy' if CUPY_AVA
 | `dy` | float | `required` | Positive y sampling interval, metres. |
 | `nx` | int | `required` | Number of x samples; at least 2. |
 | `ny` | int | `required` | Number of y samples; at least 2. |
-| `backend` | str | `CuPy if importable; else NumPy` | "numpy", "cupy", "torch", "tensorflow", or "jax" (case-insensitive). Default is "cupy" if CuPy imported successfully, otherwise "numpy". Fixed at module import, not selected by a device test. |
+| `backend` | str | `CuPy if importable; else NumPy` | "numpy", "cupy", "torch", or "jax" (case-insensitive). Default is "cupy" if CuPy imported successfully, otherwise "numpy". Fixed at module import, not selected by a device test. |
 
 **Returns**
 
@@ -706,7 +706,7 @@ Both grid classes expose the following methods. Parameters `field`, `field_a`, a
 | `grid.ifft(field)` | Inverse transform, with reciprocal spatial scaling | Same array validation |
 | `grid.propagate(field, z, k)` | z in metres; positive k in rad/m. Returns ifft(fft(field)*H) | z=0 returns a copy. Unlike optical-object wrappers, this low-level method does not reject negative z or validate positive k |
 | `grid.convolve(field_a, field_b)` | ifft(fft(a)*fft(b)); same output shape | Both arrays validated; periodic convolution |
-| `grid.xp` | Read-only property: NumPy, CuPy or device-bound Torch, TensorFlow or JAX array operations | No arguments |
+| `grid.xp` | Read-only property: NumPy, CuPy, or device-bound Torch/JAX array operations | No arguments |
 
 `Grid1D` attributes: `dx`, `nx`, `backend`, `x`, `qx`, `dqx`, `shape`, `dimension`. `Grid2D` adds `dy`, `ny`, `y`, `x_axis`, `y_axis`, `qy`, `qx_axis`, `qy_axis`, `dqy`. Coordinate and reciprocal-coordinate arrays use float64 and the grid backend.
 

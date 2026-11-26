@@ -1,6 +1,6 @@
 # XPOSim
 
-XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating monochromatic X-ray propagation, diffraction, and focusing. It propagates complex wavefields on one- and two-dimensional transverse grids using FFTs. Calculations run on the CPU with NumPy or on an NVIDIA GPU with CuPy, PyTorch, TensorFlow or JAX.
+XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating monochromatic X-ray propagation, diffraction, and focusing. It propagates complex wavefields on one- and two-dimensional transverse grids using FFTs. Calculations run on the CPU with NumPy or on an NVIDIA GPU with CuPy, PyTorch or JAX.
 
 Try XPOSim for X-ray focusing with a compound refractive lens.
 
@@ -23,17 +23,16 @@ Try XPOSim for X-ray focusing with a compound refractive lens.
 
 Keep `XPOSim.py` alongside `xray_material_data/` for formula-based materials. XPOSim requires NumPy and SciPy. Plotting examples also use Matplotlib.
 
-For NVIDIA GPU calculations, install **any one** of CuPy, PyTorch, TensorFlow or JAX with GPU support compatible with your system and driver. Select the corresponding backend on a grid or in `CRLFocusConfig`.
+For NVIDIA GPU calculations, install **any one** of CuPy, PyTorch or JAX with GPU support compatible with your system and driver. Select the corresponding backend on a grid or in `CRLFocusConfig`.
 
 | Compute backend | Setting |
 | --- | --- |
 | NumPy on CPU | `backend="numpy"` |
 | CuPy on GPU | `backend="cupy"` |
 | PyTorch on GPU | `backend="torch"` |
-| TensorFlow on GPU | `backend="tensorflow"` |
 | JAX on GPU | `backend="jax"` |
 
-The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch, TensorFlow and JAX in that order and uses NumPy if no GPU backend can run. An explicit GPU selection requires that backend to execute on a visible GPU.
+The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch and JAX in that order and uses NumPy if no GPU backend can run. An explicit GPU selection requires that backend to execute on a visible GPU.
 
 GPU fields stay on the selected device during propagation, filtering and metric reduction. `focus_scan` transfers one compact metric table after the scan. The high-level workflow exports profiles in bounded chunks and returns NumPy arrays for plotting. Adaptive searches read scalar results to choose their next evaluation point. See [device memory and transfers](DOCUMENTATION.md#device-memory-and-transfers) for cache limits and synchronization details.
 
@@ -50,7 +49,7 @@ import XPOSim as xpos
 
 requested = "auto"
 available = []
-for name in ("cupy", "torch", "tensorflow", "jax", "numpy"):
+for name in ("cupy", "torch", "jax", "numpy"):
     try:
         available.append(xpos.select_backend(name))
     except (ImportError, OSError, RuntimeError):
@@ -200,7 +199,7 @@ The initial independent reference suite checks complex Gaussian propagation, thi
 
 - [Physical and numerical conventions](docs/PHYSICAL_CONVENTIONS.md)
 - [Reference cases and test tolerances](docs/VALIDATION.md)
-- [RTX 4060 GPU validation and TensorFlow measurements](docs/GPU_VALIDATION.md)
+- [RTX 4060 GPU validation and measurements](docs/GPU_VALIDATION.md)
 - [Engineering audit and staged roadmap](docs/ENGINEERING_AUDIT.md)
 - [Proposed API evolution](docs/API_DESIGN.md)
 
