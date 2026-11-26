@@ -18,17 +18,17 @@ PyTorch and JAX on GPU.
 
 ## How it works
 
-<img src="https://raw.githubusercontent.com/mamichberdey/XPOSim/main/docs/assets/optical-bench.png" width="900" alt="An isometric optical bench with fields E0 through E3 passing from a source through an aperture, compound refractive lens and sample to observation. A general legend shows E_in to object to E_out for every optical element. The sample is parallel to the aperture, with the beam visibly transmitted through it; spare modules show interchangeable elements." />
+<img src="https://raw.githubusercontent.com/mamichberdey/XPOSim/main/docs/assets/optical-bench.png" width="900" alt="An isometric optical bench with fields E0 through E3 passing from a source through an aperture, compound refractive lens and sample to observation. A general legend shows E_in to object to E_out for every optical object. The sample is parallel to the aperture, with the beam visibly transmitted through it; spare modules show interchangeable optical objects." />
 
-Change the illumination and replace or combine optical elements to build a scheme.
-A **source creates the complex field** `E`. Each element receives `E_in` through
-`input_field` and returns a complex field `E_out`, which can feed the next element.
+Change the illumination and replace or combine optical objects to build a scheme.
+A **source creates the complex field** `E`. Other optical objects receive `E_in` through
+`input_field` and return a complex field `E_out`, which can feed the next object.
 Both amplitude and phase are carried by the field. At an observation plane,
 intensity is `abs(E)**2` for the field propagated to that plane.
 
 `source.E(z=d)` creates the field a distance `d` from the source.
-`element.E(z=0)` returns the element's exit field; `element.E(z=d)` also propagates
-it by `d` from that exit. Elements share a `Grid1D` or `Grid2D`. Lengths are in
+`optic.E(z=0)` returns the object's exit field; `optic.E(z=d)` also propagates
+it by `d` from that exit. Optical objects share a `Grid1D` or `Grid2D`. Lengths are in
 metres and photon energies in keV.
 
 [Physical model and references](https://github.com/mamichberdey/XPOSim/blob/main/docs/PHYSICAL_MODEL.md) ·
@@ -112,6 +112,8 @@ print(f"Image plane: {z * 1e3:.2f} mm from lens exit")
 print(f"Spot FWHM: {beam.fwhm * 1e9:.1f} nm | Peak intensity: {beam.max_intensity:.1f} × incident")
 print("XPOSim lens check passed.")
 ```
+
+Here `n_elements` is the number of individual lenslets in the CRL.
 
 ## Documentation
 
