@@ -4,7 +4,7 @@ XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating mo
 
 Try XPOSim for X-ray focusing with a compound refractive lens.
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/7dbed4b7097dc3165417f07c78b4f9b0c749453d/notebooks/CRL_Focus_Colab.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mamichberdey/XPOSim/blob/b7eed82b4c50594f7e41b8c3b1dc905f9bea31b0/notebooks/CRL_Focus_Colab.ipynb)
 
 [Installation](#installation) · [Quick start](#quick-start) · [Library guide](DOCUMENTATION.md) · [API reference](DOCUMENTATION.md#8-api-reference)
 
