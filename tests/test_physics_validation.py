@@ -53,6 +53,25 @@ class PhysicsValidationTests(unittest.TestCase):
         np.testing.assert_allclose(grid.propagate(propagated, -z, self.k), field,
                                    rtol=0, atol=1e-12)
 
+    def test_library_sampling_and_window_convergence_against_gaussian(self):
+        width, z = 2e-6, .05
+        detector = xpos.Grid1D(80e-9, 81, backend="numpy")
+        spread = 1+2j*z/(self.k*width**2)
+        expected = np.exp(-detector.x**2/(width**2*spread))/np.sqrt(spread)
+
+        def relative_error(step, count):
+            grid = xpos.Grid1D(step, count, backend="numpy")
+            field = np.exp(-(grid.x/width)**2)
+            actual = grid.propagate_to_grid(field, z, self.k, detector)
+            return np.linalg.norm(actual-expected)/np.linalg.norm(expected)
+
+        sampling = [relative_error(16e-6/count, count) for count in (8, 16, 32)]
+        windows = [relative_error(125e-9, count) for count in (32, 64, 128)]
+        for errors in (sampling, windows):
+            self.assertLess(errors[1], errors[0]/10)
+            self.assertLess(errors[2], errors[1]/10)
+            self.assertLess(errors[2], 1e-6)
+
     def test_thin_lens_gaussian_focus(self):
         grid = xpos.Grid1D(40e-9, 2049, backend="numpy")
         width, focus = 3e-6, 0.05

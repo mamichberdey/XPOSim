@@ -776,6 +776,8 @@ def _bounded_minimum(objective, lower, upper, tolerance, max_evaluations):
     golden = (3-np.sqrt(5.))/2
     x = previous = older = lower + golden*(upper-lower)
     value = previous_value = older_value = float(objective(x))
+    if not np.isfinite(value):
+        raise ArithmeticError("The scalar objective must be finite.")
     step = history = 0.
     for _ in range(max(0, max_evaluations-1)):
         midpoint = (lower+upper)/2
@@ -803,6 +805,8 @@ def _bounded_minimum(objective, lower, upper, tolerance, max_evaluations):
             step = golden*history
         trial = x + np.copysign(max(abs(step), accuracy), step if step else midpoint-x)
         trial_value = float(objective(trial))
+        if not np.isfinite(trial_value):
+            raise ArithmeticError("The scalar objective must be finite.")
         if trial_value <= value:
             if trial < x:
                 upper = x
@@ -3509,10 +3513,14 @@ def _source_host_cache_budget() -> int:
     return max(0, min(4 * 1024**3, available // 2))
 
 
-def _gaussian_source_quadrature(sigma, count, *, equal_probability=False):
-    """Sample an intensity-normalized Gaussian using centred point modes."""
-    if sigma == 0:
-        return np.array([0.]), np.array([1.])
+def _readonly_quadrature(nodes, weights):
+    nodes.flags.writeable = weights.flags.writeable = False
+    return nodes, weights
+
+
+@lru_cache(maxsize=16)
+def _standard_source_quadrature(count, equal_probability):
+    """Cache immutable standard-normal nodes and weights by order and method."""
     if equal_probability:
         # Each cell contains the same probability. Its Gaussian centroid gives
         # much finer spacing in the bright core than low-order Hermite nodes.
@@ -3523,8 +3531,9 @@ def _gaussian_source_quadrature(sigma, count, *, equal_probability=False):
         nodes=.5*(nodes-nodes[::-1])
         # A representative per cell suppresses within-cell variance. Restore
         # the specified source variance before propagating the point modes.
-        nodes*=sigma/np.sqrt(np.mean(nodes**2))
-        return nodes, np.full(count,1./count)
+        nodes/=np.sqrt(np.mean(nodes**2))
+        weights = np.full(count,1./count)
+        return _readonly_quadrature(nodes, weights)
     # Golub-Welsch Jacobi matrix for probabilists' Hermite polynomials.
     off_diagonal = np.sqrt(np.arange(1, count, dtype=float))
     jacobi = np.diag(off_diagonal, 1) + np.diag(off_diagonal, -1)
@@ -3532,7 +3541,16 @@ def _gaussian_source_quadrature(sigma, count, *, equal_probability=False):
     weights = vectors[0]**2
     nodes = (nodes-nodes[::-1])/2
     weights = (weights+weights[::-1])/2
-    return nodes*sigma, weights/weights.sum()
+    return _readonly_quadrature(nodes, weights/weights.sum())
+
+
+
+def _gaussian_source_quadrature(sigma, count, *, equal_probability=False):
+    """Return independent, writable Gaussian nodes and normalized weights."""
+    if sigma == 0:
+        return np.array([0.]), np.array([1.])
+    nodes, weights = _standard_source_quadrature(count, equal_probability)
+    return nodes*sigma, weights.copy()
 
 
 class _CRLFocusSession:

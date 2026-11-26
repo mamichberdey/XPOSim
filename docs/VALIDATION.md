@@ -55,3 +55,41 @@ The runtime uses device-side bilinear interpolation, radix-smooth FFT padding, s
 A comparison of 0.36.0 with the replacement implementation used five 128-sample configurations, including Gaussian point/convolution sources and crossed lenses. At common detector distances, relative intensity L2 differences were at most `3.2e-16`. Peak-distance shifts were at most `7.9e-11 m`, within the configured adaptive-search tolerance. These CPU checks assess numerical agreement. They do not establish GPU performance of the new interpolation path.
 
 The energy-conversion reference uses the exact SI values h=6.62607015e-34 J s, c=299792458 m/s and e=1.602176634e-19 C. [SI defining constants](https://www.bipm.org/en/measurement-units/si-defining-constants)
+
+## Numerical stability and quadrature reuse
+
+`tests/test_numerical_stability.py` checks minimization under objective scales
+`1e-250` through `1e250`, flat objectives, narrow peaks with exhausted budgets,
+reversed root brackets, nonfinite objectives, odd/even propagation round trips,
+and FWHM invariance under intensity scales `1e-240` through `1e240`. Minimizer
+positions must agree with the known quadratic minimum within `5e-8`; round-trip
+complex fields use relative/absolute `2e-12`. Undefined scalar objectives fail
+explicitly. Flat public peak searches report lack of convergence.
+
+`test_library_sampling_and_window_convergence_against_gaussian` compares the
+library's local-detector field with the analytic Gaussian above, using w=2 um,
+lambda=0.1 nm, z=50 mm and an 81-node detector at 80 nm. Sampling is refined at
+fixed 16 um entrance width with 8/16/32 nodes. Separately, a fixed 125 nm entrance
+step uses 32/64/128 nodes. Each error must decrease at least tenfold per step and
+finish below relative complex-field L2 error `1e-6`. Observed final errors on the
+CPU were `8.22e-9` and `2.20e-8`. The initial coarse grids deliberately expose
+sampling and window errors. This is a library convergence test against an
+independent expression, rather than only an independent quadrature test.
+
+Standard source nodes/weights now use a 16-entry LRU keyed by count and method.
+Tests check reuse across physical source sizes, Gaussian moments, mutation
+isolation and eviction. The initial dense eigensolve is unchanged.
+
+Preparation timings measured in the cloud on an Intel Xeon Platinum 8573C,
+x86_64, Python 3.12.14, NumPy 2.4.6, `OPENBLAS_NUM_THREADS=OMP_NUM_THREADS=1`:
+
+| Gaussian order | Cold median (range), ms | Cached median (range), ms |
+| --- | --- | --- |
+| 7 | 0.0417 (0.0235–0.240) | 0.00102 (0.000933–0.00138) |
+| 201 | 4.15 (3.55–10.2) | 0.00114 (0.00108–0.00140) |
+
+Seven cold trials cleared the cache before preparing sigma=2 um. Seven warm
+trials each averaged 1000 calls with sigma=3 um at the same order; timing includes
+scaling and copying the returned arrays. These measure quadrature preparation,
+not full propagation, GPU execution or performance on a laptop. Large first-call
+orders still need a more scalable eigensolver before claiming improved complexity.
