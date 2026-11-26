@@ -19,7 +19,7 @@ PyTorch and JAX on GPU.
 
 ## How it works
 
-<img src="https://raw.githubusercontent.com/mamichberdey/XPOSim/main/docs/assets/optical-scheme.png" width="900" alt="A point source illuminates an aperture and a compound refractive lens, focusing onto an observation plane. Swap symbols show plane-wave or Gaussian illumination and alternative blade or sampled-material elements." />
+<img src="https://raw.githubusercontent.com/mamichberdey/XPOSim/main/docs/assets/optical-scheme.png?v=2" width="900" alt="A point source illuminates an aperture and a compound refractive lens, focusing onto an observation plane. Separate option groups show plane-wave or Gaussian illumination and alternative blade or sampled-material elements." />
 
 Change the illumination and replace or combine optical elements to build a scheme.
 A **source creates the complex field** `E`. Each element receives it as `input_field`,
