@@ -19,13 +19,13 @@ PyTorch and JAX on GPU.
 
 ## How it works
 
-<img src="https://raw.githubusercontent.com/mamichberdey/XPOSim/main/docs/assets/optical-scheme.png?v=3" width="900" alt="A source creates the input complex field E_in. A selectable optical object transforms it into the output complex field E_out. Observation calculates intensity I = |E_out|². Smaller icons show alternative source fields and optical objects." />
+<img src="https://raw.githubusercontent.com/mamichberdey/XPOSim/main/docs/assets/optical-bench.png" width="900" alt="An isometric optical bench with fields E0 through E3 passing from a source through an aperture, compound refractive lens and sample to observation. A general legend shows E_in to object to E_out for every optical element. The sample is parallel to the aperture, with the beam visibly transmitted through it; spare modules show interchangeable elements." />
 
 Change the illumination and replace or combine optical elements to build a scheme.
-A **source creates the complex field** `E_in`. Each element receives it as
+A **source creates the complex field** `E`. Each element receives `E_in` through
 `input_field` and returns a complex field `E_out`, which can feed the next element.
-Both amplitude and phase are carried by the field; intensity is
-calculated at observation as `abs(E_out)**2`.
+Both amplitude and phase are carried by the field. At an observation plane,
+intensity is `abs(E)**2` for the field propagated to that plane.
 
 `source.E(z=d)` creates the field a distance `d` from the source.
 `element.E(z=0)` returns the element's exit field; `element.E(z=d)` also propagates
