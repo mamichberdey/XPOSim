@@ -1,5 +1,10 @@
 # XPOSim
 
+[![PyPI version](https://img.shields.io/pypi/v/XPOSim?logo=pypi&logoColor=white)](https://pypi.org/project/XPOSim/)
+[![Python >=3.10](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB?logo=python&logoColor=white)](https://pypi.org/project/XPOSim/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/mamichberdey/XPOSim/blob/main/LICENSE)
+[![Numerical validation](https://github.com/mamichberdey/XPOSim/actions/workflows/validation.yml/badge.svg?branch=main)](https://github.com/mamichberdey/XPOSim/actions/workflows/validation.yml)
+
 XPOSim (X-ray Paraxial Optical Simulation) is a Python library for simulating monochromatic X-ray propagation, diffraction, and focusing. It propagates complex wavefields on one- and two-dimensional transverse grids using FFTs. Calculations run on the CPU with NumPy or on an NVIDIA GPU with CuPy, PyTorch or JAX.
 
 Try XPOSim for X-ray focusing with a compound refractive lens.
