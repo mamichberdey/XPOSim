@@ -24,6 +24,7 @@ Documentation = "https://github.com/mamichberdey/XPOSim/blob/main/DOCUMENTATION.
 Issues = "https://github.com/mamichberdey/XPOSim/issues"
 Source = "https://github.com/mamichberdey/XPOSim"
 Releases = "https://github.com/mamichberdey/XPOSim/releases"
+Citation = "https://github.com/mamichberdey/XPOSim/blob/main/CITATION.cff"
 
 [tool.setuptools]
 py-modules = ["XPOSim"]

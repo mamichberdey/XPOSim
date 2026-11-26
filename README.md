@@ -252,3 +252,9 @@ The conventions document explains finite-window behavior on even grids and the e
 XPOSim code is distributed under the [MIT license](https://github.com/mamichberdey/XPOSim/blob/main/LICENSE). The bundled material
 tables retain the [DABAX MIT notice](https://github.com/mamichberdey/XPOSim/blob/main/xray_material_data/LICENSE) and
 [data provenance](https://github.com/mamichberdey/XPOSim/blob/main/xray_material_data/README.md). See [third-party notices](https://github.com/mamichberdey/XPOSim/blob/main/THIRD_PARTY_NOTICES.md).
+
+## Citation
+
+If you use XPOSim in research, please cite the software using
+[CITATION.cff](https://github.com/mamichberdey/XPOSim/blob/main/CITATION.cff).
+GitHub's **Cite this repository** menu provides APA and BibTeX citations.

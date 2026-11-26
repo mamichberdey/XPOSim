@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use XPOSim in your research, please cite this software using the metadata below."
+type: software
+title: "XPOSim: X-ray Paraxial Optical Simulation"
+authors:
+  - family-names: Aleksandrov
+    given-names: Aleksandr
+    orcid: "https://orcid.org/0009-0009-6131-6088"
+version: "0.38.0"
+license: MIT
+repository-code: "https://github.com/mamichberdey/XPOSim"
+url: "https://github.com/mamichberdey/XPOSim"
+abstract: >-
+  XPOSim is a Python library for scalar paraxial X-ray wave propagation,
+  diffraction and focusing on one- and two-dimensional grids, with NumPy,
+  CuPy, PyTorch and JAX numerical backends.
+keywords:
+  - X-ray optics
+  - wave optics
+  - Fresnel diffraction
+  - compound refractive lenses
+  - scientific computing
