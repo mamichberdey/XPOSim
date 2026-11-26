@@ -33,7 +33,7 @@ A parameter scan should yield bounded chunks with stable parameter ordering, exp
 
 Proposed precision modes pair float32 coordinates/complex64 fields and float64 coordinates/complex128 fields. Phase accumulation may need a documented higher-precision path. Each mode needs its own validation tolerances and supported backend capability checks. Current double-precision results establish the reference baseline.
 
-Add `close()` and context-manager support to retained result sessions, with explicit semantics for subsequent `plane_at` calls. Clear result-owned buffers and temporary source files on close. Never clear a backend's process-wide memory allocator as a side effect of closing one result. Cache keys must include geometry, wavelength, dtype, backend/device and boundary convention. Tensor mutation needs an ownership contract because read-only attributes alone do not prevent mutation of device arrays.
+Implemented additively in 0.38.0: retained CRL results support `close()` and context managers. Exported arrays and summaries survive closing; `plane_at` and `check_convergence` then raise `RuntimeError`. Closing drops result-owned references and temporary source files without clearing process-wide allocator pools. `BaseGrid.estimate_memory`, `CRLNumericalReport` and `CRLConvergenceReport` expose planning estimates and explicit stability checks. See the [resource and reliability contract](../DOCUMENTATION.md#resource-lifetime-and-numerical-reliability). Cache keys must include geometry, wavelength, dtype, backend/device and boundary convention. Tensor mutation needs an ownership contract because read-only attributes alone do not prevent mutation of device arrays.
 
 ## Persistence
 

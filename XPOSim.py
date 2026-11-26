@@ -32,7 +32,7 @@ import re
 import sys
 from shutil import disk_usage
 from tempfile import TemporaryFile, gettempdir
-from threading import Lock
+from threading import RLock
 from time import perf_counter
 from typing import Any, Callable, Iterable, Iterator, Sequence
 import warnings
@@ -47,7 +47,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.37.0"
+__version__ = "0.38.0"
 
 
 __all__ = [
@@ -85,6 +85,8 @@ __all__ = [
     "analyze_crl",
     "analyze_crossed_crl",
     "CRLFocusResult",
+    "CRLNumericalReport",
+    "CRLConvergenceReport",
     "estimate_crl_focus",
     "CRLProgressUpdate",
     "PeakIntensitySearchResult",
@@ -1072,6 +1074,24 @@ class BaseGrid(_Configured, ABC):
         field_bytes = int(np.prod(self.shape)) * itemsize
         # Reserve space for FFT workspace, spectra, intensity and retained output.
         return max(1, min(n_planes, 16, int(free_bytes * 0.25) // (6 * field_bytes)))
+
+    def estimate_memory(self, n_planes: int = 1, *, batch_size: int | None = None,
+                        return_fields: bool = False, source_modes: int = 1) -> dict[str, Any]:
+        """Estimate complex128 propagation storage without allocating fields.
+
+        Working storage uses the same six-fields-per-batch heuristic as automatic
+        batching. FFT workspaces, framework pools, detector zoom plans and optical
+        element caches are excluded; this is not a peak-memory guarantee.
+        Source spectra and retained output are separate from working storage.
+        """
+        _validate_count("n_planes", n_planes)
+        _validate_count("source_modes", source_modes)
+        size = self._batch_size(n_planes, np.dtype(np.complex128), batch_size)
+        field_bytes = int(np.prod(self.shape)) * 16
+        return {"grid_shape": self.shape, "dtype": "complex128", "batch_size": size,
+                "field_bytes": field_bytes, "working_bytes_estimate": 6*size*field_bytes,
+                "output_stack_bytes": n_planes*field_bytes if return_fields else 0,
+                "source_spectra_bytes": source_modes*field_bytes}
 
     def iter_propagate(self, field: Any, z_values: Sequence[float], k: float, *,
                        batch_size: int | None = None) -> Iterator[tuple[slice, Any]]:
@@ -3544,7 +3564,6 @@ def _standard_source_quadrature(count, equal_probability):
     return _readonly_quadrature(nodes, weights/weights.sum())
 
 
-
 def _gaussian_source_quadrature(sigma, count, *, equal_probability=False):
     """Return independent, writable Gaussian nodes and normalized weights."""
     if sigma == 0:
@@ -3556,7 +3575,15 @@ def _gaussian_source_quadrature(sigma, count, *, equal_probability=False):
 class _CRLFocusSession:
     """Reusable propagation state with bounded detector and source batches."""
 
-    def __init__(self, cfg, grid, crl, incident, coherent_state=None, progress=None):
+    def __init__(self, cfg, grid, crl, incident, coherent_state=None, progress=None, resources=None):
+        self._mode_io_lock=RLock()
+        self._mode_batches=[]
+        self._mode_file=None
+        self._closed=False
+        self.source_cache_location="not_used"
+        self.source_cache_bytes=0
+        if resources is not None:
+            resources.append(self)
         self.cfg,self.grid,self.crl,self.incident=cfg,grid,crl,incident
         self.xp=grid.xp
         self.exit_field=crl.E() if coherent_state is None else coherent_state.exit_field
@@ -3577,8 +3604,6 @@ class _CRLFocusSession:
         self.detector_grid=grid
         self._zoom_plan=None
         self.diagnostics=[]
-        self._mode_batches=[]
-        self._mode_file=None
         sigma_factor=1/(2*np.sqrt(2*np.log(2)))
         self.source_sigma=(cfg.source_fwhm_x_m*sigma_factor,cfg.source_fwhm_y_m*sigma_factor)
         self._crossed_projection=None
@@ -3603,6 +3628,21 @@ class _CRLFocusSession:
             self._prepare_mode_cache(progress)
         elif cfg.source_type=="gaussian":
             self.diagnostics.append("convolution_model: Gaussian intensity convolution assumes a shift-invariant pupil response; use point sampling to include source-dependent clipping and absorption.")
+
+    def close(self):
+        """Drop owned references and close scratch files without flushing GPU pools."""
+        with self._mode_io_lock:
+            if self._closed:
+                return
+            self._closed=True
+            if self._mode_file is not None:
+                self._mode_file.close()
+                self._mode_file=None
+            self._mode_batches.clear()
+            # Some arrays are shared with other sessions. Drop references only.
+            for name in ("_last_image", "_peak_cache", "spectrum", "exit_field", "incident",
+                         "crl", "grid", "detector_grid", "_zoom_plan", "_mode_weights", "xp"):
+                setattr(self,name,None)
 
     def configure_refined_detector(self,analytic,*,z_bounds=None):
         """Resolve the detector peak without globally oversampling the lens plane."""
@@ -3729,6 +3769,7 @@ class _CRLFocusSession:
             gpu_budget = (64 << 20) if self.grid.backend == "jax" else 0
 
         cache_location="GPU" if required<=gpu_budget else "RAM"
+        self.source_cache_bytes=required
         scratch=None
         if cache_location=="RAM" and required>_source_host_cache_budget():
             cache_location="temporary storage"
@@ -3740,6 +3781,7 @@ class _CRLFocusSession:
                 )
             scratch=TemporaryFile(dir=directory)
 
+        self.source_cache_location=cache_location
         try:
             if progress is not None:
                 progress.start("source_modes",len(self.weights),
@@ -3761,7 +3803,6 @@ class _CRLFocusSession:
                 del spectrum
             if scratch is not None:
                 scratch.flush()
-                self._mode_io_lock=Lock()
                 self._mode_file=scratch
         finally:
             if scratch is not None and self._mode_file is None:
@@ -4125,6 +4166,33 @@ def _find_equal_fwhm_plane(z_values, widths, reference_z, measure, *, max_evalua
     return None if best is None else EqualFWHMPlane(best, *widths_at(best))
 
 
+@dataclass(frozen=True)
+class CRLNumericalReport:
+    """Sampling indicators, not an error bound or a convergence certificate.
+
+    Phase estimates sum magnitudes of ideal lens and source-curvature slopes at
+    pupil edges. Boundary fractions use the outer 5% rim (at least one pixel).
+    The detector ROI and coherent exit pupil are distinct integration domains.
+    """
+    estimated_phase_step_rad: tuple[float, ...]
+    detector_points_per_fwhm: tuple[float | None, ...]
+    detector_boundary_power_fraction: float
+    coherent_exit_boundary_power_fraction: float
+    memory: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class CRLConvergenceReport:
+    """Observed stability on two finer grids, relative to the original result.
+
+    This checks transverse sampling/window effects at fixed axial ROI and source
+    quadrature. It does not establish absolute accuracy or source convergence.
+    """
+    relative_tolerance: float
+    stable: bool
+    comparisons: tuple[dict[str, Any], ...]
+
+
 @dataclass
 class CRLFocusResult:
     """Display data and a live session for arbitrary z planes.
@@ -4165,7 +4233,7 @@ class CRLFocusResult:
     detector_step_y_m: float | None
     lens_length_m: float
     diagnostics: tuple[str,...]
-    _session: _CRLFocusSession
+    _session: _CRLFocusSession | None
     reference_metrics: BeamMetrics | None = None
     reference_point_metrics: BeamMetrics | None = None
     display_signal_bounds_m: tuple[tuple[float,float],tuple[float,float]] | None = None
@@ -4173,6 +4241,86 @@ class CRLFocusResult:
     equal_fwhm_plane: EqualFWHMPlane | None = None
     longitudinal_intensity_y: np.ndarray | None = None
     coherent_reference: PeakIntensitySearchResult | None = None
+    numerical_report: CRLNumericalReport | None = None
+    convergence_report: CRLConvergenceReport | None = None
+    _lifecycle_lock: Any = field(default_factory=RLock,init=False,repr=False,compare=False)
+    _closed_metadata: dict[str, Any] = field(default_factory=dict,init=False,repr=False,compare=False)
+
+    @property
+    def closed(self) -> bool:
+        """Whether the retained propagation session has been released."""
+        return self._session is None
+
+    def _require_session(self):
+        if self.closed:
+            raise RuntimeError("This CRLFocusResult is closed; run estimate_crl_focus again to evaluate planes.")
+        return self._session
+
+    def close(self) -> None:
+        """Release cached device arrays and temporary files; keep exported data.
+
+        Summary, NumPy images and metrics remain available. Further plane_at or
+        check_convergence calls fail. No process-wide GPU allocator is cleared.
+        """
+        with self._lifecycle_lock:
+            if self.closed:
+                return
+            self._closed_metadata={
+                "magnification":self.magnification_at_peak,
+                "projected_source":self.projected_source_fwhm_at_peak_m,
+                "source_modes":self.source_mode_counts}
+            self._session.close()
+            self._session=None
+
+    def __enter__(self) -> "CRLFocusResult":
+        self._require_session()
+        return self
+
+    def __exit__(self,exc_type,exc,tb) -> None:
+        self.close()
+
+    def check_convergence(self, *, relative_tolerance: float = .02,
+                          progress: Callable[[CRLProgressUpdate], None] | None = None) -> CRLConvergenceReport:
+        """Repeat with finer sampling at fixed width, then a larger fixed-step window.
+
+        Both repeats retain grid parity, physical optics, backend, source nodes
+        and the original axial interval. Each temporary result is closed. This
+        may need about four times the entrance-grid storage for a 2D repeat.
+        Close the result after using this method, or use a context manager.
+        """
+        _validate_positive("relative_tolerance",relative_tolerance)
+        with self._lifecycle_lock:
+            self._require_session()
+            comparisons=[]
+            base=_convergence_observables(self)
+            counts=self.grid_shape[::-1]  # x, then y
+            steps=(self.grid_step_m,) if len(counts)==1 else (self.grid_step_m,self.grid_step_y_m)
+            for label in ("refined_sampling","expanded_window"):
+                if label=="refined_sampling":
+                    sizes=tuple(2*n-n%2 for n in counts)
+                    spacings=tuple(n*d/m for n,d,m in zip(counts,steps,sizes))
+                else:
+                    sizes=tuple(2*n+n%2 for n in counts)
+                    spacings=steps
+                grid=(Grid1D(spacings[0],sizes[0],backend=self.backend) if len(sizes)==1 else
+                      Grid2D(*spacings,*sizes,backend=self.backend))
+                cfg=replace(self.configuration,backend=self.backend,adaptive_window=False,
+                    grid_points=sizes[0],grid_points_y=None if len(sizes)==1 else sizes[1],
+                    grid_step_x_m=None,grid_step_y_m=None,scan_step_m=None,
+                    scan_range_m=(float(self.z_m[0]),float(self.z_m[-1])),scan_points=len(self.z_m))
+                with _run_focus_estimate(cfg,progress=progress,grid_override=grid) as repeat:
+                    values=_convergence_observables(repeat)
+                    changes={key:(None if old is None or values[key] is None else
+                                  abs(values[key]-old)/max(abs(old),1e-300)) for key,old in base.items()}
+                    stable=all(value is not None and np.isfinite(value) and value<=relative_tolerance
+                               for value in changes.values())
+                    comparisons.append({"case":label,"grid_shape":repeat.grid_shape,
+                        "grid_step_m":spacings,"observables":values,
+                        "relative_changes":changes,"stable":stable})
+                del repeat,grid
+            report=CRLConvergenceReport(float(relative_tolerance),all(c["stable"] for c in comparisons),tuple(comparisons))
+            self.convergence_report=report
+            return report
 
     @property
     def peak_z_m(self):
@@ -4293,20 +4441,27 @@ class CRLFocusResult:
 
     @property
     def magnification_at_peak(self):
-        return self._session.magnification(self.peak_z_m)
+        with self._lifecycle_lock:
+            return (self._closed_metadata["magnification"] if self.closed else
+                    self._session.magnification(self.peak_z_m))
 
     @property
     def projected_source_fwhm_at_peak_m(self):
         """Gaussian width projected to the numerical reference plane."""
         if self.configuration.source_type!="gaussian":
             return None
-        return self._session.projected_source_fwhm(self.peak_z_m)
+        with self._lifecycle_lock:
+            return (self._closed_metadata["projected_source"] if self.closed else
+                    self._session.projected_source_fwhm(self.peak_z_m))
 
     @property
     def source_mode_counts(self):
         """Actual source point counts by axis; zero-width axes use one mode."""
-        nodes=self._session.source_nodes
-        return None if nodes is None else tuple(len(axis) for axis in nodes)
+        with self._lifecycle_lock:
+            if self.closed:
+                return self._closed_metadata["source_modes"]
+            nodes=self._session.source_nodes
+            return None if nodes is None else tuple(len(axis) for axis in nodes)
 
     @property
     def magnification_at_focus(self):
@@ -4315,7 +4470,8 @@ class CRLFocusResult:
 
     def plane_at(self,z_m: float,*,full: bool=False) -> CRLPlaneResult:
         """Evaluate z with cached lens state; full=True returns the entire measurement ROI."""
-        return self._session.plane(z_m,full=full)
+        with self._lifecycle_lock:
+            return self._require_session().plane(z_m,full=full)
 
     def summary(self):
         return {"xposim_version":__version__,"configuration":asdict(self.configuration),
@@ -4360,7 +4516,30 @@ class CRLFocusResult:
                 "peak_search_converged":self.numerical_peak.converged,
                 "source_width_convention":"FWHM",
                 "distance_reference":"y CRL exit" if self.crossed_alignment is not None else "CRL exit",
-                "intensity_units":"relative", "convergence_checked":False}
+                "intensity_units":"relative", "convergence_checked":self.convergence_report is not None,
+                "numerical_report":None if self.numerical_report is None else asdict(self.numerical_report),
+                "convergence_report":None if self.convergence_report is None else asdict(self.convergence_report)}
+
+
+def _convergence_observables(result):
+    values={"peak_z_m":float(result.peak_z_m),"peak_intensity":float(result.reference_metrics.max_intensity),
+            "transmission":float(result.transmission)}
+    for axis,width in zip(result.fwhm_axes,np.atleast_1d(result.fwhm_at_peak_m)):
+        values[f"fwhm_{axis}_m"]=None if width is None or not np.isfinite(width) else float(width)
+    return values
+
+
+def _boundary_power_fraction(image,xp):
+    """Power in the union of outer 5% rims, normalized over the same array."""
+    rim_x=max(1,image.shape[-1]//20)
+    interior=(slice(rim_x,-rim_x),)
+    if image.ndim==2:
+        rim_y=max(1,image.shape[0]//20)
+        interior=(slice(rim_y,-rim_y),*interior)
+    total=xp.sum(image)
+    edge=xp.maximum(total-xp.sum(image[interior]),xp.asarray(0.))
+    return xp.where(total>0,edge/xp.where(total>0,total,1.),xp.asarray(float("nan")))
+
 
 
 def _display_slice(axis,profile,level,margin=0.12):
@@ -4493,7 +4672,7 @@ def _focus_width_estimates(cfg, wavelength, analytic, alignment=None):
     return tuple(.886*wavelength*distance/aperture for distance,aperture in zip(distances,apertures))
 
 
-def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignment=None):
+def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignment=None,resources=None,grid_override=None):
     """Fit CRL geometry first, resolve its physics, then check propagation edges."""
     wavelength,_=wavelength_energy(energy_kev=cfg.energy_kev)
     focus_widths=_focus_width_estimates(cfg,wavelength,analytic,alignment)
@@ -4537,7 +4716,7 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
         if cfg.grid_points is None and nx<required_x:
             messages.append("grid_cap: Automatic x sampling reached its memory cap; refine the grid to check spot size.")
         if cfg.grid_dimension==1:
-            grid=Grid1D(dx,nx,backend=backend)
+            grid=Grid1D(dx,nx,backend=backend) if grid_override is None else grid_override
         else:
             if cfg.geometry=="two-dimensional":
                 target_y=target_x
@@ -4557,7 +4736,17 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
             ny,dy=_focus_axis_sampling(width_y,required_y,cfg.grid_points_y,cfg.grid_step_y_m,cap,128)
             if cfg.grid_points_y is None and ny<required_y:
                 messages.append("grid_cap_y: Automatic y sampling reached its memory cap; refine the grid.")
-            grid=Grid2D(dx,dy,nx,ny,backend=backend)
+            grid=Grid2D(dx,dy,nx,ny,backend=backend) if grid_override is None else grid_override
+        if progress is not None:
+            modes=1
+            if cfg.source_type=="gaussian" and cfg.source_method=="points":
+                modes=cfg.source_points if cfg.source_fwhm_x_m>0 else 1
+                if grid.dimension==2 and cfg.source_fwhm_y_m>0:
+                    modes*=cfg.source_points_y or cfg.source_points
+            plan=grid.estimate_memory(cfg.scan_points,batch_size=cfg.batch_size,source_modes=modes)
+            progress.start("memory",detail=f"Grid {grid.shape} · batch {plan['batch_size']} · "
+                f"working estimate {plan['working_bytes_estimate']/1024**2:.1f} MiB · "
+                f"source spectra {plan['source_spectra_bytes']/1024**2:.1f} MiB (FFT workspace excluded)")
         xp=grid.xp
         position=0.0 if grid.dimension==1 else (0.0,0.0)
         incident=(xp.ones(grid.shape,dtype=xp.complex128) if cfg.source_type=="plane" else
@@ -4573,8 +4762,8 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
                            transverse_length=cfg.second_crl.structure_depth_m)
             crl=_CrossedCRL(crl,second_crl,alignment)
         probe_cfg=replace(cfg,source_method="convolution") if cfg.source_type=="gaussian" else cfg
-        probe=_CRLFocusSession(probe_cfg,grid,crl,incident)
-        if not cfg.adaptive_window:
+        probe=_CRLFocusSession(probe_cfg,grid,crl,incident,resources=resources)
+        if not cfg.adaptive_window or grid_override is not None:
             break
         edge=xp.zeros(grid.dimension, dtype=xp.float64)
         if progress is not None:
@@ -4583,6 +4772,7 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
             # Use the inexpensive geometrical projection for provisional grids.
             image=probe._blur(probe.coherent_intensity(z),z,displacement_scale=probe.magnification(z))
             edge=xp.maximum(edge,_edge_power_fractions(image,xp))
+            del image
             if progress is not None:
                 progress.advance(index+1)
         edge = _to_numpy(edge)
@@ -4599,6 +4789,7 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
         if grow_y:
             width_y*=1.5
             enlarged.append('y')
+        probe.close()
         probe=None
     if enlarged:
         messages.append("mesh_window: Geometry-fit window was expanded along "+', '.join(sorted(set(enlarged)))+" to reduce FFT-edge power.")
@@ -4674,10 +4865,30 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     coherent peak as their reference.
     The retained session evaluates any detector z from cached source spectra.
     Oversized spectra may use a temporary cache for the session lifetime.
+    Use the result as a context manager or call close() when finished; exported
+    arrays and summaries survive closing. check_convergence() runs two explicit
+    transverse refinements rather than silently repeating the calculation.
     progress receives synchronous stage updates without threads or timers.
     Unknown adaptive lengths have no percentage or ETA. Sampling ETA uses
     completed batches, preserving GPU batching and bounding progress overhead.
     """
+    return _run_focus_estimate(configuration,progress=progress)
+
+
+def _run_focus_estimate(configuration, *, progress=None, grid_override=None):
+    resources=[]
+    retained=None
+    try:
+        result=_estimate_crl_focus(configuration,progress=progress,resources=resources,grid_override=grid_override)
+        retained=result._session
+        return result
+    finally:
+        for session in resources:
+            if session is not retained:
+                session.close()
+
+
+def _estimate_crl_focus(configuration, *, progress=None, resources=None, grid_override=None):
     if not isinstance(configuration,CRLFocusConfig):
         raise TypeError("Pass a CRLFocusConfig instance.")
     reporter=_CRLProgressReporter(progress)
@@ -4706,12 +4917,12 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         if not np.isfinite(analytic) or analytic<=0:
             raise ValueError("This source/lens configuration has no finite real image after the CRL.")
         analytical_image=float(analytic)
-    grid,crl,coherent,messages=_build_focus_session(cfg,backend,parameters,analytic,reporter,alignment=alignment)
+    grid,crl,coherent,messages=_build_focus_session(cfg,backend,parameters,analytic,reporter,alignment=alignment,resources=resources,grid_override=grid_override)
     if alignment is not None and not alignment.aligned:
         messages.append("crossed_alignment: "+alignment.message)
     search_cfg=(replace(cfg,source_type="point",source_fwhm_x_m=0.0,source_fwhm_y_m=0.0)
                 if cfg.source_type=="gaussian" else cfg)
-    search_session=(_CRLFocusSession(search_cfg,grid,crl,coherent.incident,coherent_state=coherent)
+    search_session=(_CRLFocusSession(search_cfg,grid,crl,coherent.incident,coherent_state=coherent,resources=resources)
                     if cfg.source_type=="gaussian" else coherent)
     search_bounds=cfg.scan_range_m or (max(1e-9,.05*analytic),3*analytic)
     manual_detector=cfg.detector_roi_m is not None
@@ -4754,9 +4965,10 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         messages.append("z_roi_boundary: The axial ROI reached a search boundary; inspect the displayed range.")
     if cfg.source_type=="gaussian":
         messages.extend(search_session.diagnostics)
-        search_session=None  # Release the central detector before source-mode caching.
+        search_session.close()  # Release the central detector before source-mode caching.
+        search_session=None
         reporter.start("source_preparation",detail="Preparing the full Gaussian source after central-point search")
-        session=_CRLFocusSession(cfg,grid,crl,coherent.incident,coherent_state=coherent,progress=reporter)
+        session=_CRLFocusSession(cfg,grid,crl,coherent.incident,coherent_state=coherent,progress=reporter,resources=resources)
         if alignment is not None and cfg.source_method=="convolution":
             reporter.start("source_preparation",detail="Measuring off-axis displacement through the crossed CRLs")
             session.projected_source_fwhm(analytic)
@@ -4767,6 +4979,8 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
             messages.append("central_source_reference: Peak search and automatic z ROI use the central point; displayed intensities and widths include the full Gaussian source. Its maximum can occur at a different z.")
     else:
         session=search_session
+    if coherent is not session:
+        coherent.close()
     coherent=None
     if manual_detector and (alignment is None or cfg.source_type=="gaussian"):
         reporter.start("detector",detail="Preparing the manual detector region")
@@ -4870,21 +5084,23 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         slope+=crl.k*cfg.aperture_m/(2*cfg.source_distance_m)*grid.dx
     if slope>np.pi/2:
         messages.append("phase_sampling: Phase changes too rapidly between x samples; refine the grid.")
+    phase_steps=[float(slope)]
     if alignment is not None:
         lens=cfg.second_crl
         slope_y=crl.k*alignment.y_lens.delta*lens.n_elements*lens.aperture_m/lens.radius_m*grid.dy
+        if cfg.source_type!="plane":
+            slope_y+=crl.k*cfg.second_crl.aperture_m/(2*cfg.source_distance_m)*grid.dy
+        phase_steps.append(float(slope_y))
         if slope_y>np.pi/2:
             messages.append("phase_sampling_y: Phase changes too rapidly between y samples; refine the grid.")
     image=session.intensity(numerical.z_m)[session.measurement_slices]
-    rim_x=max(1,image.shape[-1]//20)
-    if grid.dimension==1:
-        edge=xp.sum(image[:rim_x])+xp.sum(image[-rim_x:])
-    else:
-        rim_y=max(1,image.shape[0]//20)
-        edge=(xp.sum(image[:rim_y])+xp.sum(image[-rim_y:])+
-              xp.sum(image[rim_y:-rim_y,:rim_x])+xp.sum(image[rim_y:-rim_y,-rim_x:]))
-    total = xp.sum(image)
-    if bool((total > 0) & (edge > 1e-3 * total)):
+    if cfg.geometry=="two-dimensional":
+        phase_steps.append(float(slope*grid.dy/grid.dx))
+        if phase_steps[-1]>np.pi/2:
+            messages.append("phase_sampling_y: Phase changes too rapidly between y samples; refine the grid.")
+    boundary_fractions=_to_numpy(xp.stack((_boundary_power_fraction(image,xp),
+        _boundary_power_fraction(abs(session.exit_field)**2,xp))))
+    if boundary_fractions[0]>1e-3:
         if manual_detector:
             messages.append("detector_boundary: Significant intensity reaches the edge of the manual detector ROI.")
         elif cfg.accuracy=="refined":
@@ -4912,6 +5128,12 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
             reporter.advance(evaluations)
             return widths_at_z
         equal_fwhm_plane=_find_equal_fwhm_plane(positions,widths,numerical.z_m,measure_widths)
+    source_modes=1 if session.source_nodes is None else int(np.prod([len(axis) for axis in session.source_nodes]))
+    memory=grid.estimate_memory(len(positions),batch_size=cfg.batch_size,source_modes=source_modes)
+    memory.update(source_cache_location=session.source_cache_location,source_cache_bytes=session.source_cache_bytes)
+    numerical_report=CRLNumericalReport(tuple(phase_steps),
+        tuple(None if not np.isfinite(w) else float(w/d) for w,d in zip(best_widths,steps)),
+        float(boundary_fractions[0]),float(boundary_fractions[1]),memory)
     result=CRLFocusResult(cfg,backend,analytical_image,collimated_focus,numerical,
         positions,intensities,widths,best_index,
         best.x_m,best.y_m,best.intensity,lines_x[:,x_slice].copy(),
@@ -4919,6 +5141,6 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         None if grid.dimension==1 else grid.dy,image.shape,detector.dx,
         None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics,point_metrics,
         display_signal_bounds,alignment,equal_fwhm_plane,
-        lines_y[:,y_slice].copy() if both_axes else None,coherent_reference)
+        lines_y[:,y_slice].copy() if both_axes else None,coherent_reference,numerical_report)
     reporter.finish()
     return result

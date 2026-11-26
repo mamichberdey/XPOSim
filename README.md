@@ -66,7 +66,7 @@ The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch an
 
 In this workload, both measured GPU backends have lower median times from 32,768 points per plane onward. [Benchmark setup and results](docs/GPU_VALIDATION.md#extended-grid-comparison).
 
-GPU fields stay on the selected device during propagation, filtering and metric reduction. `focus_scan` transfers one compact metric table after the scan. The high-level workflow exports profiles in bounded chunks and returns NumPy arrays for plotting. Adaptive searches read scalar results to choose their next evaluation point. See [device memory and transfers](DOCUMENTATION.md#device-memory-and-transfers) for cache limits and synchronization details.
+GPU fields stay on the selected device during propagation, filtering and metric reduction. `focus_scan` transfers one compact metric table after the scan. The high-level workflow exports profiles in bounded chunks and returns NumPy arrays for plotting. Adaptive searches read scalar results to choose their next evaluation point. Retained CRL results support `with estimate_crl_focus(config) as result:` or explicit `result.close()`. Use `result.numerical_report` for sampling indicators and `result.check_convergence()` for optional grid/window comparisons. See [device memory and transfers](DOCUMENTATION.md#device-memory-and-transfers) for cache limits and synchronization details.
 
 ## Quick start
 

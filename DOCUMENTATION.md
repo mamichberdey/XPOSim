@@ -7,7 +7,7 @@ This guide covers the grid and optical-element API and the high-level CRL workfl
 
 ## Installation into an existing environment
 
-Install XPOSim from a checkout with `python -m pip install --no-deps .`, from GitHub with `python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"`, or from a downloaded wheel with `python -m pip install --no-deps path/to/xposim-0.37.0-py3-none-any.whl`.
+Install XPOSim from a checkout with `python -m pip install --no-deps .`, from GitHub with `python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"`, or from a downloaded wheel with `python -m pip install --no-deps path/to/xposim-0.38.0-py3-none-any.whl`.
 
 Package metadata intentionally declares no runtime dependencies. NumPy must already be installed for every backend, including GPU execution. NumPy and the standard library supply host arrays, interpolation, scalar searches, source quadrature and CPU calculations. SciPy is optional for independent reference tests. GPU calculation additionally uses one of CuPy, Torch or JAX. These frameworks retain their own dependency requirements, including SciPy for JAX distributions. Matplotlib is needed for plots. Dependency versions belong to the surrounding environment. Missing packages are installed explicitly by the user. The `--no-deps` flag also explicitly disables pip dependency resolution.
 
@@ -56,6 +56,74 @@ CuPy, PyTorch and JAX keep propagated fields, Gaussian filtering and metric redu
 Gaussian point-source spectra are cached on the device when they fit the cache budget. CuPy and PyTorch use up to one quarter of available GPU memory, capped at 1 GiB. JAX uses a conservative 64 MiB budget when free device memory cannot be queried. Larger caches use RAM or temporary storage and transfer source batches back to the device during propagation. This bounds memory use for large source quadratures.
 
 Adaptive peak and axial-ROI searches read scalar objective values because each value determines the next position. Geometry validation also reads device validity flags. Explicit backend probes synchronize a small FFT to detect execution failures. Public scalar results and host exports synchronize when requested. These operations remain part of the API's execution model.
+
+### Resource lifetime and numerical reliability
+
+`CRLFocusResult` retains a live propagation session so `plane_at(z)` can reuse
+lens fields and source spectra. Release it explicitly when finished:
+
+```python
+from XPOSim import CRLFocusConfig, estimate_crl_focus
+
+config = CRLFocusConfig(backend="auto")
+with estimate_crl_focus(config) as result:
+    print(result.numerical_report)
+    # Optional: two additional full runs; may be expensive for 2D/source scans.
+    convergence = result.check_convergence(relative_tolerance=0.02)
+    print("Stable within 2%:", convergence.stable)
+    image = result.best_intensity
+    summary = result.summary()
+# image, summary and result.summary() remain usable here.
+```
+
+`close()` is idempotent. It drops session-owned device references and closes
+source-spectrum temporary files. `plane_at()` and `check_convergence()` raise
+`RuntimeError` after closing. Exported NumPy images, metrics and summaries remain
+available. A failed calculation also closes its prepared sessions, including when
+a progress callback raises. Closing does not clear process-wide CuPy/Torch/JAX
+allocator pools. Device arrays retained separately by user code still consume
+memory. Concurrent GPU streams and external mutation of internal arrays are not
+managed by this lifecycle API.
+
+`grid.estimate_memory(n_planes, batch_size=None, return_fields=False,
+source_modes=1)` estimates complex128 field bytes, working bytes, a retained
+field stack and source spectra separately without allocating those fields.
+Working storage uses the automatic batching heuristic of six fields per batch.
+FFT workspaces, framework pools, optical caches and refined detector plans are
+excluded. This is a planning estimate, not a peak VRAM guarantee. The high-level
+workflow emits a `memory` progress event before preparing the incident/lens
+fields. Its numerical report includes the estimate and source-cache location.
+A grid itself already holds coordinate arrays.
+
+`result.numerical_report` contains estimated ideal phase changes per entrance
+sample on each focusing axis, detector pixels per FWHM, boundary-power fractions
+and storage estimates. Phase estimates sum absolute ideal lens and incident
+curvature slopes at pupil edges; they do not bound arbitrary surface errors or
+every internal propagated phase. Boundary power is measured over the outer 5%
+rim, at least one pixel, separately for the detector ROI and central coherent
+exit field. The exit indicator does not measure an entire incoherent ensemble.
+A small detector-boundary fraction alone cannot certify absence of FFT replicas.
+Unresolved FWHM is `None`; a zero-power boundary fraction is `NaN`.
+
+`result.check_convergence()` repeats the same physical setup twice: approximately
+twice as many samples per axis at fixed physical width `N*dx`, then approximately
+twice the width at fixed step. Counts retain their odd/even parity, preserving
+the Fourier boundary convention. It fixes the original axial display interval,
+backend and source quadrature. Peak distance, peak intensity, transmission and
+focusing-axis FWHMs are compared to the original run. All relative changes must
+be finite and within the requested tolerance for `stable=True`; unresolved
+widths fail the check. Temporary results are closed after comparison. In 2D,
+each repeat can require about four times the entrance-grid storage. Refined
+local detector dimensions may also change. Automatic axial ROI selection is not
+retested. The resulting `convergence_report` is included in `summary()`.
+This establishes observed transverse stability for those observables and grids,
+not absolute accuracy, axial-search convergence or source-node convergence.
+
+Standard Gaussian source quadratures are cached by node count and method in a
+bounded, process-local LRU of 16 entries. Cached unit-variance arrays are read-only;
+each source receives independent writable scaled arrays. The first Gauss-Hermite
+preparation still uses a dense NumPy symmetric eigensolve. Large orders retain
+that first-call cost; subsequent sources of another physical size reuse it.
 
 ### Units and array conventions
 

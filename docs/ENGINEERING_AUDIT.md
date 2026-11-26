@@ -89,3 +89,22 @@ Standalone SciPy is no longer a runtime requirement of XPOSim. NumPy and the sta
 Optional SciPy reference tests validate the replacements. Five before/after model comparisons covered line/point focusing, Gaussian quadrature/convolution and crossed lenses. Relative intensity L2 differences at common detector coordinates were at most 3.2e-16, and peak-distance shifts were at most 7.9e-11 m. These observations apply to the recorded small-grid configurations and search tolerances.
 
 Distribution validation additionally installs a NumPy wheel into a fresh environment with no SciPy, then installs XPOSim offline without dependency resolution overrides. It exercises refined detection and both Gaussian-source methods, runs the NumPy-only test suite and verifies preservation of the pre-existing distributions. Source distributions and wheels retain their material resources and legacy import path.
+
+
+## Numerical reliability follow-up in 0.38.0
+
+The additive follow-up implements `CRLNumericalReport`, explicit transverse
+`check_convergence()`, result `close()`/context managers, exception-safe retained
+session cleanup, and complex128 memory estimates before field preparation.
+Gaussian unit-source quadratures have a bounded cache with independent returned
+arrays. Numerical-scale and analytic Gaussian convergence regressions run in CI.
+The physical conventions, default backend order and existing call signatures are
+preserved. See [validation evidence](VALIDATION.md) and the
+[resource contract](../DOCUMENTATION.md#resource-lifetime-and-numerical-reliability).
+
+Remaining limits: first-call high-order quadrature still uses dense eigenvectors;
+phase/boundary indicators are heuristics, and refinement only checks transverse
+observables on two additional grids. Source/axial convergence, real-device peak
+VRAM tests and a broader independent-reference corpus remain roadmap work.
+Rollback can revert the resource/report API commit independently of the numerical
+test/cache commit. The changes add no mandatory dependencies or deprecations.

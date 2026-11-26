@@ -27,8 +27,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install numpy scipy pytest pytest-cov ruff
-      - name: Lint the physical reference suite
-        run: python -m ruff check --isolated tests/test_physics_validation.py
+      - name: Lint physical and numerical reliability suites
+        run: python -m ruff check --isolated tests/test_physics_validation.py tests/test_numerical_stability.py tests/test_focus_reliability.py
       - name: Run CPU regressions and physical references
         run: python -m pytest tests --cov=XPOSim --cov-report=term-missing --cov-report=xml
       - uses: actions/upload-artifact@v4

@@ -93,3 +93,28 @@ trials each averaged 1000 calls with sigma=3 um at the same order; timing includ
 scaling and copying the returned arrays. These measure quadrature preparation,
 not full propagation, GPU execution or performance on a laptop. Large first-call
 orders still need a more scalable eigensolver before claiming improved complexity.
+
+
+## Retained CRL reliability and resource contract in 0.38.0
+
+`tests/test_focus_reliability.py` checks storage estimates against explicit byte
+counts, preflight progress ordering, phase/FWHM report dimensions, boundary-rim
+union fractions including single-pixel/dark arrays, and JSON-compatible finite
+reports. Context-manager and explicit-close tests force source spectra into a
+temporary file. They verify file closure, dropped array references, repeatable
+close, surviving exported data/summaries and rejected post-close plane requests.
+Progress exceptions are injected during source preparation, sampling, finalizing
+and completion to check deterministic cleanup, including partial construction.
+
+Convergence tests cover even and odd 1D grids and a nonsquare mixed-parity 2D
+grid. They check retained physical widths/steps and parity, original-result
+integrity, closure of both temporary sessions, and per-observable stability
+criteria. Missing widths cannot certify stability. Failed refinement leaves the
+original session usable. These tests verify the convergence API's contract; the
+analytic Gaussian case above separately establishes numerical improvement for a
+known physical solution. The API leaves source quadrature and axial search
+convergence to separate tests by design.
+
+Closing releases owned references; allocator-reserved VRAM is not a leak test.
+Actual-GPU allocation and timing checks remain hardware-dependent. No GPU memory
+or speed conclusion is inferred from CPU test injection.
