@@ -51,13 +51,15 @@ jobs:
         with:
           python-version: '3.12'
       - name: Prepare build tools and existing numerical environment
-        run: python -m pip install build setuptools wheel numpy scipy ruff
+        run: python -m pip install build setuptools wheel numpy ruff
       - name: Lint distribution checks
         run: python -m ruff check --isolated tests/check_distribution.py
       - name: Build source archive and wheel
         run: python -m build
-      - name: Verify offline installation and dependency preservation
-        run: python tests/check_distribution.py dist
+      - name: Prepare NumPy-only test environment wheel
+        run: python -m pip download --only-binary=:all: --no-deps numpy --dest build/runtime-wheels
+      - name: Verify offline installation and NumPy-only calculations
+        run: python tests/check_distribution.py dist build/runtime-wheels
       - uses: actions/upload-artifact@v4
         with:
           name: distributions-${{ matrix.os }}

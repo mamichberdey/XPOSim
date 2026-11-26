@@ -9,11 +9,11 @@ This guide covers the grid and optical-element API and the high-level CRL workfl
 
 Install XPOSim from a checkout with `python -m pip install --no-deps .`, from GitHub with `python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"`, or from a downloaded wheel with `python -m pip install --no-deps path/to/xposim-0.36.0-py3-none-any.whl`.
 
-Package metadata intentionally declares no runtime dependencies. NumPy and SciPy must already be installed for every backend, including GPU execution. NumPy supplies host arrays and CPU calculations, while SciPy supplies interpolation, optimization and numerical helpers. GPU calculation additionally uses one of CuPy, Torch or JAX. Matplotlib is needed for plots. Dependency versions belong to the surrounding environment. Missing packages are installed explicitly by the user. The `--no-deps` flag also explicitly disables pip dependency resolution.
+Package metadata intentionally declares no runtime dependencies. NumPy must already be installed for every backend, including GPU execution. NumPy and the standard library supply host arrays, interpolation, scalar searches, source quadrature and CPU calculations. SciPy is optional for independent reference tests. GPU calculation additionally uses one of CuPy, Torch or JAX. These frameworks retain their own dependency requirements, including SciPy for JAX distributions. Matplotlib is needed for plots. Dependency versions belong to the surrounding environment. Missing packages are installed explicitly by the user. The `--no-deps` flag also explicitly disables pip dependency resolution.
 
 A wheel installs the module and its three material tables directly. Source builds use setuptools in an isolated temporary build environment, which can download build tools. For an offline source installation, provide setuptools 61 or newer and wheel in the environment and add `--no-build-isolation`. The import remains `import XPOSim`, including outside the source checkout. Single-file use with an adjacent `xray_material_data/` directory also remains supported.
 
-Maintainers can build both formats with `python -m build`. Run `python tests/check_distribution.py dist` from an interpreter with NumPy, SciPy, setuptools and wheel available to validate metadata, material resources and offline installation. CI tests wheels in bare and populated environments and source archives with preinstalled build tools, comparing every other installed distribution before and after installation.
+Maintainers can build both formats with `python -m build`. Run `python tests/check_distribution.py dist` from an interpreter with NumPy, setuptools and wheel available to validate metadata, material resources and offline installation. CI tests wheels in bare and populated environments and source archives with preinstalled build tools, comparing every other installed distribution before and after installation.
 
 
 ## Contents
@@ -1715,7 +1715,7 @@ ValueError when a 2D map is used on 1D or a 1D map on 2D; interpolation errors p
 
 **Notes**
 
-Uses CPU NumPy/SciPy interpolation, then transfers the result to the grid backend.
+Uses rectilinear bilinear interpolation on the selected calculation backend.
 
 **See also:** [`SurfaceError`](#api-surfaceerror).
 

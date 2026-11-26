@@ -2,8 +2,11 @@
 import unittest
 
 import numpy as np
-from scipy.constants import c, elementary_charge, h
-from scipy.special import fresnel
+
+try:
+    from scipy.special import fresnel
+except ImportError:
+    fresnel = None
 
 import XPOSim as xpos
 
@@ -63,6 +66,7 @@ class PhysicsValidationTests(unittest.TestCase):
         measured = xpos.full_width_half_max(abs(actual)**2, grid.x)
         self.assertAlmostEqual(measured / expected_width, 1., delta=0.002)
 
+    @unittest.skipUnless(fresnel is not None, "SciPy Fresnel reference is optional")
     def test_slit_fresnel_quadrature_convergence(self):
         # Independent Fresnel integral, evaluated on a local detector to exclude
         # FFT window wraparound. Slit boundaries are cell edges at +/-2 um.
@@ -113,5 +117,5 @@ class PhysicsValidationTests(unittest.TestCase):
         self.assertEqual(energy, 12.)
         # The current API uses rounded hc. Quantify its accuracy without silently
         # changing a constant that affects all established numerical results.
-        codata = h * c / (12e3 * elementary_charge)
+        codata = 6.62607015e-34 * 299792458 / (12e3 * 1.602176634e-19)
         self.assertAlmostEqual(wavelength / codata, 1., delta=2e-6)

@@ -153,7 +153,6 @@ dependencies:
   - re2=2025.11.05
   - readline=8.3
   - scikit-image=0.26.0
-  - scipy=1.17.1
   - setuptools=84.0.0
   - six=1.17.0
   - snappy=1.2.2

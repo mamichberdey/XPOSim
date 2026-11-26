@@ -1,7 +1,7 @@
 """Validate built distributions and installation without dependency resolution.
 
-Run with NumPy and SciPy already installed in this interpreter.
-Usage: python tests/check_distribution.py dist
+Run with NumPy already available in the base interpreter.
+Usage: python tests/check_distribution.py dist [numpy-wheel-directory]
 """
 import hashlib
 import json
@@ -36,11 +36,18 @@ def installed(python, cwd, env):
             if row["name"].lower() != "xposim"}
 
 
-def check_install(distribution, version, directory, env, inherit):
+def check_install(distribution, version, directory, env, inherit, numpy_wheel=None):
     source_archive = distribution.suffix != ".whl"
-    target = directory / ("source" if source_archive else "existing" if inherit else "bare")
+    label = "existing" if inherit else "bare"
+    if source_archive:
+        label = "source"
+    if numpy_wheel is not None:
+        label = "numpy-only"
+    target = directory / label
     venv.EnvBuilder(with_pip=True, system_site_packages=inherit).create(target)
     python = target / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if numpy_wheel is not None:
+        run(python, ["-m", "pip", "install", "--no-index", str(numpy_wheel)], directory, env)
     before = installed(python, directory, env)
     # Deliberately omit --no-deps to verify the package's ordinary pip behavior.
     # No package index is available to either test installation.
@@ -56,10 +63,17 @@ import sys
 assert not metadata.requires("XPOSim")
 assert metadata.version("XPOSim") == sys.argv[1]
 '''
-    if inherit:
+    if numpy_wheel is not None:
+        check += "from importlib.util import find_spec\nassert find_spec('scipy') is None\n"
+    if inherit or numpy_wheel is not None:
         check += '''
+import importlib.abc
+class BlockScipy(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] == "scipy":
+            raise ModuleNotFoundError(fullname)
+sys.meta_path.insert(0, BlockScipy())
 import numpy as np
-import scipy
 import XPOSim as xpos
 assert Path(xpos.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 assert xpos.__version__ == metadata.version("XPOSim")
@@ -72,6 +86,13 @@ field = np.exp(-(grid.x/1e-6)**2).astype(complex)
 actual = grid.propagate(field, .03, 2*np.pi/1e-10)
 np.testing.assert_allclose(np.sum(abs(actual)**2), np.sum(abs(field)**2), rtol=1e-12)
 assert np.isfinite(xpos.beam_metrics(actual, grid).max_intensity)
+for method in ("points", "convolution"):
+    config = xpos.CRLFocusConfig(backend="numpy", grid_dimension=1, grid_points=128,
+        scan_points=7, adaptive_window=False, accuracy="refined",
+        source_type="gaussian", source_method=method, source_points=3)
+    result = xpos.estimate_crl_focus(config)
+    assert np.isfinite(result.best_intensity).all() and result.transmission > 0
+assert "scipy" not in sys.modules
 '''
     else:
         check += '''
@@ -87,6 +108,14 @@ else:
 '''
     run(python, ["-c", check, version], directory, env)
     assert installed(python, directory, env) == before, "Import changed the environment"
+    if numpy_wheel is not None:
+        suite = """
+import sys, unittest
+result = unittest.TextTestRunner().run(unittest.defaultTestLoader.discover(sys.argv[1]))
+print(f"NumPy-only suite: {result.testsRun} tests, {len(result.skipped)} skips")
+sys.exit(not result.wasSuccessful())
+"""
+        print(run(python, ["-c", suite, str(Path(__file__).resolve().parent)], directory, env))
 
 
 def main():
@@ -120,7 +149,11 @@ def main():
         for inherit in (False, True):
             check_install(wheel, metadata["Version"], directory, env, inherit)
         check_install(archives[0], metadata["Version"], directory, env, inherit=True)
-    print("Wheel/sdist, material tables and all three offline installation scenarios passed")
+        if len(sys.argv) > 2:
+            numpy_wheel, = Path(sys.argv[2]).resolve().glob("numpy-*.whl")
+            check_install(wheel, metadata["Version"], directory, env, inherit=False,
+                          numpy_wheel=numpy_wheel)
+    print("Distribution, resources, dependency preservation and SciPy-free calculations passed")
 
 
 if __name__ == "__main__":

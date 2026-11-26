@@ -1,6 +1,6 @@
 # Reference validation suite, initial revision
 
-Run from the repository root with NumPy and SciPy installed.
+Run from the repository root with NumPy installed. SciPy is optional for the independent Fresnel-integral reference and numerical-helper comparisons. Those reference cases are skipped when SciPy is absent.
 
 ```sh
 python -m unittest discover -s tests -p test_physics_validation.py
@@ -8,7 +8,7 @@ python -m pytest tests --cov=XPOSim --cov-report=term-missing
 python -m ruff check --isolated tests/test_physics_validation.py
 ```
 
-The first command has no optional GPU or test-framework dependency. The other commands require pytest, pytest-cov and Ruff. The CI workflow installs these development tools separately.
+The first command uses unittest and can run without optional GPU packages. The Fresnel-integral case uses SciPy when available. The other commands require pytest, pytest-cov and Ruff. The CI workflow installs these development tools separately.
 
 ## Cases implemented in the first audit package
 
@@ -21,7 +21,7 @@ The first command has no optional GPU or test-framework dependency. The other co
 | `slit_fresnel_quadrature_convergence` | Uniform slit of width 4 um, lambda=0.1 nm, z=20 mm. Independent SciPy Fresnel integrals provide the complex reference at 61 detector points. Midpoint integration is repeated at 40/20 nm. The library evaluates propagation onto that detector from a 160 um window. | Chirp-z field absolute `0.004`. Independent midpoint integration error decreases by more than a factor of 3 when halving the step. |
 | `crl_material_transmission` | Single parabolic interaction, R=50 um, bridge=2 um, delta=3e-6, beta=2e-8. Compute thickness directly as `bridge+x²/R`. Check complex phase and Beer–Lambert intensity loss independently. | Absolute `1e-14` in transmission and relative incident intensity units. |
 | `sampled_plane_wave_eigenmode` | 64/65 nodes, a wavevector exactly on the grid's sampled frequency axis. Propagation must multiply the wave by `exp(-iz*q²/(2k))`. | Field absolute `1e-12`. This also documents even-grid half-integer frequency behavior. |
-| `energy_wavelength_units` | Compare 12 keV conversion against `h*c/(energy in joules)` using SciPy SI constants. | Relative `2e-6`, reflecting the legacy rounded hc constant. |
+| `energy_wavelength_units` | Compare 12 keV conversion against `h*c/(energy in joules)` using the exact SI defining constants h, c and e. | Relative `2e-6`, reflecting the legacy rounded hc constant. |
 
 Gaussian and thin-lens expressions follow directly from the Fresnel kernel by completing the square. For `E0=exp(-a*x²)`, propagation gives `E_z=(1+2iaz/k)^(-1/2)*exp[-a*x²/(1+2iaz/k)]`, with the square-root branch continuous from z=0. A thin lens adds `i*k/(2*f)` to a. These equations supply an independent calculation of the complex field.
 
@@ -44,3 +44,14 @@ Each published case should contain a JSON manifest and an NPZ data file, loaded 
 Store complex reference fields or an explicitly justified intensity-only observable. Use dimensionless relative errors plus physically meaningful absolute floors. Compare phase only where reference amplitude is resolved. Separate an independent analytic/published reference from a frozen library regression output in the manifest. Golden data updates require scientific review and a recorded reason.
 
 Later cases must include finite-stack CRL focus against independent ABCD/Gaussian propagation, aperture Airy/sinc limits, library grid/window convergence, partially coherent quadrature convergence and actual GPU parity. Zone plates and gratings need explicit sampled phase/transmission models before specialized public element classes are promised. A published-paper comparison needs verified parameters and reference data with redistribution rights.
+
+
+## NumPy numerical core in 0.37.0
+
+The runtime uses device-side bilinear interpolation, radix-smooth FFT padding, separable zero-padded NumPy Gaussian convolution, bounded Brent minimization and safeguarded bracketed inverse interpolation for roots. Gaussian source modes use a Golub-Welsch Jacobi matrix with diagonal zero and off-diagonal entries `sqrt(1), ..., sqrt(n-1)`. Squared first-row eigenvector entries give normalized Gaussian weights. Equal-probability nodes use `statistics.NormalDist.inv_cdf` with explicit infinite endpoints and variance restoration.
+
+`tests/test_numpy_numerics.py` checks these helpers against analytic invariants and, when SciPy is present, independent SciPy implementations. The source quadrature uses a dense NumPy symmetric eigensolve, whose preparation cost grows with the quadrature order. Source-node convergence should still be checked when increasing the mode count.
+
+A comparison of 0.36.0 with the replacement implementation used five 128-sample configurations, including Gaussian point/convolution sources and crossed lenses. At common detector distances, relative intensity L2 differences were at most `3.2e-16`. Peak-distance shifts were at most `7.9e-11 m`, within the configured adaptive-search tolerance. These CPU checks assess numerical agreement. They do not establish GPU performance of the new interpolation path.
+
+The energy-conversion reference uses the exact SI values h=6.62607015e-34 J s, c=299792458 m/s and e=1.602176634e-19 C. [SI defining constants](https://www.bipm.org/en/measurement-units/si-defining-constants)

@@ -80,3 +80,12 @@ These are measurable project goals. Current evidence supports an evolving scient
 PEP 517/621 build metadata now produces a pure-Python wheel and source archive, preserving `import XPOSim` and the adjacent material-resource layout. Runtime dependency metadata is empty. Installation relies on the user's existing numerical packages. Distribution checks cover resource hashes, offline wheel installation in bare and populated environments, source installation with existing build tools, and preservation of all other installed distributions. CI includes distribution checks on Linux and Windows, and CPU validation now includes Python 3.10.
 
 The flat module layout is retained for this incremental packaging change. Src-layout migration, broader typing/lint gates, licensing and attribution decisions remain separate roadmap items.
+
+
+## NumPy-only core in 0.37.0
+
+Standalone SciPy is no longer a runtime requirement of XPOSim. NumPy and the standard library supply interpolation, scalar optimization/root searches, FFT-size selection, Gaussian-source quadrature and CPU Gaussian smoothing. Backend-native device implementations remain available. JAX's own distribution has separate dependency requirements, including SciPy.
+
+Optional SciPy reference tests validate the replacements. Five before/after model comparisons covered line/point focusing, Gaussian quadrature/convolution and crossed lenses. Relative intensity L2 differences at common detector coordinates were at most 3.2e-16, and peak-distance shifts were at most 7.9e-11 m. These observations apply to the recorded small-grid configurations and search tolerances.
+
+Distribution validation additionally installs a NumPy wheel into a fresh environment with no SciPy, then installs XPOSim offline without dependency resolution overrides. It exercises refined detection and both Gaussian-source methods, runs the NumPy-only test suite and verifies preservation of the pre-existing distributions. Source distributions and wheels retain their material resources and legacy import path.

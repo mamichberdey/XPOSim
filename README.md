@@ -23,17 +23,17 @@ Try XPOSim for X-ray focusing with a compound refractive lens.
 
 Use Python 3.10 or newer and activate the environment where you will run XPOSim.
 
-### 1. Prepare the required numerical packages
+### 1. Prepare NumPy
 
-**NumPy and SciPy are required for every backend, including GPU calculations.** NumPy provides host arrays and CPU calculations. SciPy provides interpolation, optimization and other numerical helpers used by the library.
+**NumPy is required for every backend, including GPU calculations.** XPOSim uses NumPy and the Python standard library for host-side interpolation, scalar searches, source quadrature and CPU calculations.
 
-If both packages are already installed, use the existing installations. In a new environment, install them with your package manager, for example with pip.
+If NumPy is already installed, use the existing installation. In a new environment, install it with your package manager, for example with pip.
 
 ```sh
-python -m pip install numpy scipy
+python -m pip install numpy
 ```
 
-For an existing environment with a missing package, follow its package manager's compatibility requirements. Official installation guides are available for both packages. [NumPy](https://numpy.org/install/) · [SciPy](https://scipy.org/install/)
+For an existing environment with a missing NumPy installation, follow its package manager's compatibility requirements. [NumPy installation guide](https://numpy.org/install/)
 
 ### 2. Install XPOSim
 
@@ -41,17 +41,17 @@ For an existing environment with a missing package, follow its package manager's
 python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"
 ```
 
-XPOSim leaves dependency management to your environment. Its package metadata declares no runtime dependencies, and `--no-deps` explicitly disables dependency resolution. The required numerical packages from step 1 must be available when importing XPOSim.
+XPOSim leaves dependency management to your environment. Its package metadata declares no runtime dependencies, and `--no-deps` explicitly disables dependency resolution. NumPy from step 1 must be available when importing XPOSim.
 
 The material tables are included, and the public import is `import XPOSim`. For wheel, local-checkout and offline source installations, see the installation guide. [Other installation methods](DOCUMENTATION.md#installation-into-an-existing-environment)
 
-**Plotting is optional.** Install Matplotlib with `python -m pip install matplotlib` to use plotting helpers and plotting examples. The quick start below prints its results and works with the numerical packages from step 1.
+**Plotting is optional.** Install Matplotlib with `python -m pip install matplotlib` to use plotting helpers and plotting examples. The quick start below prints its results and works with NumPy from step 1.
 
 ### 3. Choose CPU or GPU execution
 
-For **CPU calculations**, the required NumPy and SciPy installations are sufficient. Select `backend="numpy"`.
+For **CPU calculations**, NumPy is sufficient. Select `backend="numpy"`.
 
-For **GPU calculations**, additionally install **one** of CuPy, PyTorch or JAX with GPU support compatible with your system and driver. NumPy and SciPy are still required. Select the corresponding backend on a grid or in `CRLFocusConfig`.
+For **GPU calculations**, additionally install **one** of CuPy, PyTorch or JAX with GPU support compatible with your system and driver. NumPy is still required. GPU frameworks have their own dependency requirements; JAX installations can require SciPy. Select the corresponding backend on a grid or in `CRLFocusConfig`.
 
 | Compute backend | Setting | Installation |
 | --- | --- | --- |
@@ -77,7 +77,6 @@ from importlib import import_module
 import platform
 
 import numpy as np
-import scipy
 import XPOSim as xpos
 
 requested = "auto"
@@ -91,7 +90,7 @@ for name in ("cupy", "torch", "jax", "numpy"):
 backend = available[0] if requested == "auto" else xpos.select_backend(requested)
 device = "CPU" if backend == "numpy" else "GPU"
 print(f"XPOSim {xpos.__version__} | Python {platform.python_version()} | {platform.system()}")
-print(f"Core packages: NumPy {np.__version__} | SciPy {scipy.__version__}")
+print(f"Core package: NumPy {np.__version__}")
 print("Available backends:", ", ".join(available))
 print(f"Selected: {backend} {import_module(backend).__version__} ({device})")
 
@@ -229,7 +228,7 @@ The modulus removes the phase from the displayed intensity, but the phase remain
 
 ## Scientific validation and development
 
-The initial independent reference suite checks complex Gaussian propagation, thin-lens focusing, slit Fresnel diffraction, Fourier normalization, material attenuation and photon-energy units. Run `python -m unittest discover -s tests -p test_physics_validation.py` with NumPy and SciPy installed. Tests use documented setups and numerical tolerances.
+The initial independent reference suite checks complex Gaussian propagation, thin-lens focusing, slit Fresnel diffraction, Fourier normalization, material attenuation and photon-energy units. Run `python -m unittest discover -s tests -p test_physics_validation.py` with NumPy installed. Optional SciPy reference checks include slit Fresnel integrals and comparisons of the numerical helpers. Tests use documented setups and numerical tolerances.
 
 - [Physical and numerical conventions](docs/PHYSICAL_CONVENTIONS.md)
 - [Reference cases and test tolerances](docs/VALIDATION.md)

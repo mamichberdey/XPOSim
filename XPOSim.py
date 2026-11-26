@@ -25,6 +25,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache, partial
 from numbers import Integral
+from statistics import NormalDist
 import os
 from pathlib import Path
 import re
@@ -37,7 +38,6 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 import warnings
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 
 try:  # CuPy is optional; it is the preferred backend when available.
     import cupy as cp
@@ -47,7 +47,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.36.0"
+__version__ = "0.37.0"
 
 
 __all__ = [
@@ -119,13 +119,6 @@ class _JaxArrays:
 
     def __getattr__(self, name):
         return getattr(self.np, name)
-
-    def interp_map(self, values, x_axis, y_axis, grid, fill):
-        from jax.scipy.interpolate import RegularGridInterpolator
-        interp = RegularGridInterpolator(
-            (self.asarray(y_axis), self.asarray(x_axis)), self.asarray(values), fill_value=fill)
-        points = self.stack((grid.y, grid.x), axis=-1)
-        return interp(points)
 
     def gaussian_filter(self, image, sigmas):
         for axis, sigma in enumerate(np.atleast_1d(sigmas)):
@@ -731,14 +724,162 @@ def _ifft2d(array: Any, dx: float, dy: float) -> Any:
     return _transform2d(array, dx, dy, True)
 
 
+@lru_cache(maxsize=128)
+def _next_fast_len(target, radices=(2, 3, 5, 7, 11)):
+    """Smallest radix-smooth FFT length at least target, using integer arithmetic."""
+    target = max(1, int(target))
+    best = 1 << (target-1).bit_length()
+
+    def search(product, index):
+        nonlocal best
+        if index == len(radices):
+            quotient = (target+product-1)//product
+            candidate = product * (1 << (quotient-1).bit_length())
+            best = min(best, candidate)
+            return
+        while product < best:
+            search(product, index+1)
+            product *= radices[index]
+
+    search(1, 1)
+    return best
+
+
+def _numpy_gaussian_filter(image, sigmas):
+    """Separable normalized Gaussian, zero padding, and a five-sigma radius."""
+    for axis, sigma in enumerate(np.atleast_1d(sigmas)):
+        radius = int(5*sigma+.5)
+        if radius:
+            offsets = np.arange(-radius, radius+1, dtype=float)
+            kernel = np.exp(-.5*(offsets/sigma)**2)
+            kernel /= kernel.sum()
+            # Larger offsets multiply only the zero-padded exterior. Preserve
+            # the full-kernel normalization while trimming those unused terms.
+            used_radius = min(radius, image.shape[axis]-1)
+            kernel = kernel[radius-used_radius:radius+used_radius+1]
+            padding = [(0, 0)]*image.ndim
+            padding[axis] = (used_radius, used_radius)
+            padded = np.pad(image, padding)
+            image = np.apply_along_axis(
+                lambda line: np.convolve(line, kernel, mode="valid"), axis, padded)
+    return image
+
+
+@dataclass(frozen=True)
+class _ScalarSearchResult:
+    x: float
+    converged: bool
+
+
+def _bounded_minimum(objective, lower, upper, tolerance, max_evaluations):
+    """Brent's bounded parabolic/golden-section search on a scalar objective."""
+    golden = (3-np.sqrt(5.))/2
+    x = previous = older = lower + golden*(upper-lower)
+    value = previous_value = older_value = float(objective(x))
+    step = history = 0.
+    for _ in range(max(0, max_evaluations-1)):
+        midpoint = (lower+upper)/2
+        accuracy = np.sqrt(np.finfo(float).eps)*abs(x) + tolerance/3
+        if abs(x-midpoint) <= 2*accuracy - (upper-lower)/2:
+            return _ScalarSearchResult(float(x), True)
+        accepted = False
+        if abs(history) > accuracy:
+            r = (x-previous)*(value-older_value)
+            q = (x-older)*(value-previous_value)
+            numerator = (x-older)*q - (x-previous)*r
+            denominator = 2*(q-r)
+            if denominator > 0:
+                numerator = -numerator
+            denominator = abs(denominator)
+            old_history, history = history, step
+            accepted = (abs(numerator) < abs(denominator*old_history/2)
+                        and denominator*(lower-x) < numerator < denominator*(upper-x))
+            if accepted:
+                step = numerator/denominator
+                if min(x+step-lower, upper-x-step) < 2*accuracy:
+                    step = np.copysign(accuracy, midpoint-x)
+        if not accepted:
+            history = (upper if x < midpoint else lower)-x
+            step = golden*history
+        trial = x + np.copysign(max(abs(step), accuracy), step if step else midpoint-x)
+        trial_value = float(objective(trial))
+        if trial_value <= value:
+            if trial < x:
+                upper = x
+            else:
+                lower = x
+            older, older_value = previous, previous_value
+            previous, previous_value = x, value
+            x, value = trial, trial_value
+        else:
+            if trial < x:
+                lower = trial
+            else:
+                upper = trial
+            if trial_value <= previous_value or previous == x:
+                older, older_value = previous, previous_value
+                previous, previous_value = trial, trial_value
+            elif trial_value <= older_value or older == x or older == previous:
+                older, older_value = trial, trial_value
+    return _ScalarSearchResult(float(x), False)
+
+
+def _bracketed_root(objective, left, right, tolerance, maxiter=100):
+    """Safeguarded inverse interpolation with a retained sign-changing bracket."""
+    a, b = float(left), float(right)
+    fa, fb = float(objective(a)), float(objective(b))
+    if not np.isfinite(fa) or not np.isfinite(fb):
+        raise ValueError("Root bracket values must be finite.")
+    if fa == 0:
+        return _ScalarSearchResult(a, True)
+    if fb == 0:
+        return _ScalarSearchResult(b, True)
+    if np.signbit(fa) == np.signbit(fb):
+        raise ValueError("Root endpoints must bracket a sign change.")
+    if abs(fa) < abs(fb):
+        a, b, fa, fb = b, a, fb, fa
+    c, fc, d = a, fa, a
+    bisected = True
+    for _ in range(maxiter):
+        accuracy = tolerance + 4*np.finfo(float).eps*abs(b)
+        if fb == 0 or abs(b-a) <= accuracy:
+            return _ScalarSearchResult(b, True)
+        scale = max(abs(fa), abs(fb), abs(fc))
+        va, vb, vc = fa/scale, fb/scale, fc/scale
+        if va != vb and va != vc and vb != vc:
+            trial = (a*(vb/(va-vb))*(vc/(va-vc)) + b*(va/(vb-va))*(vc/(vb-vc))
+                     + c*(va/(vc-va))*(vb/(vc-vb)))
+        elif va != vb:
+            trial = b-(vb/(vb-va))*(b-a)
+        else:
+            trial = (a+b)/2
+        edge = (3*a+b)/4
+        unsafe = (not min(edge,b) < trial < max(edge,b)
+                  or abs(trial-b) >= abs(b-c if bisected else c-d)/2
+                  or abs(b-c if bisected else c-d) < accuracy)
+        if unsafe:
+            trial = (a+b)/2
+        value = float(objective(trial))
+        if not np.isfinite(value):
+            raise ValueError("Root objective must be finite.")
+        d, c, fc = c, b, fb
+        if np.signbit(fa) != np.signbit(value):
+            b, fb = trial, value
+        else:
+            a, fa = trial, value
+        if abs(fa) < abs(fb):
+            a, b, fa, fb = b, a, fb, fa
+        bisected = unsafe
+    return _ScalarSearchResult(b, fb == 0 or abs(b-a) <= tolerance+4*np.finfo(float).eps*abs(b))
+
+
 class _InverseFourierAxis:
     """Cached Bluestein/CZT quadrature of a continuous inverse Fourier axis."""
     def __init__(self, n, q0, dq, output_axis, xp):
-        from scipy.fft import next_fast_len
         self.xp=xp
         self.n=n
         self.m=len(output_axis)
-        self.length=next_fast_len(n+self.m-1)
+        self.length=_next_fast_len(n+self.m-1)
         first=output_axis[0]
         step=output_axis[1]-output_axis[0]
         angle=dq*step
@@ -1440,28 +1581,19 @@ class InterpolatedThicknessDefect(ThicknessDefect):
 
 def _interpolate_map(values: Any, x_axis: Any, y_axis: Any,
                      grid: BaseGrid, fill_value: float) -> Any:
-    """Interpolate a 2D map on its calculation backend when CuPy supports it."""
+    """Bilinearly interpolate a rectilinear map on the calculation device."""
     xp = grid.xp
-    if grid.backend in {"torch", "jax"}:
+    if grid.backend == "torch":
         return xp.interp_map(values, x_axis, y_axis, grid, fill_value)
-    interpolator_type = RegularGridInterpolator
-    if grid.backend == "cupy":
-        try:
-            from cupyx.scipy.interpolate import RegularGridInterpolator as interpolator_type
-        except ImportError:
-            # Older CuPy releases can still use the CPU interpolation fallback.
-            xp = np
-    interpolator = interpolator_type(
-        (xp.asarray(y_axis), xp.asarray(x_axis)), xp.asarray(values),
-        method="linear", bounds_error=False, fill_value=fill_value,
-    )
-    if xp is np and grid.backend == "cupy":
-        x_map, y_map = np.meshgrid(_centered_coordinates(grid.nx, grid.dx, np),
-                                   _centered_coordinates(grid.ny, grid.dy, np))
-    else:
-        x_map, y_map = grid.x, grid.y
-    points = xp.stack((y_map.ravel(), x_map.ravel()), axis=-1)
-    return grid.xp.asarray(interpolator(points).reshape(grid.shape))
+    x, y, data = map(xp.asarray, (x_axis, y_axis, values))
+    i = xp.clip(xp.searchsorted(x, grid.x_axis), 1, len(x)-1)
+    j = xp.clip(xp.searchsorted(y, grid.y_axis), 1, len(y)-1)
+    wx = (grid.x_axis-x[i-1])/(x[i]-x[i-1])
+    wy = (grid.y_axis-y[j-1])/(y[j]-y[j-1])
+    rows = data[:, i-1] + wx*(data[:, i]-data[:, i-1])
+    result = rows[j-1] + wy[:, None]*(rows[j]-rows[j-1])
+    inside = (grid.x >= x[0]) & (grid.x <= x[-1]) & (grid.y >= y[0]) & (grid.y <= y[-1])
+    return xp.where(inside, result, fill_value)
 
 
 class SurfaceError(_Configured):
@@ -2653,7 +2785,6 @@ def find_peak_intensity_distance(peak_intensity: Callable[[float], float], initi
     The maximized quantity is the transverse peak intensity at each distance,
     not minimum FWHM or a geometrical imaging condition.
     """
-    from scipy.optimize import minimize_scalar
     _validate_positive("initial_z_m", initial_z_m)
     _validate_count("max_evaluations", max_evaluations, 8)
     bounds = _validated_distances(bounds_m or (0.0, 3 * initial_z_m), nonnegative=True)
@@ -2710,12 +2841,11 @@ def find_peak_intensity_distance(peak_intensity: Callable[[float], float], initi
                     break
                 a, b, c = b, c, min(hi, c+step)
         if bracketed:
-            optimized = minimize_scalar(lambda z: -evaluate(z), bounds=(a, c),
-                                        method="bounded", options={"xatol": tolerance,
-                                        "maxiter": max_evaluations-len(cache)})
-            success = bool(optimized.success)
+            optimized = _bounded_minimum(lambda z: -evaluate(z), a, c, tolerance,
+                                         max_evaluations-len(cache))
+            success = bool(optimized.converged)
             evaluate(optimized.x)
-            message = "A local peak was bracketed and refined." if success else str(optimized.message)
+            message = "A local peak was bracketed and refined." if success else "The refinement evaluation budget was exhausted."
     except BudgetReached:
         pass
     if not cache:
@@ -2739,7 +2869,6 @@ def find_numerical_focus(*args, **kwargs) -> PeakIntensitySearchResult:
 def _peak_z_roi(objective: Callable[[float], float], peak: PeakIntensitySearchResult,
                   bounds: tuple[float, float], level: float) -> tuple[float, float]:
     """Find the connected peak-intensity ROI by expanding and root refinement."""
-    from scipy.optimize import brentq
     if peak.intensity <= 0:
         return bounds
     target = level * peak.intensity
@@ -2756,8 +2885,11 @@ def _peak_z_roi(objective: Callable[[float], float], peak: PeakIntensitySearchRe
             value = objective(outside)
             if value <= target:
                 a, b = sorted((inside, outside))
-                crossings.append(float(brentq(lambda z: objective(z)-target, a, b,
-                                               xtol=max(1e-9, initial*1e-3))))
+                crossing = _bracketed_root(lambda z: objective(z)-target, a, b,
+                                            max(1e-9, initial*1e-3))
+                if not crossing.converged:
+                    raise RuntimeError("The axial ROI root did not converge.")
+                crossings.append(crossing.x)
                 break
             if outside == limit:
                 crossings.append(float(limit))
@@ -3382,11 +3514,10 @@ def _gaussian_source_quadrature(sigma, count, *, equal_probability=False):
     if sigma == 0:
         return np.array([0.]), np.array([1.])
     if equal_probability:
-        from scipy.special import ndtri
-
         # Each cell contains the same probability. Its Gaussian centroid gives
         # much finer spacing in the bright core than low-order Hermite nodes.
-        edges=ndtri(np.linspace(0.,1.,count+1))
+        normal = NormalDist()
+        edges = np.r_[-np.inf, [normal.inv_cdf(i/count) for i in range(1, count)], np.inf]
         density=np.exp(-.5*edges**2)/np.sqrt(2*np.pi)
         nodes=count*(density[:-1]-density[1:])
         nodes=.5*(nodes-nodes[::-1])
@@ -3394,10 +3525,14 @@ def _gaussian_source_quadrature(sigma, count, *, equal_probability=False):
         # the specified source variance before propagating the point modes.
         nodes*=sigma/np.sqrt(np.mean(nodes**2))
         return nodes, np.full(count,1./count)
-    from scipy.special import roots_hermitenorm
-
-    nodes,weights=roots_hermitenorm(count)
-    return nodes*sigma,weights/np.sum(weights)
+    # Golub-Welsch Jacobi matrix for probabilists' Hermite polynomials.
+    off_diagonal = np.sqrt(np.arange(1, count, dtype=float))
+    jacobi = np.diag(off_diagonal, 1) + np.diag(off_diagonal, -1)
+    nodes, vectors = np.linalg.eigh(jacobi)
+    weights = vectors[0]**2
+    nodes = (nodes-nodes[::-1])/2
+    weights = (weights+weights[::-1])/2
+    return nodes*sigma, weights/weights.sum()
 
 
 class _CRLFocusSession:
@@ -3803,9 +3938,8 @@ class _CRLFocusSession:
             return self.xp.gaussian_filter(image, sigmas)
         if self.grid.backend=="cupy":
             from cupyx.scipy.ndimage import gaussian_filter
-        else:
-            from scipy.ndimage import gaussian_filter
-        return gaussian_filter(image,sigmas,mode="constant",cval=0.0,truncate=5.0)
+            return gaussian_filter(image,sigmas,mode="constant",cval=0.0,truncate=5.0)
+        return _numpy_gaussian_filter(image, sigmas)
 
     def iter_intensities(self,z_values,progress=None):
         if self._point_model:
@@ -3905,7 +4039,6 @@ class EqualFWHMPlane:
 
 def _find_equal_fwhm_plane(z_values, widths, reference_z, measure, *, max_evaluations=48):
     """Refine sampled crossings and tangencies using the full-source intensity."""
-    from scipy.optimize import brentq, minimize_scalar
 
     tolerance = 1e-3  # Fraction of the larger FWHM at the verified match.
     valid = np.all(np.isfinite(widths) & (widths > 0), axis=1)
@@ -3960,13 +4093,11 @@ def _find_equal_fwhm_plane(z_values, widths, reference_z, measure, *, max_evalua
                     break
                 try:
                     if tangent:
-                        fit = minimize_scalar(lambda z: abs(residual(z)), bounds=(left, right), method="bounded",
-                                              options={"xatol": 1e-10, "maxiter": 24})
-                        z = float(fit.x)
+                        fit = _bounded_minimum(lambda z: abs(residual(z)), left, right, 1e-10, 24)
                     else:
-                        z, fit = brentq(residual, left, right, xtol=1e-10, maxiter=32,
-                                        full_output=True, disp=False)
-                    accepted = (fit.success if tangent else fit.converged) and abs(residual(z)) <= tolerance
+                        fit = _bracketed_root(residual, left, right, 1e-10, maxiter=32)
+                    z = float(fit.x)
+                    accepted = fit.converged and abs(residual(z)) <= tolerance
                     if accepted and (best is None or abs(z-reference_z) < abs(best-reference_z)):
                         best = float(z)
                 except UnresolvedWidth:
@@ -4228,16 +4359,7 @@ def _display_slice(axis,profile,level,margin=0.12):
 
 def _fast_grid_size(required):
     """Use small FFT radices supported efficiently by both pocketfft and cuFFT."""
-    from scipy.fft import next_fast_len
-    n=next_fast_len(int(np.ceil(required)))
-    while True:
-        remainder=n
-        for factor in (2,3,5,7):
-            while remainder%factor==0:
-                remainder//=factor
-        if remainder==1:
-            return n
-        n=next_fast_len(n+1)
+    return _next_fast_len(int(np.ceil(required)), (2, 3, 5, 7))
 
 
 def _nice_grid_step(value,rounding="nearest"):
@@ -4469,7 +4591,6 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
 
 def _refine_crossed_peak(session,bounds,reference_z,image_positions,reporter):
     """Find the strongest candidate basin on the same grid as the output."""
-    from scipy.optimize import minimize_scalar
 
     lo,hi=bounds
     candidates=np.unique(np.r_[np.linspace(lo,hi,7),np.clip(reference_z,lo,hi),
@@ -4493,14 +4614,13 @@ def _refine_crossed_peak(session,bounds,reference_z,image_positions,reporter):
             reporter.advance(len(history)-len(candidates))
         return -history[z]
 
-    optimized=minimize_scalar(objective,bounds=(left,right),method="bounded",
-                              options={"xatol":tolerance,"maxiter":18})
+    optimized=_bounded_minimum(objective, left, right, tolerance, 18)
     objective(optimized.x)
     z=max(history,key=lambda sample:(history[sample],-abs(sample-reference_z)))
     at_boundary=z-lo<=tolerance or hi-z<=tolerance
-    converged=bool(optimized.success) and not at_boundary
+    converged=bool(optimized.converged) and not at_boundary
     message=("The strongest peak reaches the axial search boundary." if at_boundary else
-             "The strongest crossed-CRL candidate was refined." if converged else str(optimized.message))
+             "The strongest crossed-CRL candidate was refined." if converged else "The refinement evaluation budget was exhausted.")
     return PeakIntensitySearchResult(float(z),history[z],(left,right),converged,len(history),
                                      message,tuple(history.items()))
 
