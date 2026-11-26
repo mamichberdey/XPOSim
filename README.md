@@ -35,6 +35,8 @@ For NVIDIA GPU calculations, install **any one** of CuPy, PyTorch, TensorFlow or
 
 The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch, TensorFlow and JAX in that order and uses NumPy if no GPU backend can run. An explicit GPU selection requires that backend to execute on a visible GPU.
 
+GPU fields stay on the selected device during propagation, filtering and metric reduction. `focus_scan` transfers one compact metric table after the scan. The high-level workflow exports profiles in bounded chunks and returns NumPy arrays for plotting. Adaptive searches read scalar results to choose their next evaluation point. See [device memory and transfers](DOCUMENTATION.md#device-memory-and-transfers) for cache limits and synchronization details.
+
 ## Quick start
 
 Run this example from the repository root. It probes each GPU backend with a small FFT and lists the working backends in selection order. Leave `requested = "auto"` to use the first available backend, or set it to a backend name to require that backend.

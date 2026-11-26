@@ -35,6 +35,16 @@ In the optical-element API, distances are relative to the current object's outpu
 The examples below are sequential: run the setup once and then continue with the subsequent sections. Optional schemes reuse the named objects from that setup.
 
 
+### Device memory and transfers
+
+CuPy, PyTorch, TensorFlow and JAX keep propagated fields, Gaussian filtering and metric reductions on the calculation device. Uniform grid coordinates and ROI indices are derived from grid metadata on the host. Chirp-z plans and Gaussian Fourier filters use device scalars directly.
+
+`CRL.focus_scan` accumulates a compact device metric table across propagation batches and reads it once at completion. Returned fields stay on the device. The high-level `estimate_crl_focus` workflow packs metrics and longitudinal profiles into chunks of up to 16 planes and approximately 8 MiB per chunk, with a minimum of one plane. Its public results contain NumPy arrays for plotting and export. A detector-plane request packs its image and metrics into one host read.
+
+Gaussian point-source spectra are cached on the device when they fit the cache budget. CuPy and PyTorch use up to one quarter of available GPU memory, capped at 1 GiB. TensorFlow and JAX use a conservative 64 MiB budget when free device memory cannot be queried. Larger caches use RAM or temporary storage and transfer source batches back to the device during propagation. This bounds memory use for large source quadratures.
+
+Adaptive peak and axial-ROI searches read scalar objective values because each value determines the next position. Geometry validation also reads device validity flags. Explicit backend probes synchronize a small FFT to detect execution failures. Public scalar results and host exports synchronize when requested. These operations remain part of the API's execution model.
+
 ### Units and array conventions
 
 | Quantity | Convention |

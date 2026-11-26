@@ -47,7 +47,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.33.2"
+__version__ = "0.34.0"
 
 
 __all__ = [
@@ -880,8 +880,8 @@ class _InverseFourierAxis:
         self.n=n
         self.m=len(output_axis)
         self.length=next_fast_len(n+self.m-1)
-        first=float(_to_python_float(output_axis[0]))
-        step=float(_to_python_float(output_axis[1]-output_axis[0]))
+        first=output_axis[0]
+        step=output_axis[1]-output_axis[0]
         angle=dq*step
         j=xp.arange(n,dtype=xp.float64)
         d=xp.arange(-(n-1),self.m,dtype=xp.float64)
@@ -904,16 +904,17 @@ class _DetectorFourierPlan:
     def __init__(self,grid,detector,offsets=(0.0,0.0)):
         self.grid=grid
         self.detector=detector
+        self.offsets=offsets
         xp=grid.xp
         x=detector.x if grid.dimension==1 else detector.x_axis
         qx=grid.qx if grid.dimension==1 else grid.qx_axis
         self.output_x=x if offsets[0]==0 else x+offsets[0]
-        self.x=_InverseFourierAxis(grid.nx,_to_python_float(qx[0]),grid.dqx,self.output_x,xp)
+        self.x=_InverseFourierAxis(grid.nx,qx[0],grid.dqx,self.output_x,xp)
         self.y=None
         self.output_y=None
         if grid.dimension==2:
             self.output_y=detector.y_axis if offsets[1]==0 else detector.y_axis+offsets[1]
-            self.y=_InverseFourierAxis(grid.ny,_to_python_float(grid.qy_axis[0]),
+            self.y=_InverseFourierAxis(grid.ny,grid.qy_axis[0],
                                       grid.dqy,self.output_y,xp)
 
     def _inverse(self,work):
@@ -1565,10 +1566,10 @@ class InterpolatedThicknessDefect(ThicknessDefect):
             raise ValueError("Defect dimensionality must match the calculation grid.")
         xp = grid.xp
         coords = (self.coords,) if grid.dimension == 1 else self.coords
-        axes = (grid.x,) if grid.dimension == 1 else (grid.x_axis, grid.y_axis)
-        if any(_to_python_float(axis[0]) < points[0] or
-               _to_python_float(axis[-1]) > points[-1]
-               for axis, points in zip(axes, coords)):
+        spans = [(grid.nx - 1) * grid.dx / 2]
+        if grid.dimension == 2:
+            spans.append((grid.ny - 1) * grid.dy / 2)
+        if any(-span < points[0] or span > points[-1] for span, points in zip(spans, coords)):
             warnings.warn(
                 "The defect coordinates do not fully cover the calculation grid. "
                 "Regions outside the defect bounds will use fill_value.",
@@ -1600,7 +1601,8 @@ def _interpolate_map(values: Any, x_axis: Any, y_axis: Any,
         method="linear", bounds_error=False, fill_value=fill_value,
     )
     if xp is np and grid.backend == "cupy":
-        x_map, y_map = np.meshgrid(_to_numpy(grid.x_axis), _to_numpy(grid.y_axis))
+        x_map, y_map = np.meshgrid(_centered_coordinates(grid.nx, grid.dx, np),
+                                   _centered_coordinates(grid.ny, grid.dy, np))
     else:
         x_map, y_map = grid.x, grid.y
     points = xp.stack((y_map.ravel(), x_map.ravel()), axis=-1)
@@ -1724,12 +1726,12 @@ class ArrayObject(OpticalElement):
     def _warn_if_clipped(self) -> None:
         """Warn only when the supplied object extends beyond the calculation grid."""
         d = self._thickness_data
-        x_axis = self.grid.x if self.grid.dimension == 1 else self.grid.x_axis
-        axes = [("x", d.x_axis, _to_numpy(x_axis))]
+        axes = [("x", d.x_axis, self.grid.nx, self.grid.dx)]
         if self.grid.dimension == 2 and d.y_axis is not None:
-            axes.append(("y", d.y_axis, _to_numpy(self.grid.y_axis)))
-        for name, coords, calc_coords in axes:
-            lo, hi = float(np.min(calc_coords)), float(np.max(calc_coords))
+            axes.append(("y", d.y_axis, self.grid.ny, self.grid.dy))
+        for name, coords, count, step in axes:
+            hi = (count - 1) * step / 2
+            lo = -hi
             tol = 1e-12 * max(1.0, abs(lo), abs(hi))
             if coords[0] < lo - tol or coords[-1] > hi + tol:
                 warnings.warn(
@@ -2388,17 +2390,12 @@ class CRL(OpticalElement):
         roi_shape = (len(x_roi),) if self.grid.dimension == 1 else (len(y_roi), len(x_roi))
         E_array = (self.grid.xp.empty((len(z_array), *roi_shape), dtype=spectrum.dtype)
                    if return_fields else None)
-        metrics: list[BeamMetrics] = []
         tables = []
         measure_y = self.transverse_length is None
         for planes, fields in self.grid._iter_spectrum(E0, spectrum, z_array, self.k, batch_size):
             cropped = fields[(slice(None), *slices)]
             values = abs(cropped)**2
-            if self.grid.backend == "tensorflow":
-                tables.append(_tensorflow_metrics(self.grid.xp, values, x_roi, y_roi, measure_y))
-            else:
-                metrics.extend(_intensity_metrics_batch(values, self.grid, slices, div,
-                    coordinates=(x_roi, y_roi), measure_y_fwhm=measure_y))
+            tables.append(_device_metrics(self.grid, values, x_roi, y_roi, measure_y))
             if return_fields:
                 if self.grid.backend == "tensorflow":
                     E_array[planes].assign(cropped)
@@ -2407,12 +2404,10 @@ class CRL(OpticalElement):
                 else:
                     E_array[planes] = cropped
             del values, cropped, fields
-        if tables:
-            # One compact host read for the entire scan, after all batches.
-            table = self.grid.xp.tf.concat(tables, axis=0).numpy()
-            metrics = _metrics_from_table(table, self.grid.dimension, div)
-            if return_fields:
-                E_array = E_array.read_value()
+        table = _to_numpy(self.grid.xp.concatenate(tables, axis=0))
+        metrics = _metrics_from_table(table, self.grid.dimension, div)
+        if return_fields and self.grid.backend == "tensorflow":
+            E_array = E_array.read_value()
 
         peaks = np.asarray([m.max_intensity for m in metrics])
         peak_index = None if np.all(np.isnan(peaks)) else int(np.nanargmax(peaks))
@@ -2535,26 +2530,30 @@ def full_width_half_max(intensity_array: Any, coordinate: Any) -> float | None:
     coord = xp.asarray(_to_numpy(coordinate) if xp is np else coordinate, dtype=float)
     if arr.ndim != 1 or coord.ndim != 1 or len(arr) != len(coord):
         raise ValueError("full_width_half_max expects matching one-dimensional arrays.")
-    if not bool(xp.all(xp.isfinite(coord))) or bool(xp.any(xp.diff(coord) <= 0)):
+    valid = xp.all(xp.isfinite(coord)) & xp.all(xp.diff(coord) > 0)
+    width = _widths_batch(arr[None, :], coord)[0]
+    valid, width = _to_numpy(xp.stack((valid, width)))
+    if not valid:
         raise ValueError("FWHM coordinates must be finite and strictly increasing.")
-    return _optional_float(_to_python_float(_widths_batch(arr[None, :], coord)[0]))
+    return _optional_float(width)
 
 
-def _roi_slices(grid: BaseGrid, roi: Any, *, coordinates=None) -> tuple[slice, ...]:
+def _roi_slices(grid: BaseGrid, roi: Any, *, offsets=(0., 0.)) -> tuple[slice, ...]:
     """Resolve physical bounds once using only 1D coordinate axes."""
     if roi is None:
         return (slice(None),) * grid.dimension
     if not isinstance(roi, Sequence) or len(roi) != 2:
         raise ValueError("ROI must be (xmin, xmax) or ((xmin, xmax), (ymin, ymax)).")
     bounds = [roi] if grid.dimension == 1 else [roi[1], roi[0]]
-    x, y = _coordinates_for_slices(grid, (slice(None),)*grid.dimension) if coordinates is None else coordinates
-    axes = [x] if grid.dimension == 1 else [y, x]
+    axes = [(grid.nx, grid.dx, offsets[0])]
+    if grid.dimension == 2:
+        axes.insert(0, (grid.ny, grid.dy, offsets[1]))
     result = []
-    for axis, limits in zip(axes, bounds):
+    for (count, step, offset), limits in zip(axes, bounds):
         limits = np.asarray(limits, dtype=float)
         if limits.shape != (2,) or not np.all(np.isfinite(limits)) or limits[0] > limits[1]:
             raise ValueError("ROI bounds must be finite, ordered pairs.")
-        coords = _to_numpy(axis)
+        coords = _centered_coordinates(count, step, np) + offset
         start = int(np.searchsorted(coords, limits[0], side="left"))
         stop = int(np.searchsorted(coords, limits[1], side="right"))
         if start >= stop:
@@ -2622,7 +2621,10 @@ def _tensorflow_metric_graph(xp, shape, dtype, axis_dtype, measure_y_fwhm):
     return reduce_batch
 
 
-def _tensorflow_metrics(xp, values, x, y, measure_y):
+def _device_metrics(grid, values, x, y, measure_y):
+    xp = grid.xp
+    if grid.backend != "tensorflow":
+        return _metric_table(values, x, y, measure_y, xp)
     reduce_batch = _tensorflow_metric_graph(xp, tuple(values.shape), values.dtype, x.dtype, measure_y)
     axes = (x,) if y is None else (x, y)
     return reduce_batch(values, *axes)
@@ -2634,10 +2636,7 @@ def _intensity_metrics_batch(values: Any, grid: BaseGrid, slices: tuple[slice, .
     """Measure already-incoherent intensities without creating artificial fields."""
     xp = grid.xp
     x, y = _coordinates_for_slices(grid, slices) if coordinates is None else coordinates
-    if grid.backend == "tensorflow":
-        table = _tensorflow_metrics(xp, values, x, y, measure_y_fwhm).numpy()
-    else:
-        table = _to_numpy(_metric_table(values, x, y, measure_y_fwhm, xp))
+    table = _to_numpy(_device_metrics(grid, values, x, y, measure_y_fwhm))
     return _metrics_from_table(table, grid.dimension, divergence_value)
 
 
@@ -2673,20 +2672,26 @@ def _divergence_from_spectrum(spectrum: Any, grid: BaseGrid, k: float) -> Any:
     xp = grid.xp
     values = abs(spectrum)**2
     qx = grid.qx if grid.dimension == 1 else grid.qx_axis
-    valid_x = abs(qx) <= k
-    if int(xp.count_nonzero(valid_x)) < 3:
+    def propagating_slice(count, dq):
+        # q is a uniform centred axis. Its contiguous propagating interval
+        # can be found without device mask compaction or a scalar readback.
+        q = _centered_coordinates(count, dq, np)
+        return slice(np.searchsorted(q, -k), np.searchsorted(q, k, side="right"))
+
+    valid_x = propagating_slice(grid.nx, grid.dqx)
+    if valid_x.stop - valid_x.start < 3:
         return None
     theta_x = xp.arcsin(xp.clip(qx[valid_x] / k, -1, 1))
     if grid.dimension == 1:
         return _optional_float(_to_python_float(_widths_batch(values[None, valid_x], theta_x)[0]))
-    valid_y = abs(grid.qy_axis) <= k
-    if int(xp.count_nonzero(valid_y)) < 3:
+    valid_y = propagating_slice(grid.ny, grid.dqy)
+    if valid_y.stop - valid_y.start < 3:
         return None
     theta_y = xp.arcsin(xp.clip(grid.qy_axis[valid_y] / k, -1, 1))
     peak = xp.argmax(values)
     j, i = peak // grid.nx, peak % grid.nx
-    wx = _widths_batch(values[j, valid_x][None, :], theta_x)[0]
-    wy = _widths_batch(values[valid_y, i][None, :], theta_y)[0]
+    wx = _widths_batch(values[j.reshape(1), valid_x], theta_x)[0]
+    wy = _widths_batch(values[valid_y, i.reshape(1)].reshape(1, -1), theta_y)[0]
     widths = _to_numpy(xp.stack((wx, wy)))
     return _optional_float(widths[0]), _optional_float(widths[1])
 
@@ -2697,9 +2702,9 @@ def gaussian_filter_1d(field: Any, coordinate: Any, sigma: float) -> Any:
     _validate_positive("sigma", sigma)
     xp = _array_module(field)
     coord = xp.asarray(coordinate)
-    dx = float(_to_python_float(coord[1] - coord[0]))
+    dx = coord[1] - coord[0]
     kernel = xp.exp(-((coord - 0.0) / sigma) ** 2 / 2) / (np.sqrt(2 * np.pi) * sigma)
-    return _ifft1d(_fft1d(field, dx) * _fft1d(kernel, dx), dx).real
+    return xp.real(_ifft1d(_fft1d(field, dx) * _fft1d(kernel, dx), dx))
 
 
 def gaussian_filter_2d(field: Any, x: Any, y: Any, sigma_x: float, sigma_y: float) -> Any:
@@ -2714,13 +2719,13 @@ def gaussian_filter_2d(field: Any, x: Any, y: Any, sigma_x: float, sigma_y: floa
         x_grid, y_grid = xp.meshgrid(x, y)
     else:
         x_grid, y_grid = x, y
-    dx = _to_python_float(x_grid[0, 1] - x_grid[0, 0])
-    dy = _to_python_float(y_grid[1, 0] - y_grid[0, 0])
+    dx = x_grid[0, 1] - x_grid[0, 0]
+    dy = y_grid[1, 0] - y_grid[0, 0]
     xp = _array_module(field)
     kernel = xp.exp(
         -(x_grid / sigma_x) ** 2 / 2 - (y_grid / sigma_y) ** 2 / 2
     ) / (2 * np.pi * sigma_x * sigma_y)
-    return _ifft2d(_fft2d(field, dx, dy) * _fft2d(kernel, dx, dy), dx, dy).real
+    return xp.real(_ifft2d(_fft2d(field, dx, dy) * _fft2d(kernel, dx, dy), dx, dy))
 
 
 # ---------------------------------------------------------------------------
@@ -3599,8 +3604,15 @@ class _CRLFocusSession:
         self.xp=grid.xp
         self.exit_field=crl.E() if coherent_state is None else coherent_state.exit_field
         self.spectrum=grid.fft(self.exit_field) if coherent_state is None else coherent_state.spectrum
-        self.input_power=_to_python_float(self.xp.sum(abs(incident)**2))
-        self.transmission=_to_python_float(self.xp.sum(abs(self.exit_field)**2))/self.input_power
+        if coherent_state is None:
+            self.input_power, output_power = map(float, _to_numpy(self.xp.stack((
+                self.xp.sum(abs(incident)**2), self.xp.sum(abs(self.exit_field)**2)))))
+            if self.input_power <= 0:
+                raise ValueError("The entrance aperture is not resolved by the grid.")
+            self.transmission = output_power / self.input_power
+        else:
+            self.input_power = coherent_state.input_power
+            self.transmission = coherent_state.transmission
         self._last_z,self._last_image=None,None
         self._peak_cache={}
         self.slices=(slice(None),)*grid.dimension
@@ -3728,15 +3740,21 @@ class _CRLFocusSession:
                 Grid2D(*steps,*counts,backend=self.grid.backend))
             self._zoom_plan=_DetectorFourierPlan(self.grid,self.detector_grid,offsets)
             self._last_z,self._last_image=None,None
-        full=(slice(None),)*self.grid.dimension
-        self.measurement_slices=_roi_slices(
-            self.detector_grid,cfg.detector_roi_m,coordinates=self.detector_coordinates(full))
+        offsets = self._zoom_plan.offsets if self._zoom_plan is not None else (0., 0.)
+        self.measurement_slices=_roi_slices(self.detector_grid, cfg.detector_roi_m, offsets=offsets)
         if any(region.stop-region.start<3 for region in self.measurement_slices):
             raise ValueError("Manual detector ROI needs at least three samples along each axis. Widen it or refine the grid.")
         self.slices=self.measurement_slices
         self._peak_cache.clear()
 
-    def detector_coordinates(self,slices):
+    def detector_coordinates(self,slices,*,host=False):
+        if host:
+            grid = self.detector_grid
+            offsets = self._zoom_plan.offsets if self._zoom_plan is not None else (0., 0.)
+            x = (_centered_coordinates(grid.nx, grid.dx, np) + offsets[0])[slices[-1]]
+            y = None if grid.dimension == 1 else (
+                _centered_coordinates(grid.ny, grid.dy, np) + offsets[1])[slices[0]]
+            return x, y
         if self._zoom_plan is None:
             return _coordinates_for_slices(self.detector_grid,slices)
         y=None if self.grid.dimension==1 else self._zoom_plan.output_y[slices[0]]
@@ -3747,7 +3765,11 @@ class _CRLFocusSession:
         self._mode_bytes=int(np.prod(self.spectrum.shape)) * self.spectrum.dtype.size if self.grid.backend == "tensorflow" else self.spectrum.nbytes
         required=len(self.weights)*self._mode_bytes
         free = self.grid._free_gpu_memory()
-        gpu_budget = min(1024**3, free//4) if free is not None else 0
+        if free is not None:
+            gpu_budget = min(1024**3, free//4)
+        else:
+            # Same conservative device budget as automatic propagation batches.
+            gpu_budget = (64 << 20) if self.grid.backend in {"tensorflow", "jax"} else 0
 
         cache_location="GPU" if required<=gpu_budget else "RAM"
         scratch=None
@@ -3812,7 +3834,7 @@ class _CRLFocusSession:
             fields=self._propagate_source_points(self.positions[start:stop])
             values=abs(fields)**2
             axes=tuple(range(1,fields.ndim))
-            total_power+=_to_python_float(xp.sum(self._mode_weights[start:stop]*xp.sum(values,axis=axes)))
+            total_power = total_power + xp.sum(self._mode_weights[start:stop]*xp.sum(values,axis=axes))
             del values
             spectrum=self.grid._transform_batch(fields)
             del fields
@@ -3820,7 +3842,7 @@ class _CRLFocusSession:
             del spectrum
             if progress is not None:
                 progress.advance(stop)
-        self.transmission=total_power/self.input_power
+        self.transmission=_to_python_float(total_power)/self.input_power
 
     def _iter_cached_modes(self):
         """Load only the current batch from RAM or temporary storage."""
@@ -3877,7 +3899,7 @@ class _CRLFocusSession:
             spectrum=grid.fft(field)
             del field
             coordinates=xp.linspace(-radius,radius,max(321,len(q)//8+1))
-            inverse=_InverseFourierAxis(len(q),_to_python_float(q[0]),dq,coordinates,xp)
+            inverse=_InverseFourierAxis(len(q),q[0],dq,coordinates,xp)
             phase=(-.5j/self.crl.k)*q**2
             if axis==1:
                 phase=phase[:,None]
@@ -3887,8 +3909,9 @@ class _CRLFocusSession:
                 # Parseval allows integration over the other direction in Fourier space.
                 profile=xp.sum(abs(field)**2, axis=axis)
                 del field
-                power=_to_python_float(xp.sum(profile))
-                centers.append(_to_python_float(xp.dot(coordinates,profile))/power if power>0 else np.nan)
+                power = xp.sum(profile)
+                centers.append(xp.dot(coordinates, profile) / xp.where(power > 0, power, xp.nan))
+            centers = _to_numpy(xp.stack(centers))
             slope=(centers[1]-centers[0])/((far-near)*offset)
             response=(centers[0]/offset-near*slope,slope)
             if not np.all(np.isfinite(response)):
@@ -4027,13 +4050,17 @@ class _CRLFocusSession:
 
     def plane(self,z,*,full=False):
         image=self.intensity(z)
-        metrics=self.metrics(image)
+        measure = self.measurement_slices
+        x_measure, y_measure = self.detector_coordinates(measure)
+        table = _device_metrics(self.detector_grid, image[measure][None, ...],
+                               x_measure, y_measure, len(self.cfg.focusing_axes) == 2)[0]
         region=self.measurement_slices if full else self.slices
-        x,y=self.detector_coordinates(region)
-        return CRLPlaneResult(float(z),_to_numpy(image[region]).copy(),
-            _to_numpy(x).copy(),
-            None if y is None else _to_numpy(y).copy(),
-            metrics,self.magnification(z))
+        cropped = image[region]
+        packed = _to_numpy(self.xp.concatenate((table, cropped.reshape(-1))))
+        metrics = _metrics_from_table(packed[None, :len(table)], self.grid.dimension, None)[0]
+        x,y=self.detector_coordinates(region,host=True)
+        return CRLPlaneResult(float(z), packed[len(table):].reshape(cropped.shape).copy(),
+            x, y, metrics, self.magnification(z))
 
 
 def _depth_of_focus_bounds(positions, widths):
@@ -4503,16 +4530,13 @@ def _uniform_scan_positions(bounds,target_count,requested_step,accuracy,anchor_m
 
 
 def _edge_power_fractions(image,xp):
-    total=_to_python_float(xp.sum(image))
-    if total<=0:
-        return (0.0,)*image.ndim
-    rim_x=max(1,image.shape[-1]//20)
-    edge_x=xp.sum(image[...,:rim_x])+xp.sum(image[...,-rim_x:])
-    fractions=[_to_python_float(edge_x)/total]
-    if image.ndim==2:
-        rim_y=max(1,image.shape[0]//20)
-        fractions.append(_to_python_float(xp.sum(image[:rim_y])+xp.sum(image[-rim_y:]))/total)
-    return tuple(fractions)
+    total = xp.sum(image)
+    rim_x = max(1, image.shape[-1]//20)
+    edges = [xp.sum(image[..., :rim_x]) + xp.sum(image[..., -rim_x:])]
+    if image.ndim == 2:
+        rim_y = max(1, image.shape[0]//20)
+        edges.append(xp.sum(image[:rim_y]) + xp.sum(image[-rim_y:]))
+    return xp.stack(edges) / xp.where(total > 0, total, xp.inf)
 
 
 def _focus_width_estimates(cfg, wavelength, analytic, alignment=None):
@@ -4599,8 +4623,6 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
             lens_parameters["transverse_length"]=cfg.structure_depth_m
         crl=CRL(grid=grid,**lens_parameters)
         incident*=crl._entrance_pupil()
-        if _to_python_float(xp.sum(abs(incident)**2))<=0:
-            raise ValueError("The entrance aperture is not resolved by the grid.")
         crl.input_field=incident
         if alignment is not None:
             second_crl=CRL(grid=grid,**y_parameters,rotation=np.pi/2,
@@ -4610,15 +4632,16 @@ def _build_focus_session(cfg,backend,parameters,analytic,progress=None,*,alignme
         probe=_CRLFocusSession(probe_cfg,grid,crl,incident)
         if not cfg.adaptive_window:
             break
-        edge=np.zeros(grid.dimension)
+        edge=xp.zeros(grid.dimension, dtype=xp.float64)
         if progress is not None:
             progress.start("window_checks",3,f"{backend} · propagation grid {grid.shape}")
         for index,z in enumerate((.8*analytic,analytic,1.2*analytic)):
             # Use the inexpensive geometrical projection for provisional grids.
             image=probe._blur(probe.coherent_intensity(z),z,displacement_scale=probe.magnification(z))
-            edge=np.maximum(edge,_edge_power_fractions(image,xp))
+            edge=xp.maximum(edge,_edge_power_fractions(image,xp))
             if progress is not None:
                 progress.advance(index+1)
+        edge = _to_numpy(edge)
         grow_x=edge[0]>1e-3 and cfg.grid_points is None
         grow_y=grid.dimension==2 and edge[1]>1e-3 and cfg.grid_points_y is None
         if not grow_x and not grow_y:
@@ -4649,9 +4672,11 @@ def _refine_crossed_peak(session,bounds,reference_z,image_positions,reporter):
                                [z for z in image_positions if lo<=z<=hi]])
     history={}
     reporter.start("peak_search",len(candidates),"Checking the full beam across the crossed-CRL scan")
+    peaks = []
     for index,(z,image) in enumerate(session.iter_intensities(candidates)):
-        history[z]=session.peak_in_region(image)
+        peaks.append(session.xp.max(image[session.measurement_slices]))
         reporter.advance(index+1)
+    history.update(zip(candidates, map(float, _to_numpy(session.xp.stack(peaks)))))
     peak=int(np.argmax([history[z] for z in candidates]))
     left=float(candidates[max(0,peak-1)])
     right=float(candidates[min(len(candidates)-1,peak+1)])
@@ -4813,30 +4838,45 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     positions=_uniform_scan_positions(bounds,cfg.scan_points,cfg.scan_step_m,cfg.accuracy,numerical.z_m,
                                      within_bounds=cfg.scan_range_m is not None and (manual_detector or alignment is not None))
     metrics=[]
-    lines_x,lines_y=[],[]
     both_axes=len(cfg.focusing_axes)==2
     x_full,y_full=session.detector_coordinates(session.measurement_slices)
     if both_axes:
-        center_x=int(xp.argmin(abs(x_full)))
-        center_y=int(xp.argmin(abs(y_full)))
+        x_host, y_host = session.detector_coordinates(session.measurement_slices, host=True)
+        center_x, center_y = int(np.argmin(abs(x_host))), int(np.argmin(abs(y_host)))
     transverse_x=xp.zeros(detector.nx,dtype=xp.float64)
     transverse_y=None if grid.dimension==1 else xp.zeros(detector.ny,dtype=xp.float64)
     reporter.start("sampling",len(positions),"Calculating detector planes and beam metrics")
-    for z,image in session.iter_intensities(positions,reporter):
-        metrics.append(session.metrics(image))
-        region=image[session.measurement_slices]
+    lines_x = np.empty((len(positions), len(x_full)), dtype=float)
+    lines_y = np.empty((len(positions), len(y_full)), dtype=float) if both_axes else None
+    pending = []
+    # Store only reduced rows on the device; a profile view could pin an
+    # entire batched image. Bound temporary storage even for wide 1D scans.
+    row_bytes = 8 * (6 + len(x_full) + (len(y_full) if both_axes else 0))
+    chunk_size = max(1, min(16, (8 << 20) // row_bytes))
+    for index, (z, image) in enumerate(session.iter_intensities(positions, reporter)):
+        region = image[session.measurement_slices]
+        table = _device_metrics(detector, region[None, ...], x_full, y_full, both_axes)[0]
         if both_axes:
-            line=region[center_y,:]
-            lines_y.append(_to_numpy(region[:,center_x]).copy())
+            row = xp.concatenate((table, region[center_y, :], region[:, center_x]))
         else:
-            line=region if grid.dimension==1 else region[region.shape[0]//2,:]
+            line = region if grid.dimension == 1 else region[region.shape[0]//2, :]
+            row = xp.concatenate((table, line))
+        pending.append(row)
+        if len(pending) == chunk_size or index + 1 == len(positions):
+            rows = _to_numpy(xp.stack(pending))
+            target = slice(index + 1 - len(pending), index + 1)
+            columns = len(table)
+            metrics.extend(_metrics_from_table(rows[:, :columns], grid.dimension, None))
+            lines_x[target] = rows[:, columns:columns + len(x_full)]
+            if both_axes:
+                lines_y[target] = rows[:, columns + len(x_full):]
+            pending.clear()
         if not manual_detector:
             if grid.dimension==1:
                 transverse_x=xp.maximum(transverse_x,image)
             else:
                 transverse_x=xp.maximum(transverse_x,xp.max(image,axis=0))
                 transverse_y=xp.maximum(transverse_y,xp.max(image,axis=1))
-        lines_x.append(_to_numpy(line).copy())
     reporter.start("finalizing",detail="Finalizing transverse ROI and beam metrics")
     intensities=np.asarray([m.max_intensity for m in metrics])
     reference_index=int(np.argmin(abs(positions-numerical.z_m)))
@@ -4853,10 +4893,13 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
     x_slice=y_slice=slice(None)
     display_signal_bounds=None
     if not manual_detector:
-        x_full,profile_x=_to_numpy(x_full),_to_numpy(transverse_x)
+        profiles = transverse_x if y_full is None else xp.concatenate((transverse_x, transverse_y))
+        profiles = _to_numpy(profiles)
+        x_full, y_full = session.detector_coordinates(session.measurement_slices, host=True)
+        profile_x = profiles[:detector.nx]
         x_slice=_display_slice(x_full,profile_x,cfg.transverse_roi_level)
         if y_full is not None:
-            y_full,profile_y=_to_numpy(y_full),_to_numpy(transverse_y)
+            profile_y = profiles[detector.nx:]
             y_slice=_display_slice(y_full,profile_y,cfg.transverse_roi_level)
             if cfg.geometry=="one-dimensional":
                 def signal_bounds(axis,profile,step):
@@ -4898,8 +4941,8 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         rim_y=max(1,image.shape[0]//20)
         edge=(xp.sum(image[:rim_y])+xp.sum(image[-rim_y:])+
               xp.sum(image[rim_y:-rim_y,:rim_x])+xp.sum(image[rim_y:-rim_y,-rim_x:]))
-    total=_to_python_float(xp.sum(image))
-    if total>0 and _to_python_float(edge)/total>1e-3:
+    total = xp.sum(image)
+    if bool((total > 0) & (edge > 1e-3 * total)):
         if manual_detector:
             messages.append("detector_boundary: Significant intensity reaches the edge of the manual detector ROI.")
         elif cfg.accuracy=="refined":
@@ -4929,11 +4972,11 @@ def estimate_crl_focus(configuration: CRLFocusConfig, *,
         equal_fwhm_plane=_find_equal_fwhm_plane(positions,widths,numerical.z_m,measure_widths)
     result=CRLFocusResult(cfg,backend,analytical_image,collimated_focus,numerical,
         positions,intensities,widths,best_index,
-        best.x_m,best.y_m,best.intensity,np.stack(lines_x)[:,x_slice].copy(),
+        best.x_m,best.y_m,best.intensity,lines_x[:,x_slice].copy(),
         session.transmission,float(delta),float(beta),grid.dx,grid.shape,
         None if grid.dimension==1 else grid.dy,image.shape,detector.dx,
         None if grid.dimension==1 else detector.dy,crl.length,tuple(messages),session,best.metrics,point_metrics,
         display_signal_bounds,alignment,equal_fwhm_plane,
-        np.stack(lines_y)[:,y_slice].copy() if both_axes else None,coherent_reference)
+        lines_y[:,y_slice].copy() if both_axes else None,coherent_reference)
     reporter.finish()
     return result
