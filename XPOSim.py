@@ -47,7 +47,7 @@ except (ImportError, OSError, RuntimeError):  # Optional GPU libraries may be un
     cp = None
     CUPY_AVAILABLE = False
 
-__version__ = "0.34.0"
+__version__ = "0.34.1"
 
 
 __all__ = [
@@ -2604,6 +2604,58 @@ def _metric_table(values, x_axis, y_axis, measure_y_fwhm, xp):
     return xp.stack((maxima, x_axis[i], y_axis[j], width_x, width_y, finite), axis=1)
 
 
+def _tensorflow_widths(tf, profiles, coordinates, peak, maxima):
+    """Peak-crossing FWHM using native batched gathers and known peak indices."""
+    n = profiles.shape[-1]
+    dtype = tf.experimental.numpy.result_type(profiles.dtype, coordinates.dtype)
+    if n < 2:
+        return tf.fill(tf.shape(maxima), tf.constant(np.nan, dtype))
+    indices = tf.range(n)[None, :]
+    below_half = profiles < maxima[:, None] / 2
+    left = tf.reduce_max(tf.where((indices < peak[:, None]) & below_half, indices, -1), axis=1)
+    right = tf.reduce_min(tf.where((indices > peak[:, None]) & below_half, indices, n), axis=1)
+    li = tf.clip_by_value(left, 0, n - 2)
+    ri = tf.clip_by_value(right, 1, n - 1)
+    crossings = tf.stack((li, li + 1, ri - 1, ri), axis=1)
+    samples = tf.gather(profiles, crossings, axis=1, batch_dims=1)
+    positions = tf.cast(tf.gather(coordinates, crossings), dtype)
+    denominator = samples[:, 1::2] - samples[:, ::2]
+    fraction = (maxima[:, None] / 2 - samples[:, ::2]) / tf.where(
+        denominator == 0, tf.ones_like(denominator), denominator)
+    fraction = tf.cast(tf.where(denominator == 0, tf.cast(.5, fraction.dtype), fraction), dtype)
+    positions = positions[:, ::2] + fraction * (positions[:, 1::2] - positions[:, ::2])
+    widths = positions[:, 1] - positions[:, 0]
+    valid = (tf.reduce_all(tf.math.is_finite(profiles), axis=1) & (maxima > 0)
+             & (left >= 0) & (right < n) & (widths >= 0))
+    return tf.where(valid, widths, tf.constant(np.nan, dtype))
+
+
+def _tensorflow_metric_table(tf, values, x_axis, y_axis, measure_y):
+    """Reduce metrics without experimental.numpy advanced-index machinery."""
+    if not values.dtype.is_floating:
+        values = tf.cast(values, tf.experimental.numpy.result_type(values.dtype, x_axis.dtype))
+    flat = tf.reshape(values, (values.shape[0], -1))
+    flat = tf.where(tf.math.is_nan(flat), tf.cast(-np.inf, values.dtype), flat)
+    peaks = tf.argmax(flat, axis=1, output_type=tf.int32)
+    maxima = tf.gather(flat, peaks, axis=1, batch_dims=1)
+    finite = tf.reduce_any(tf.math.is_finite(flat), axis=1)
+    if y_axis is None:
+        widths = _tensorflow_widths(tf, values, x_axis, peaks, maxima)
+        columns = (maxima, tf.gather(x_axis, peaks), widths, finite)
+    else:
+        j, i = peaks // values.shape[-1], peaks % values.shape[-1]
+        horizontal = tf.gather(values, j, axis=1, batch_dims=1)
+        width_x = _tensorflow_widths(tf, horizontal, x_axis, i, maxima)
+        if measure_y:
+            vertical = tf.gather(values, i, axis=2, batch_dims=1)
+            width_y = _tensorflow_widths(tf, vertical, y_axis, j, maxima)
+        else:
+            width_y = tf.fill(tf.shape(maxima), tf.constant(np.nan, width_x.dtype))
+        columns = (maxima, tf.gather(x_axis, i), tf.gather(y_axis, j), width_x, width_y, finite)
+    dtype = tf.experimental.numpy.result_type(values.dtype, x_axis.dtype)
+    return tf.stack([tf.cast(column, dtype) for column in columns], axis=1)
+
+
 @lru_cache(maxsize=32)
 def _tensorflow_metric_graph(xp, shape, dtype, axis_dtype, measure_y_fwhm):
     """Cache the reduction for each batch shape, including the shorter final batch."""
@@ -2616,7 +2668,7 @@ def _tensorflow_metric_graph(xp, shape, dtype, axis_dtype, measure_y_fwhm):
     def reduce_batch(values, *axes):
         with tf.device(xp.device):
             y = axes[1] if len(axes) == 2 else None
-            return _metric_table(values, axes[0], y, measure_y_fwhm, xp)
+            return _tensorflow_metric_table(tf, values, axes[0], y, measure_y_fwhm)
 
     return reduce_batch
 

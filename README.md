@@ -200,6 +200,7 @@ The initial independent reference suite checks complex Gaussian propagation, thi
 
 - [Physical and numerical conventions](docs/PHYSICAL_CONVENTIONS.md)
 - [Reference cases and test tolerances](docs/VALIDATION.md)
+- [RTX 4060 GPU validation and TensorFlow measurements](docs/GPU_VALIDATION.md)
 - [Engineering audit and staged roadmap](docs/ENGINEERING_AUDIT.md)
 - [Proposed API evolution](docs/API_DESIGN.md)
 
