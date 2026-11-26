@@ -25,14 +25,18 @@ Keep `XPOSim.py` alongside `xray_material_data/` for formula-based materials. XP
 
 For NVIDIA GPU calculations, install **any one** of CuPy, PyTorch or JAX with GPU support compatible with your system and driver. Select the corresponding backend on a grid or in `CRLFocusConfig`.
 
-| Compute backend | Setting |
-| --- | --- |
-| NumPy on CPU | `backend="numpy"` |
-| CuPy on GPU | `backend="cupy"` |
-| PyTorch on GPU | `backend="torch"` |
-| JAX on GPU | `backend="jax"` |
+| Compute backend | Setting | Installation |
+| --- | --- | --- |
+| NumPy on CPU | `backend="numpy"` | [Guide](https://numpy.org/install/) |
+| CuPy on GPU | `backend="cupy"` | [Guide](https://docs.cupy.dev/en/stable/install.html) |
+| PyTorch on GPU | `backend="torch"` | [Guide](https://pytorch.org/get-started/locally/) |
+| JAX on GPU | `backend="jax"` | [Guide](https://docs.jax.dev/en/latest/installation.html) |
 
 The high-level workflow defaults to `backend="auto"`. It probes CuPy, PyTorch and JAX in that order and uses NumPy if no GPU backend can run. An explicit GPU selection requires that backend to execute on a visible GPU.
+
+<a href="docs/assets/backend-benchmark.png"><img src="docs/assets/backend-benchmark.png" width="720" alt="XPOSim CPU and GPU benchmark on Intel Core i5-12450H and NVIDIA GeForce RTX 4060 Laptop GPU. Logarithmic scan time above, GPU speedup relative to NumPy below. NumPy is blue, CuPy green, and PyTorch orange."></a>
+
+In this workload, both measured GPU backends have lower median times from 32,768 points per plane onward. [Benchmark setup and results](docs/GPU_VALIDATION.md#extended-grid-comparison).
 
 GPU fields stay on the selected device during propagation, filtering and metric reduction. `focus_scan` transfers one compact metric table after the scan. The high-level workflow exports profiles in bounded chunks and returns NumPy arrays for plotting. Adaptive searches read scalar results to choose their next evaluation point. See [device memory and transfers](DOCUMENTATION.md#device-memory-and-transfers) for cache limits and synchronization details.
 
