@@ -193,3 +193,14 @@ The modulus removes the phase from the displayed intensity, but the phase remain
 [kohn2022]: https://doi.org/10.1107/S1600577522001345
 [kohn2003]: https://doi.org/10.1134/1.1600812
 [kohn-imaging2003]: https://doi.org/10.1016/S0030-4018(02)02285-X
+
+## Scientific validation and development
+
+The initial independent reference suite checks complex Gaussian propagation, thin-lens focusing, slit Fresnel diffraction, Fourier normalization, material attenuation and photon-energy units. Run `python -m unittest discover -s tests -p test_physics_validation.py` with NumPy and SciPy installed. Tests use documented setups and numerical tolerances.
+
+- [Physical and numerical conventions](docs/PHYSICAL_CONVENTIONS.md)
+- [Reference cases and test tolerances](docs/VALIDATION.md)
+- [Engineering audit and staged roadmap](docs/ENGINEERING_AUDIT.md)
+- [Proposed API evolution](docs/API_DESIGN.md)
+
+The conventions document explains finite-window behavior on even grids and the entrance-pupil difference between low-level CRLs and the high-level focus workflow. GPU validation requires target hardware.
