@@ -4,6 +4,18 @@ User guide and API reference for [XPOSim](https://github.com/mamichberdey/XPOSim
 
 This guide covers the grid and optical-element API and the high-level CRL workflow. Examples import the library with `import XPOSim as xpos`.
 
+
+## Installation into an existing environment
+
+Install XPOSim from a checkout with `python -m pip install --no-deps .`, from GitHub with `python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"`, or from a downloaded wheel with `python -m pip install --no-deps path/to/xposim-0.36.0-py3-none-any.whl`.
+
+Package metadata intentionally declares no runtime dependencies. NumPy and SciPy must already be installed. GPU calculation additionally uses one of CuPy, Torch or JAX. Matplotlib is needed for plots. Dependency versions belong to the surrounding environment. Missing packages are installed explicitly by the user. The `--no-deps` flag also explicitly disables pip dependency resolution.
+
+A wheel installs the module and its three material tables directly. Source builds use setuptools in an isolated temporary build environment, which can download build tools. For an offline source installation, provide setuptools 61 or newer and wheel in the environment and add `--no-build-isolation`. The import remains `import XPOSim`, including outside the source checkout. Single-file use with an adjacent `xray_material_data/` directory also remains supported.
+
+Maintainers can build both formats with `python -m build`. Run `python tests/check_distribution.py dist` from an interpreter with NumPy, SciPy, setuptools and wheel available to validate metadata, material resources and offline installation. CI tests wheels in bare and populated environments and source archives with preinstalled build tools, comparing every other installed distribution before and after installation.
+
+
 ## Contents
 
 1. [Fields, grids, and optical planes](#1-fields-grids-and-optical-planes)

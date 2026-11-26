@@ -73,3 +73,10 @@ Proposed criteria should become release gates after baseline measurements and ma
 - A maintainer-approved citation, code/data licenses, contribution process, release notes and support policy exist. A proposed LTS commitment must identify maintainers and capacity before it is advertised.
 
 These are measurable project goals. Current evidence supports an evolving scientific tool with an initial validation foundation. Standard status depends on independent adoption and sustained verification.
+
+
+## Packaging progress in 0.36.0
+
+PEP 517/621 build metadata now produces a pure-Python wheel and source archive, preserving `import XPOSim` and the adjacent material-resource layout. Runtime dependency metadata is empty. Installation relies on the user's existing numerical packages. Distribution checks cover resource hashes, offline wheel installation in bare and populated environments, source installation with existing build tools, and preservation of all other installed distributions. CI includes distribution checks on Linux and Windows, and CPU validation now includes Python 3.10.
+
+The flat module layout is retained for this incremental packaging change. Src-layout migration, broader typing/lint gates, licensing and attribution decisions remain separate roadmap items.

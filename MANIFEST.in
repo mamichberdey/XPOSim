@@ -1,0 +1,4 @@
+include README.md DOCUMENTATION.md COLAB_GUIDE.md
+recursive-include xray_material_data *.dat
+recursive-include tests *.py
+recursive-include docs *.md *.png

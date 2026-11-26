@@ -21,7 +21,17 @@ Try XPOSim for X-ray focusing with a compound refractive lens.
 
 ## Installation
 
-Keep `XPOSim.py` alongside `xray_material_data/` for formula-based materials. XPOSim requires NumPy and SciPy. Plotting examples also use Matplotlib.
+Install into your active environment from GitHub.
+
+```sh
+python -m pip install --no-deps "git+https://github.com/mamichberdey/XPOSim.git"
+```
+
+XPOSim declares **no runtime dependencies** in its package metadata. Installation uses the numerical packages already present in your environment. NumPy and SciPy are required to import and run XPOSim. Plotting examples also use Matplotlib. Install any missing packages separately using the package manager appropriate for your environment.
+
+For an existing checkout, use `python -m pip install --no-deps .`. A built wheel can be installed with `python -m pip install --no-deps path/to/xposim-0.36.0-py3-none-any.whl`. Wheel installation requires no build tools. Building from Git or a source archive uses setuptools in a temporary build environment. If your environment already provides setuptools 61 or newer and wheel, `--no-build-isolation` also avoids downloading isolated build tools.
+
+The material tables are included in the distribution. The public import is `import XPOSim`. Direct single-file use also works when `XPOSim.py` is kept alongside `xray_material_data/`.
 
 For NVIDIA GPU calculations, install **any one** of CuPy, PyTorch or JAX with GPU support compatible with your system and driver. Select the corresponding backend on a grid or in `CRLFocusConfig`.
 
@@ -42,7 +52,7 @@ GPU fields stay on the selected device during propagation, filtering and metric 
 
 ## Quick start
 
-Run this example from the repository root. It probes each GPU backend with a small FFT and lists the working backends in selection order. Leave `requested = "auto"` to use the first available backend, or set it to a backend name to require that backend.
+Run this example after installation, or from the repository root. It probes each GPU backend with a small FFT and lists the working backends in selection order. Leave `requested = "auto"` to use the first available backend, or set it to a backend name to require that backend.
 
 ```python
 from importlib import import_module

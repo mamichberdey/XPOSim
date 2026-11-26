@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "XPOSim"
+dynamic = ["version"]
+description = "Scalar paraxial X-ray wave optics with NumPy, CuPy, PyTorch and JAX"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/mamichberdey/XPOSim"
+Documentation = "https://github.com/mamichberdey/XPOSim/blob/main/DOCUMENTATION.md"
+Issues = "https://github.com/mamichberdey/XPOSim/issues"
+
+[tool.setuptools]
+py-modules = ["XPOSim"]
+packages = ["xray_material_data"]
+
+[tool.setuptools.dynamic]
+version = {attr = "XPOSim.__version__"}
+
+[tool.setuptools.package-data]
+xray_material_data = ["*.dat"]
