@@ -19,11 +19,12 @@ PyTorch and JAX on GPU.
 
 ## How it works
 
-<img src="https://raw.githubusercontent.com/mamichberdey/XPOSim/main/docs/assets/field-flow.svg" width="800" alt="A source creates a complex field E. An aperture and a lens receive and transform that field. Intensity is measured as the squared field magnitude." />
+<img src="https://raw.githubusercontent.com/mamichberdey/XPOSim/main/docs/assets/optical-scheme.png" width="900" alt="A point source illuminates an aperture and a compound refractive lens, focusing onto an observation plane. Swap symbols show plane-wave or Gaussian illumination and alternative blade or sampled-material elements." />
 
-A **source creates the complex field** `E`. Every optical element receives an
-`input_field`, transforms it and returns a field that can be passed to the next
-element. The field carries both amplitude and phase; intensity is `abs(E)**2`.
+Change the illumination and replace or combine optical elements to build a scheme.
+A **source creates the complex field** `E`. Each element receives it as `input_field`,
+transforms it and returns a field for the next element. The field carries both
+amplitude and phase; intensity is `abs(E)**2`.
 
 `source.E(z=d)` creates the field a distance `d` from the source.
 `element.E(z=0)` returns the element's exit field; `element.E(z=d)` also propagates
