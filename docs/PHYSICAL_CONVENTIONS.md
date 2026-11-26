@@ -31,6 +31,8 @@ For a parabolic lens, two surfaces give `t=bridge+x_local**2/radius` within the 
 
 Outside the nominal aperture the current CRL thickness is capped at the rim thickness. It transmits through a material slab with attenuation. The high-level focus workflow separately restricts incident illumination to the entrance pupil. Low-level schemes needing that stop should compose a `Hole` with the CRL. This difference must be included when comparing analytical aperture diffraction and the two entry points.
 
+The tabulated material path currently takes the absolute value of the real susceptibility when reporting delta. Negative f1 entries near absorption features can therefore lose their dispersion sign. Direct `Material(delta=..., beta=...)` accepts signed delta. Missing-value metadata in the source tables also needs explicit interpretation. Treat near-edge material calculations as requiring an independent optical-constant check until that behavior has a tested migration. This issue does not justify changing Fourier or attenuation sign conventions.
+
 ## Sampling and boundaries
 
 Both axes use `x_j=(j-(N-1)/2)*dx` and `q_l=(l-(N-1)/2)*2*pi/(N*dx)`. Even counts have half-integer frequencies and no DC frequency. The spectral basis obeys `E(x+N*dx)=-E(x)` for even counts, and periodic continuation for odd counts. In 2D this applies independently to each axis.
